@@ -1,0 +1,17 @@
+# Data manifests & generated clips
+data/*.csv
+!data/.gitkeep
+
+# Outputs
+checkpoints/
+models/
+results/
+logs/
+wandb/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.ipynb_checkpoints/

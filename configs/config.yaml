@@ -1,0 +1,70 @@
+# =============================================================================
+# config.yaml — single-label 4-class VideoMAE (unimodal, Haydom + DRC combined)
+# =============================================================================
+# Task: classify each 3-second clip into ONE of
+#   0 non_target, 1 stimulation, 2 ventilation, 3 suction
+# comparable to the multimodal thesis' MoViNet video base model.
+#
+# Select the model at the CLI: --model VideoMAE | VideoMAEGiant
+# The two model blocks below differ only in learning-rate strategy; switch the
+# commented block to match your model.
+# =============================================================================
+
+# ---------------------------------------------------------------- data paths
+train_data:      data/train.csv
+validation_data: data/validation.csv
+test_data:       data/test.csv
+
+# ---------------------------------------------------------------- runtime
+device: cuda
+batch_size: 8            # thesis MoViNet used 48; VideoMAE is heavier — tune to VRAM
+num_workers: 8
+num_epochs: 80
+train_backbone: true     # full-backbone fine-tuning (VideoMAE has no LoRA)
+attention_pooling: false # false => CLS token (base) / internal mean pool (giant)
+validation_step: null    # e.g. 5000 to validate mid-epoch; null = end-of-epoch only
+
+# ---------------------------------------------------------------- loss / imbalance
+# Matches the thesis: sqrt inverse-frequency class weights (computed from the
+# train split at runtime) + label smoothing. No sampler.
+label_smoothing: 0.1
+minority_class: suction  # class whose F1 drives the "best minority" checkpoint
+
+# ---------------------------------------------------------------- scheduler
+scheduler: plateau       # plateau (ReduceLROnPlateau on minority F1) | cosine
+plateau_patience: 8
+early_stopping_patience: 20   # epochs without macro/minority F1 gain; 0 disables
+
+# ---------------------------------------------------------------- classifier head
+classifier_config:
+  dims: []               # [] = single linear layer; e.g. [64] for one hidden layer
+  activation: relu
+  use_bias: true         # bias initialised to per-class log-priors
+  dropout: 0.3
+
+# ---------------------------------------------------------------- optimizer
+# >>> VideoMAE / VideoMAEGiant (dual LR): set learning_rate = null so
+#     backbone_lr and classifier_lr are used.
+learning_rate: null
+backbone_lr: 1.0e-5
+classifier_lr: 5.0e-5
+weight_decay: 1.0e-3
+#
+# >>> Single-LR alternative (all params share one LR): set learning_rate to a
+#     value and it overrides backbone_lr/classifier_lr.
+# learning_rate: 1.0e-4
+
+# ---------------------------------------------------------------- model
+# Optional backbone override passed to the model constructor.
+model_params: {}
+#   backbone_id: MCG-NJU/videomae-base-finetuned-ssv2   # VideoMAE base
+#   backbone_id: OpenGVLab/VideoMAEv2-giant             # VideoMAEGiant
+
+# ---------------------------------------------------------------- outputs
+checkpoint_path: checkpoints/
+save_path: models/
+results_dir: results/
+
+# ---------------------------------------------------------------- logging
+wandb_project: videomae-unimodal
+wandb_mode: online       # online | offline | disabled
