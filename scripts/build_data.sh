@@ -6,8 +6,8 @@
 # on the VM (the `.../videos` directory that contains the per-class subfolders).
 set -euo pipefail
 
-HAYDOM_VIDEOS="/spo/LS-Haydom/ProcessedData/Athavan_Frida/Data_processing/Processed_data_new_dataset_no_suction_merge_chestmov/videos"
-DRC_VIDEOS="/spo/LS-DRC.marta2/ProcessedData/Athavan_Frida/Data_processing/Processed_data_new_dataset_no_suction_merge_bulp_new_anot_chestmov/videos"
+HAYDOM_VIDEOS="/spo/LS-Haydom/ProcessedData/Athavan_Frida/Data_processing/Processed_data_stratified_BIG_update_strict_label/videos"
+DRC_VIDEOS="/spo/LS-DRC/ProcessedData/Athavan_Frida/Data_processing//Processed_data_new_dataset_no_suction_merge_bulp_new_anot_chestmov/videos"
 
 python -m src.data.build_manifest \
     --root "Haydom=${HAYDOM_VIDEOS}" \
