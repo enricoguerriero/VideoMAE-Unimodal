@@ -2,12 +2,13 @@
 data/*.csv
 !data/.gitkeep
 
-# Outputs
-checkpoints/
-models/
-results/
-logs/
-wandb/
+# Outputs (anchored to repo root with a leading slash so they don't also match
+# source dirs like src/models/)
+/checkpoints/
+/models/
+/results/
+/logs/
+/wandb/
 
 # Python
 __pycache__/
