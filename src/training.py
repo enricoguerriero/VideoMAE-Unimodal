@@ -12,7 +12,8 @@ comparable to that thesis's MoViNet video base model:
     * Metrics: argmax over 4 softmax logits (no per-class thresholds).
     * Model selection: keeps the best macro-F1 checkpoint AND the best
       minority-class (suction) F1 checkpoint, as the thesis did.
-    * Optional ReduceLROnPlateau on the minority-class val F1, or cosine decay.
+    * LR schedule: ReduceLROnPlateau on the minority-class val F1, plain cosine
+      decay, or linear-warmup -> cosine decay (warmup_cosine).
 
 Config is read from configs/config.yaml. CLI flags: --model (required),
 --debug, --only_train, --attention_pooling.
@@ -177,6 +178,20 @@ def main():
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="max", factor=0.5,
             patience=config.get("plateau_patience", 8), min_lr=1e-8)
+    elif scheduler_type == "warmup_cosine":
+        # Linear warmup for `warmup_epochs`, then cosine decay over the rest.
+        # Deterministic (not tied to noisy val F1): LR reliably winds down so the
+        # model settles into the minimum instead of oscillating at a high LR.
+        warmup_epochs = max(1, min(int(config.get("warmup_epochs", 5)), num_epochs - 1))
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=config.get("warmup_start_factor", 0.01),
+            end_factor=1.0, total_iters=warmup_epochs)
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=num_epochs - warmup_epochs)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
+        logger.info(f"Scheduler: warmup_cosine (warmup_epochs={warmup_epochs}, "
+                    f"start_factor={config.get('warmup_start_factor', 0.01)})")
     else:
         scheduler_type = "cosine"
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
@@ -250,7 +265,7 @@ def main():
         wu.log({"train/loss_epoch": train_loss, "lr": current_lr, "epoch": epoch + 1})
 
         if args.only_train:
-            if scheduler_type == "cosine":
+            if scheduler_type != "plateau":
                 scheduler.step()
             continue
 

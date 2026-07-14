@@ -31,7 +31,14 @@ label_smoothing: 0.1
 minority_class: suction  # class whose F1 drives the "best minority" checkpoint
 
 # ---------------------------------------------------------------- scheduler
-scheduler: plateau       # plateau (ReduceLROnPlateau on minority F1) | cosine
+# plateau        : ReduceLROnPlateau on minority F1 (LR drop tied to noisy metric)
+# cosine         : plain cosine decay over all epochs
+# warmup_cosine  : linear warmup for warmup_epochs, then cosine decay over the
+#                  rest. Deterministic anneal -> model settles into the minimum
+#                  instead of oscillating at a high LR.
+scheduler: warmup_cosine
+warmup_epochs: 5              # linear warmup length (used by warmup_cosine)
+warmup_start_factor: 0.01     # LR starts at this fraction of base, ramps to 1.0
 plateau_patience: 8
 early_stopping_patience: 20   # epochs without macro/minority F1 gain; 0 disables
 
