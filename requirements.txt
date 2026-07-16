@@ -1,29 +1,20 @@
-# Core
-# CUDA 12.8 build, same as the multimodal repo. Needs the PyTorch wheel index:
-#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
-torch==2.8.0+cu128
-# transformers pinned to the SAME GitHub commit as the multimodal repo. The
-# VideoMAEv2-giant custom-code loading (trust_remote_code / dynamic module)
-# depends on it — do not upgrade without testing.
-transformers @ git+https://github.com/huggingface/transformers@7bbfc19a4583d951eaec058cf467e81e6c97ee32
-huggingface_hub==1.2.3
-safetensors==0.7.0
-tokenizers==0.22.1
+torch
 
-# Video decode / frame extraction
-av==17.0.0
-opencv-python>=4.13.0          # only needed for the optional regenerate-from-raw path (data_process.py)
+transformers
+huggingface_hub
+safetensors
+tokenizers
 
-# Data / metrics
-numpy==2.4.0
-pandas==3.0.1
-scikit-learn==1.8.0
-PyYAML==6.0.3
-tqdm==4.67.1
+av
+opencv-python
 
-# VideoMAEv2-giant backbone deps
-timm==1.0.26
-easydict==1.13
+numpy
+pandas
+scikit-learn
+PyYAML
+tqdm
 
-# Logging (optional — set wandb_mode: disabled in config to skip)
-wandb==0.25.1
+timm
+easydict
+
+wandb
