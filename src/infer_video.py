@@ -17,16 +17,24 @@ Outputs (into --out-dir, default: viewer_out/<video-stem>/):
                        label following the playhead + a colour-coded timeline
     video.mp4          symlink (or copy with --copy-video) to the source video
 
-View it with:
+Easiest use — pick a case from the test set (no paths to type):
+    python -m src.infer_video --model VideoMAE --model_path <ckpt.pt> --serve
+This lists the cases in data/test.csv; once you pick one it auto-resolves the
+full-episode video AND its annotation from the sibling `Unprocessed_data` tree
+(see src/data/data_process.py). Add --case <case_id> to skip the menu.
+
+Or point it at any video directly:
     python -m src.infer_video --model VideoMAE --model_path <ckpt.pt> \
-        --video /path/to/<case_id>.mp4 --serve
-then open the printed http://localhost:<port>/viewer.html (forward the port over
+        --video /path/to/<case_id>.mp4 [--annotation /path/to/<case_id>.txt] --serve
+
+Then open the printed http://localhost:<port>/viewer.html (forward the port over
 SSH / VS Code Remote). --serve uses a Range-capable server so scrubbing works.
 
-Ground truth (optional): pass --annotation /path/to/<case_id>.txt (the 5-column
-TSV from Unprocessed_data/anot_files) to overlay a second timeline of the
+Ground truth is overlaid automatically when an annotation file is found (the
+5-column TSV from Unprocessed_data/anot_files): a second timeline of the
 reference labels, computed with the thesis' `for_predict` rule (dominant of
-stim/vent/suction over the 3 s window if >= 50%, else non_target).
+stim/vent/suction over the 3 s window if >= 50%, else non_target). --no-gt
+disables it.
 """
 
 from argparse import ArgumentParser
@@ -452,17 +460,118 @@ render();
 
 
 # ---------------------------------------------------------------------------
+# Test-set case selection (auto-resolve raw video + annotation from a clip path)
+# ---------------------------------------------------------------------------
+# The full-episode videos + annotations live in a sibling `Unprocessed_data`
+# tree of the processed clips (see src/data/data_process.py):
+#     <base>/Unprocessed_data/videos/<case_id>.mp4
+#     <base>/Unprocessed_data/anot_files/<case_id>.txt
+# while a clip path is  <base>/<Processed_...>/videos/<class>/<case>_interval_...
+# so we recover the case id from the clip filename and walk up its ancestors
+# to find the matching raw video/annotation.
+VIDEO_EXTS = [".mp4", ".MP4", ".avi", ".mkv", ".mov", ".MOV"]
+
+
+def recover_case_id(clip_path: str) -> str:
+    """Case id = clip filename stem before '_interval_' (matches build_manifest)."""
+    return Path(clip_path).stem.split("_interval_")[0]
+
+
+def list_test_cases(test_csv: Path):
+    """Read the test manifest → ordered unique cases with clip counts + an anchor."""
+    cases = {}
+    with open(test_csv, newline="") as f:
+        for row in csv.DictReader(f):
+            vp = row.get("video_path")
+            if not vp:
+                continue
+            cid = recover_case_id(vp)
+            c = cases.setdefault(cid, {"case_id": cid, "n_clips": 0, "anchor": vp})
+            c["n_clips"] += 1
+    return sorted(cases.values(), key=lambda c: c["case_id"])
+
+
+def resolve_media(anchor_clip: str, case_id: str):
+    """Walk up the clip path for a sibling Unprocessed_data/{videos,anot_files}."""
+    p = Path(anchor_clip).expanduser().resolve()
+    for anc in p.parents:
+        base = anc / "Unprocessed_data"
+        vids, anots = base / "videos", base / "anot_files"
+        if not vids.is_dir():
+            continue
+        for ext in VIDEO_EXTS:
+            cand = vids / f"{case_id}{ext}"
+            if cand.exists():
+                anot = anots / f"{case_id}.txt"
+                return cand, (anot if anot.exists() else None)
+    return None, None
+
+
+def choose_case(cases):
+    """Print a numbered menu and return the selected case dict (interactive)."""
+    print("\nTest-set cases:")
+    for i, c in enumerate(cases, 1):
+        v = "video ✓" if c["video"] else "video ✗ (raw not found)"
+        g = "GT ✓" if c["annotation"] else "GT ✗"
+        print(f"  [{i:2d}] {c['case_id']:14s} {c['n_clips']:5d} clips   {v:26s} {g}")
+    while True:
+        sel = input(f"\nSelect a case [1-{len(cases)}] (q to quit): ").strip()
+        if sel.lower() in ("q", "quit", "exit"):
+            raise SystemExit(0)
+        if sel.isdigit() and 1 <= int(sel) <= len(cases):
+            return cases[int(sel) - 1]
+        print("  invalid selection")
+
+
+def select_from_test_set(args):
+    """Resolve (video_path, annotation) via the test manifest + user selection."""
+    test_csv = Path(args.test_csv).expanduser()
+    if not test_csv.exists():
+        raise FileNotFoundError(
+            f"{test_csv} not found — run scripts/build_data.sh first, or pass --video.")
+    cases = list_test_cases(test_csv)
+    if not cases:
+        raise RuntimeError(f"No cases found in {test_csv}.")
+    for c in cases:
+        c["video"], c["annotation"] = resolve_media(c["anchor"], c["case_id"])
+
+    if args.case:
+        chosen = next((c for c in cases if c["case_id"] == args.case), None)
+        if chosen is None:
+            raise SystemExit(f"case '{args.case}' not in {test_csv}. "
+                             f"Available: {[c['case_id'] for c in cases]}")
+    else:
+        chosen = choose_case(cases)
+
+    if not chosen["video"]:
+        raise SystemExit(
+            f"No raw video found for case '{chosen['case_id']}'. Its clips are at\n"
+            f"  {chosen['anchor']}\n"
+            f"but no sibling Unprocessed_data/videos/{chosen['case_id']}.* exists. "
+            f"Pass the full video explicitly with --video (and --annotation).")
+    logger.info(f"Selected case {chosen['case_id']}: {chosen['video']}")
+    return chosen["case_id"], chosen["video"], chosen["annotation"]
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
     ap = ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True, choices=["VideoMAE", "VideoMAEGiant"])
     ap.add_argument("--model_path", required=True, help="Trained checkpoint .pt")
-    ap.add_argument("--video", required=True, help="Path to the ENTIRE episode video.")
+    ap.add_argument("--video", default=None,
+                    help="Full episode video. If omitted, pick a case from --test-csv.")
+    ap.add_argument("--test-csv", default="data/test.csv",
+                    help="Test manifest to pick a case from (default: data/test.csv).")
+    ap.add_argument("--case", default=None,
+                    help="Case id to run non-interactively (skips the menu).")
     ap.add_argument("--annotation", default=None,
-                    help="Optional 5-col TSV to overlay ground-truth labels.")
+                    help="5-col TSV to overlay ground truth (auto-resolved for test cases).")
+    ap.add_argument("--no-gt", action="store_true",
+                    help="Do not overlay ground truth even if an annotation is found.")
     ap.add_argument("--out-dir", default=None,
-                    help="Output dir (default: viewer_out/<video-stem>/).")
+                    help="Output dir (default: viewer_out/<case-or-video-stem>/).")
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--copy-video", action="store_true",
                     help="Copy the video into out-dir instead of symlinking.")
@@ -474,10 +583,22 @@ def main():
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(levelname)s: %(message)s")
 
-    video_path = Path(args.video).expanduser().resolve()
+    # Resolve the target video (+ optional annotation): explicit --video, or an
+    # interactive pick from the test set.
+    stem = None
+    if args.video:
+        video_path = Path(args.video).expanduser().resolve()
+        annotation = args.annotation
+    else:
+        stem, video_path, auto_annotation = select_from_test_set(args)
+        annotation = args.annotation or auto_annotation
+
+    if args.no_gt:
+        annotation = None
     if not video_path.exists():
         raise FileNotFoundError(video_path)
-    out_dir = Path(args.out_dir).expanduser() if args.out_dir else Path("viewer_out") / video_path.stem
+    stem = stem or video_path.stem
+    out_dir = Path(args.out_dir).expanduser() if args.out_dir else Path("viewer_out") / stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -491,8 +612,9 @@ def main():
 
     per_second = windows_to_per_second(results, duration_s)
     gt_second = None
-    if args.annotation:
-        gt_second = gt_per_second(load_gt_intervals(args.annotation), duration_s)
+    if annotation:
+        logger.info(f"Ground truth: {annotation}")
+        gt_second = gt_per_second(load_gt_intervals(annotation), duration_s)
 
     # ---- make the video reachable by the browser ----
     local_video = out_dir / "video.mp4"
@@ -505,7 +627,7 @@ def main():
 
     # ---- write predictions.json ----
     data = {
-        "title": video_path.stem,
+        "title": stem,
         "model": args.model,
         "video": "video.mp4",
         "fps": round(float(fps), 3),

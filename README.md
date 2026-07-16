@@ -164,29 +164,47 @@ time — a **3 s window slid with a 1 s stride** over the whole video — classi
 each window (16-frame / 224² VideoMAE processor), and maps each window's argmax
 to a **per-second** label.
 
+Just pick a case from the test set — **no paths to type**:
+
 ```bash
-bash scripts/infer_video.sh VideoMAE checkpoints/VideoMAE_best_macro_<ts>.pt \
-    /…/Unprocessed_data/videos/<case_id>.mp4 0 8000 \
-    /…/Unprocessed_data/anot_files/<case_id>.txt      # last arg (GT) is optional
+bash scripts/infer_video.sh VideoMAE checkpoints/VideoMAE_best_macro_<ts>.pt
 ```
 
-Args: `MODEL CKPT VIDEO [GPU] [PORT] [ANNOTATION]`. This calls:
+It lists the cases in `data/test.csv` (the 14 held-out episodes) with their clip
+counts and whether the raw video / annotation were found, then waits for you to
+pick one:
+
+```
+Test-set cases:
+  [ 1] 11848523         412 clips   video ✓                    GT ✓
+  [ 2] 15233524         388 clips   video ✓                    GT ✓
+  ...
+Select a case [1-14] (q to quit):
+```
+
+Once picked, it **auto-resolves the full-episode video and its annotation** by
+recovering the case id from the clip filename (`<case>_interval_…`) and walking
+up to the sibling `Unprocessed_data/{videos,anot_files}/<case_id>.*` tree
+(the layout produced by `data_process.py`). No need to know where the raw files
+live.
+
+Args: `MODEL CKPT [GPU] [PORT] [CASE]` — pass a `CASE` id as the 5th arg to skip
+the menu (e.g. `… VideoMAE <ckpt> 0 8000 11848523`). Under the hood this is:
 
 ```bash
-python -m src.infer_video \
-    --model VideoMAE --model_path <ckpt.pt> \
-    --video /…/<case_id>.mp4 \
-    --annotation /…/<case_id>.txt \   # optional: overlay ground-truth timeline
-    --serve --port 8000
+python -m src.infer_video --model VideoMAE --model_path <ckpt.pt> --serve   # menu
+# or run any video directly, bypassing the test set:
+python -m src.infer_video --model VideoMAE --model_path <ckpt.pt> \
+    --video /…/<case_id>.mp4 [--annotation /…/<case_id>.txt] --serve
 ```
 
 Outputs land in `viewer_out/<case_id>/`:
 
 - `viewer.html` — plays the video with a live class chip + confidence, a
-  colour-coded **per-second timeline** (click to seek), and — when
-  `--annotation` is given — a **ground-truth** strip below it for comparison.
-  Ground truth uses the thesis' `for_predict` rule (dominant of
-  stim/vent/suction over the 3 s window if ≥ 0.50, else non_target).
+  colour-coded **per-second timeline** (click to seek), and — when an annotation
+  is found (or given) — a **ground-truth** strip below it for comparison
+  (disable with `--no-gt`). Ground truth uses the thesis' `for_predict` rule
+  (dominant of stim/vent/suction over the 3 s window if ≥ 0.50, else non_target).
 - `predictions.json` — per-second + per-window predictions + metadata.
 - `predictions.csv` — per-window `start,end,label,confidence,` + the 4 class probs.
 - `video.mp4` — symlink to the source (use `--copy-video` to copy instead).
