@@ -155,14 +155,13 @@ bash scripts/test.sh VideoMAE checkpoints/VideoMAE_best_macro_<ts>.pt 0
 Writes `results/results_*.csv` (per-class + macro + minority F1 + confusion
 matrix) and `results/scores_*.npz` (raw logits + ground-truth class indices).
 
-### Step 4 (optional) — Inference over a full video + synced viewer
+### Step 4 (optional) — Inference over a full video + viewer
 
 Runs a trained checkpoint over an **entire episode** (not the pre-cut clips) and
-produces a self-contained web viewer that plays the video with the predicted
-label following the playhead. It re-creates the thesis clip scheme at inference
-time — a **3 s window slid with a 1 s stride** over the whole video — classifies
-each window (16-frame / 224² VideoMAE processor), and maps each window's argmax
-to a **per-second** label.
+shows the video together with the predicted label per second. It re-creates the
+thesis clip scheme at inference time — a **3 s window slid with a 1 s stride**
+over the whole video — classifies each window (16-frame / 224² VideoMAE
+processor), and maps each window's argmax to a **per-second** label.
 
 Just pick a case from the test set — **no paths to type**:
 
@@ -186,33 +185,54 @@ Once picked, it **auto-resolves the full-episode video and its annotation** by
 recovering the case id from the clip filename (`<case>_interval_…`) and walking
 up to the sibling `Unprocessed_data/{videos,anot_files}/<case_id>.*` tree
 (the layout produced by `data_process.py`). No need to know where the raw files
-live.
+live. Pass a `CASE` id as the 5th arg to skip the menu
+(`… VideoMAE <ckpt> 0 8000 11848523`).
 
-Args: `MODEL CKPT [GPU] [PORT] [CASE]` — pass a `CASE` id as the 5th arg to skip
-the menu (e.g. `… VideoMAE <ckpt> 0 8000 11848523`). Under the hood this is:
+#### Two output modes
+
+**Offline / headless VM (default) — a standalone annotated `.mp4`.** The script
+burns the predictions onto every frame (current label + confidence chip, a
+colour-coded per-second timeline with a moving playhead, and — when an annotation
+exists — a ground-truth strip below it) and writes
+`viewer_out/<case_id>/annotated.mp4`. **No server, no browser, no network** — just
+copy the one file off the VM and play it in any media player (VLC):
 
 ```bash
-python -m src.infer_video --model VideoMAE --model_path <ckpt.pt> --serve   # menu
-# or run any video directly, bypassing the test set:
-python -m src.infer_video --model VideoMAE --model_path <ckpt.pt> \
-    --video /…/<case_id>.mp4 [--annotation /…/<case_id>.txt] --serve
+bash scripts/infer_video.sh VideoMAE checkpoints/VideoMAE_best_macro_<ts>.pt
+# then, from your laptop:
+scp <user>@<vm>:/…/videomae-unimodal/viewer_out/11848523/annotated.mp4 .
 ```
 
-Outputs land in `viewer_out/<case_id>/`:
+**Interactive HTML viewer (needs a reachable browser).** If you *can* forward a
+port (SSH / VS Code Remote), set `SERVE=1` to serve a page that plays the video
+with the label following the playhead and a clickable timeline:
 
-- `viewer.html` — plays the video with a live class chip + confidence, a
-  colour-coded **per-second timeline** (click to seek), and — when an annotation
-  is found (or given) — a **ground-truth** strip below it for comparison
-  (disable with `--no-gt`). Ground truth uses the thesis' `for_predict` rule
-  (dominant of stim/vent/suction over the 3 s window if ≥ 0.50, else non_target).
+```bash
+SERVE=1 bash scripts/infer_video.sh VideoMAE checkpoints/VideoMAE_best_macro_<ts>.pt 0 8000
+# open http://localhost:8000/viewer.html  (Range-capable server, so scrubbing works)
+```
+
+Under the hood both modes are `python -m src.infer_video`:
+
+```bash
+python -m src.infer_video --model VideoMAE --model_path <ckpt.pt> --render-video  # offline mp4
+python -m src.infer_video --model VideoMAE --model_path <ckpt.pt> --serve          # html viewer
+# run any video directly, bypassing the test set:
+python -m src.infer_video --model VideoMAE --model_path <ckpt.pt> \
+    --video /…/<case_id>.mp4 [--annotation /…/<case_id>.txt] --render-video
+```
+
+Every run also writes, into `viewer_out/<case_id>/`:
+
 - `predictions.json` — per-second + per-window predictions + metadata.
 - `predictions.csv` — per-window `start,end,label,confidence,` + the 4 class probs.
-- `video.mp4` — symlink to the source (use `--copy-video` to copy instead).
+- `viewer.html` + `video.mp4` — the HTML player and the source video (a symlink;
+  use `--copy-video` so the folder is portable and `viewer.html` can be opened
+  locally via `file://` after copying it off the VM).
 
-`--serve` starts a **Range-capable** HTTP server on `0.0.0.0`, so video scrubbing
-works and the port forwards cleanly over SSH / VS Code Remote — open
-`http://localhost:8000/viewer.html`. Without `--serve`, the files are written but
-not served (plain `python -m http.server` won't support video seeking).
+Ground truth is overlaid automatically when an annotation is found (disable with
+`--no-gt`). It uses the thesis' `for_predict` rule (dominant of
+stim/vent/suction over the 3 s window if ≥ 0.50, else non_target).
 
 > Predictions use VideoMAE's own 16-frame / 224² preprocessing (not MoViNet's
 > 50-frame pipeline), the same backbone-driven difference documented above.

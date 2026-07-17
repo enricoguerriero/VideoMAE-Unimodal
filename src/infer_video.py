@@ -10,7 +10,9 @@ of the 4 activities (non_target / stimulation / ventilation / suction). Each
 window's argmax is mapped to a per-second timeline so you get one predicted label
 per second of the episode.
 
-Outputs (into --out-dir, default: viewer_out/<video-stem>/):
+Outputs (into --out-dir, default: viewer_out/<case-or-video-stem>/):
+    annotated.mp4      (with --render-video) STANDALONE video with the label +
+                       timeline burned onto every frame — offline, no server
     predictions.json   per-second + per-window predictions + metadata
     predictions.csv    per-window (start,end,label,confidence,probs...)
     viewer.html        self-contained page: plays the video with the predicted
@@ -18,17 +20,22 @@ Outputs (into --out-dir, default: viewer_out/<video-stem>/):
     video.mp4          symlink (or copy with --copy-video) to the source video
 
 Easiest use — pick a case from the test set (no paths to type):
-    python -m src.infer_video --model VideoMAE --model_path <ckpt.pt> --serve
+    python -m src.infer_video --model VideoMAE --model_path <ckpt.pt> --render-video
 This lists the cases in data/test.csv; once you pick one it auto-resolves the
 full-episode video AND its annotation from the sibling `Unprocessed_data` tree
 (see src/data/data_process.py). Add --case <case_id> to skip the menu.
 
 Or point it at any video directly:
     python -m src.infer_video --model VideoMAE --model_path <ckpt.pt> \
-        --video /path/to/<case_id>.mp4 [--annotation /path/to/<case_id>.txt] --serve
+        --video /path/to/<case_id>.mp4 [--annotation /path/to/<case_id>.txt] --render-video
 
-Then open the printed http://localhost:<port>/viewer.html (forward the port over
-SSH / VS Code Remote). --serve uses a Range-capable server so scrubbing works.
+OFFLINE / headless VM (no localhost): use --render-video. It writes a single
+annotated.mp4 you copy off the VM (scp) and play in any media player (VLC) — no
+browser or network needed.
+
+ONLINE (a browser can reach the VM): use --serve instead for an interactive HTML
+viewer at http://localhost:<port>/viewer.html (forward the port over SSH / VS Code
+Remote). --serve uses a Range-capable server so scrubbing works.
 
 Ground truth is overlaid automatically when an annotation file is found (the
 5-column TSV from Unprocessed_data/anot_files): a second timeline of the
@@ -312,6 +319,102 @@ def serve(directory, port):
 
 
 # ---------------------------------------------------------------------------
+# Offline output: burn the predictions into a standalone .mp4
+# ---------------------------------------------------------------------------
+def _hex_to_bgr(h):
+    h = h.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return (b, g, r)
+
+
+def render_annotated_video(src_video, dst_video, fps, per_second, gt_second,
+                           class_names, colors_hex):
+    """Write a self-contained mp4 with the predicted label + timeline drawn on
+    every frame — no server/browser needed, plays in any local media player.
+
+    Layout: original frame on top, then a footer with a per-second predicted
+    timeline (and a ground-truth timeline when available), a moving playhead,
+    and a colour legend. A label chip is overlaid on the top-left of each frame.
+    """
+    cap = cv2.VideoCapture(str(src_video))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video for rendering: {src_video}")
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    dur = total / fps if fps else 0.0
+    bgr = {int(k): _hex_to_bgr(v) for k, v in colors_hex.items()}
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    bar_h, gap, pad = 20, 5, 8
+    legend_h = 20
+    n_bars = 2 if gt_second else 1
+    footer = pad + n_bars * bar_h + (gap if gt_second else 0) + gap + legend_h + pad
+    seg = W / max(dur, 1.0)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(str(dst_video), fourcc, fps, (W, H + footer))
+    if not out.isOpened():
+        raise RuntimeError(f"Could not open VideoWriter for {dst_video}")
+
+    def draw_bar(canvas, arr, y):
+        for d in arr:
+            x0 = int(d["t"] * seg)
+            x1 = int((d["t"] + 1) * seg)
+            cv2.rectangle(canvas, (x0, y), (max(x1, x0 + 1), y + bar_h),
+                          bgr[d["label"]], -1)
+
+    y_pred = H + pad
+    y_gt = y_pred + bar_h + gap
+    y_legend = (y_gt + bar_h if gt_second else y_pred + bar_h) + gap
+    ph_top, ph_bot = y_pred, (y_gt + bar_h if gt_second else y_pred + bar_h)
+
+    idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        t = idx / fps if fps else 0.0
+        canvas = np.full((H + footer, W, 3), (24, 20, 18), np.uint8)
+        canvas[:H, :, :] = frame
+
+        # current-label chip (top-left of the frame)
+        sec = min(len(per_second) - 1, int(t)) if per_second else 0
+        d = per_second[max(0, sec)] if per_second else {"label": 0, "conf": None}
+        conf = d.get("conf")
+        text = class_names[d["label"]] + (f"  {conf:.2f}" if conf is not None else "")
+        (tw, th), _ = cv2.getTextSize(text, font, 0.8, 2)
+        cv2.rectangle(canvas, (10, 10), (10 + tw + 18, 10 + th + 16), bgr[d["label"]], -1)
+        cv2.putText(canvas, text, (19, 10 + th + 9), font, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
+
+        # timelines + playhead
+        draw_bar(canvas, per_second, y_pred)
+        cv2.putText(canvas, "PRED", (4, y_pred - 2), font, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+        if gt_second:
+            draw_bar(canvas, gt_second, y_gt)
+            cv2.putText(canvas, "GT", (4, y_gt - 2), font, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+        px = int(t / max(dur, 1.0) * W)
+        cv2.line(canvas, (px, ph_top), (px, ph_bot + bar_h), (255, 255, 255), 1)
+
+        # legend
+        lx = 8
+        for i, name in enumerate(class_names):
+            cv2.rectangle(canvas, (lx, y_legend), (lx + 14, y_legend + 14), bgr[i], -1)
+            cv2.putText(canvas, name, (lx + 18, y_legend + 12), font, 0.4,
+                        (220, 220, 220), 1, cv2.LINE_AA)
+            (nw, _), _ = cv2.getTextSize(name, font, 0.4, 1)
+            lx += 18 + nw + 22
+
+        out.write(canvas)
+        idx += 1
+        if fps and idx % (int(fps) * 30 or 1) == 0:
+            logger.info(f"  rendered {idx}/{total} frames ({idx / fps:.0f}s)")
+
+    cap.release()
+    out.release()
+
+
+# ---------------------------------------------------------------------------
 # Viewer HTML
 # ---------------------------------------------------------------------------
 def write_viewer(out_dir, data):
@@ -575,6 +678,9 @@ def main():
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--copy-video", action="store_true",
                     help="Copy the video into out-dir instead of symlinking.")
+    ap.add_argument("--render-video", action="store_true",
+                    help="Burn predictions into a standalone annotated.mp4 (offline: "
+                         "no server/browser needed — just copy the file off the VM).")
     ap.add_argument("--serve", action="store_true", help="Serve the viewer over HTTP.")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--debug", action="store_true")
@@ -659,12 +765,23 @@ def main():
     logger.info(f"Wrote viewer -> {out_dir}/viewer.html")
     logger.info(f"Predictions  -> {out_dir}/predictions.json  (+ .csv)")
 
+    # ---- offline: burn predictions into a standalone annotated.mp4 ----
+    if args.render_video:
+        annotated = out_dir / "annotated.mp4"
+        logger.info("Rendering annotated video (this decodes every frame)…")
+        render_annotated_video(video_path, annotated, fps, per_second, gt_second,
+                               CLASSES, CLASS_COLORS)
+        logger.info(f"Annotated MP4 -> {annotated}")
+        logger.info("Copy it off the VM and play it in any media player (VLC), e.g.:")
+        logger.info(f"  scp <user>@<vm>:{annotated.resolve()} .")
+
     if args.serve:
         serve(out_dir, args.port)
-    else:
-        logger.info("Open the viewer with:")
-        logger.info(f"  python -m src.infer_video ... --serve   (or)")
-        logger.info(f"  python -m http.server -d {out_dir} {args.port}  # note: no video scrubbing")
+    elif not args.render_video:
+        logger.info("No display? Re-run with --render-video for a standalone annotated.mp4,")
+        logger.info("or copy the whole folder off the VM and open viewer.html locally:")
+        logger.info(f"  python -m src.infer_video ... --render-video   (offline, single file)")
+        logger.info(f"  (viewer.html needs --copy-video so video.mp4 is a real file, not a symlink)")
 
 
 if __name__ == "__main__":
