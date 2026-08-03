@@ -17,9 +17,9 @@ test_data:       data/test.csv
 
 # ---------------------------------------------------------------- runtime
 device: cuda
-batch_size: 8            # thesis MoViNet used 48; VideoMAE is heavier — tune to VRAM
+batch_size: 4            # thesis MoViNet used 48; VideoMAE is heavier — tune to VRAM
 num_workers: 8
-num_epochs: 80
+num_epochs: 20
 train_backbone: true     # full-backbone fine-tuning (VideoMAE has no LoRA)
 attention_pooling: false # false => CLS token (base) / internal mean pool (giant)
 validation_step: null    # e.g. 5000 to validate mid-epoch; null = end-of-epoch only
