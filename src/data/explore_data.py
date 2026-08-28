@@ -41,7 +41,7 @@ from pathlib import Path
 import pandas as pd
 
 from .manifest import evidence_masses, explain_bad_manifest, read_manifest
-from .spec import BUCKET_NAMES, DataSpec
+from .spec import BUCKET_NAMES, TAG_BEARING_BUCKETS as TAG_BEARING, DataSpec
 
 # A class with fewer than this many clips in an eval split gives an F1 whose
 # smallest possible change is coarse enough to be noise. Warned about, not enforced.
@@ -176,6 +176,7 @@ def report_corpus(df: pd.DataFrame, spec: DataSpec, sites: list[str]) -> None:
                   "  data_process.py applied. Moving `thresholds` in the data config\n"
                   "  changes the tagged site only; compare sites with that in mind.")
 
+    report_fraction_effect(df, spec, sites)
     report_implied_cut(df, spec, sites)
     report_supervision(df, spec, sites)
 
@@ -244,6 +245,75 @@ def report_supervision(df: pd.DataFrame, spec: DataSpec, sites: list[str]) -> No
     print("  pos_weight is the sqrt_inv_freq value training would derive from these\n"
           "  counts. `masked` clips cost nothing and bias nothing — they are simply\n"
           "  excluded from that activity's loss term.")
+
+
+def label_name(label, spec: DataSpec) -> str:
+    """Human name for a resolved ClipLabel (None -> DROPPED)."""
+    if label is None:
+        return DROPPED
+    if spec.is_multilabel:
+        active = [a for a, t, m in zip(spec.activities, label.targets, label.mask)
+                  if t == 1.0 and m == 1.0]
+        masked = any(m == 0.0 for m in label.mask)
+        name = "+".join(active) or spec.negative_class
+        return f"{name} (partial)" if masked else name
+    return spec.class_names[label.class_index]
+
+
+def report_fraction_effect(df: pd.DataFrame, spec: DataSpec, sites: list[str]) -> None:
+    """How much the fractions change the label, where they exist.
+
+    This is the cross-site asymmetry the mixed corpus creates, measured rather
+    than assumed. A TAGGED clip is labelled from its fractions, so it can escape
+    its bucket — most importantly, `data_process.py` demoted a clip to
+    `partial/` whenever an "Ignored label" interval touched it, even when the
+    activity itself was well above threshold, and the fractions put those clips
+    back. An UNTAGGED clip cannot do that: its bucket is final.
+
+    So the tagged site gets positives the untagged site cannot get from the same
+    evidence. That is a labelling difference between hospitals, and it lands in
+    exactly the comparison the per-site test sets exist to make.
+    """
+    if "tagged" not in df.columns or "clip_dir" not in df.columns:
+        return
+    d = df[df["tagged"].astype(int) == 1]
+    d = d[d["bucket"].astype(int).isin(sorted(TAG_BEARING))]
+    if d.empty:
+        return
+
+    memo, per_site, examples = {}, Counter(), Counter()
+    keys = list(zip(d["bucket"].astype(int), d["clip_dir"],
+                    *(d[c].astype(float) for c in spec.frac_columns())))
+    for key, site in zip(keys, d["site"]):
+        if key not in memo:
+            fracs = dict(zip(spec.activities, key[2:]))
+            acts = spec.activities_from_path(key[1])
+            with_frac = label_name(spec.resolve(int(key[0]), fracs, tagged=True), spec)
+            bucket_only = label_name(
+                spec.resolve(int(key[0]), fracs, tagged=False, dir_activities=acts), spec)
+            memo[key] = (with_frac, bucket_only)
+        a, b = memo[key]
+        if a != b:
+            per_site[site] += 1
+            examples[(int(key[0]), b, a)] += 1
+
+    total = int(per_site.total()) if hasattr(per_site, "total") else sum(per_site.values())
+    print(f"\neffect of having fractions ({len(d):,} tagged clips in tag-bearing buckets)")
+    if not total:
+        print("  none — every tagged clip resolves the same way its bucket alone would.")
+        return
+    for site in sites:
+        n = int(d["site"].eq(site).sum())
+        if n:
+            print(f"  {site:<10}{per_site[site]:>8,} of {n:,} clips "
+                  f"({100 * per_site[site] / n:.1f}%) get a label their bucket alone "
+                  f"would not give")
+    print(f"  {'':<10}{'bucket':>8}  {'from bucket alone':<28} -> with fractions")
+    for (bucket, b, a), n in examples.most_common(6):
+        print(f"  {'':<10}{bucket:>8}  {b:<28} -> {a}  ({n:,})")
+    print("  An untagged site cannot make these moves, so this is a labelling\n"
+          "  difference BETWEEN hospitals. Small numbers are noise; a large share\n"
+          "  means the per-site scores are not measuring the same task.")
 
 
 def report_implied_cut(df: pd.DataFrame, spec: DataSpec, sites: list[str]) -> None:

@@ -472,9 +472,10 @@ class DataSpec:
             f"  task              : {self.task}  ({self.activation} head, "
             f"{'masked BCE' if self.is_multilabel else 'weighted CE'})",
             f"  outputs           : {self.num_classes} — {', '.join(self.class_names)}",
-            f"  thresholds        : " + ", ".join(
+            f"  LABEL cut (frac of the 3 s window that must be the activity)",
+            f"    positive if     : " + ", ".join(
                 f"{a}>={self.thresholds[a]:.2f}" for a in self.activities),
-            f"  weak/negative     : frac <= {self.weak_threshold:.2f}",
+            f"    negative if     : frac <= {self.weak_threshold:.2f}",
             f"  ambiguous band    : {self.ambiguous}",
             f"  buckets kept      : {kept}  (dropped: "
             f"{[b for b in sorted(BUCKET_NAMES) if b not in kept]})",
@@ -482,8 +483,10 @@ class DataSpec:
         if not self.is_multilabel:
             lines.append(f"  >=2 activities    : {self.overlap_resolution}")
         else:
-            lines.append("  decision thresh.  : " + ", ".join(
-                f"{a}@{self.decision_thresholds.get(a, 0.5):.2f}" for a in self.activities))
+            lines.append("  PREDICT cut (sigmoid probability, unrelated to the label cut)")
+            lines.append("    predict 1 if    : " + ", ".join(
+                f"p({a})>={self.decision_thresholds.get(a, 0.5):.2f}"
+                for a in self.activities))
         return "\n".join(lines)
 
 
