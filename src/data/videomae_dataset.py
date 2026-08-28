@@ -114,10 +114,17 @@ class VideoMAEDataset(Dataset):
                     f"[0, {spec.num_classes}): e.g. {bad[:5].tolist()}")
             return raw.reset_index(drop=True), labels, None, 0
 
+        # `tagged`/`clip_dir` are absent from manifests built before fraction tags
+        # were handled per site; assume tagged (the old behaviour) when missing.
+        has_tag_cols = "tagged" in raw.columns and "clip_dir" in raw.columns
         keep_idx, targets, masks = [], [], []
         for i, row in enumerate(raw.itertuples(index=False)):
             fracs = {a: float(getattr(row, f"frac_{a}")) for a in spec.activities}
-            label = spec.resolve(int(row.bucket), fracs)
+            tagged = bool(int(getattr(row, "tagged"))) if has_tag_cols else True
+            dir_acts = (spec.activities_from_path(getattr(row, "clip_dir"))
+                        if has_tag_cols else ())
+            label = spec.resolve(int(row.bucket), fracs, tagged=tagged,
+                                 dir_activities=dir_acts)
             if label is None:
                 continue
             keep_idx.append(i)

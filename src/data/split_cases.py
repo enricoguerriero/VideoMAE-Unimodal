@@ -84,6 +84,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from .manifest import evidence_masses, explain_bad_manifest
 from .spec import DataSpec
 
 # The thesis' 14 held-out cases (DRC: 4, Haydom: 10). They are SEEDS for the
@@ -122,12 +123,13 @@ def case_features(df: pd.DataFrame, spec: DataSpec) -> dict[str, dict]:
     docstring on why that matters.
     """
     feats = {}
-    frac_cols = spec.frac_columns()
-    for case, g in df.groupby("case_id", sort=True):
-        f = {"site": g["site"].iloc[0], "cases": 1.0, "clips": float(len(g))}
+    mass = evidence_masses(df, spec)
+    for case, idx in df.groupby("case_id", sort=True).groups.items():
+        g = mass.loc[idx]
+        f = {"site": df.loc[idx, "site"].iloc[0], "cases": 1.0, "clips": float(len(idx))}
         for a in spec.activities:
-            f[f"mass_{a}"] = float(g[f"frac_{a}"].sum())
-        f["negatives"] = float((g[frac_cols].astype(float).sum(axis=1) == 0).sum())
+            f[f"mass_{a}"] = float(g[a].sum())
+        f["negatives"] = float((g.sum(axis=1) == 0).sum())
         feats[case] = f
     return feats
 
@@ -298,10 +300,15 @@ def label_distribution(df: pd.DataFrame, spec: DataSpec):
     kept, dropped = Counter(), 0
     memo: dict[tuple, object] = {}
     frac_cols = spec.frac_columns()
-    for key in zip(df["bucket"].astype(int), *(df[c].astype(float) for c in frac_cols)):
+    tagged_col = (df["tagged"].astype(int) if "tagged" in df.columns
+                  else pd.Series(1, index=df.index))
+    dir_col = df["clip_dir"] if "clip_dir" in df.columns else pd.Series("", index=df.index)
+    for key in zip(df["bucket"].astype(int), tagged_col, dir_col,
+                   *(df[c].astype(float) for c in frac_cols)):
         if key not in memo:
-            fracs = dict(zip(spec.activities, key[1:]))
-            label = spec.resolve(int(key[0]), fracs)
+            fracs = dict(zip(spec.activities, key[3:]))
+            label = spec.resolve(int(key[0]), fracs, tagged=bool(key[1]),
+                                 dir_activities=spec.activities_from_path(key[2]))
             if label is None:
                 memo[key] = None
             elif spec.is_multilabel:
@@ -375,10 +382,7 @@ def main():
     required = ["video_path", "case_id", "site", "bucket"] + spec.frac_columns()
     missing_cols = [c for c in required if c not in df.columns]
     if missing_cols:
-        raise SystemExit(
-            f"{args.manifest} is missing columns {missing_cols}. It was probably built "
-            f"by an older build_manifest.py (or with different `activities`). Re-run "
-            f"`python -m src.data.build_manifest ...` to regenerate it.")
+        raise SystemExit(explain_bad_manifest(args.manifest, df, missing_cols))
 
     feats = case_features(df, spec)
     keys = dims(spec)

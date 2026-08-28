@@ -61,6 +61,21 @@ BUCKET_NAMES = {
 
 DEFAULT_DATA_CONFIG = "configs/data.yaml"
 
+#: Buckets whose clips have, by construction, a non-zero overlap with at least
+#: one activity — so data_process.py's `_overlap_suffix` MUST have written a
+#: `_stim0.67`-style tag for them. A clip in one of these buckets with no tag
+#: therefore comes from an older processing run that did not write tags at all
+#: (this is the case for the Haydom tree), and its fractions are UNKNOWN rather
+#: than zero. See `resolve` for how those clips are labelled instead.
+TAG_BEARING_BUCKETS = frozenset({1, 2, 3, 6, 7, 8})
+
+#: Stand-in fractions for an untagged clip, used only where a NUMBER is needed
+#: (the split's balancing masses). Buckets 1/2/3/7 assert "at or above
+#: threshold", buckets 6/8 assert "present but below it" — the midpoint of the
+#: ambiguous band is the least-wrong single value for the latter.
+NOMINAL_STRONG_FRAC = 1.0
+NOMINAL_PARTIAL_FRAC = 0.35
+
 # Filename fractions are written with `f"{frac:.2f}"`, so a value that should be
 # exactly at a threshold can land 0.005 below it. Absorb the rounding.
 _FRAC_EPS = 1e-6
@@ -251,25 +266,56 @@ class DataSpec:
         return sorted(b for b, p in self.buckets.items() if p == "keep")
 
     # ------------------------------------------------------------------ stage 1
-    def parse_stem(self, stem: str) -> tuple[int | None, dict[str, float]]:
-        """Filename stem -> (bucket, {activity: fraction}).
+    def parse_stem(self, stem: str) -> tuple[int | None, dict[str, float], bool]:
+        """Filename stem -> (bucket, {activity: fraction}, tagged).
 
         Clip stems look like
             {case}_interval_{n}_start_{ms}_end_{ms}[_stim0.67][_vent0.55]_{bucket}
-        Activities with no tag had zero overlap. Returns (None, {}) when the stem
-        does not follow the convention.
+
+        `tagged` is False when the stem carries NO fraction tag but its bucket
+        requires one (see TAG_BEARING_BUCKETS) — i.e. the clip predates the
+        tag-writing processor and its fractions are unknown, not zero. For every
+        other clip `tagged` is True and the (possibly all-zero) fractions are
+        real. Returns (None, {}, False) when the stem breaks the convention.
         """
         try:
             bucket = int(stem.rsplit("_", 1)[1])
         except (ValueError, IndexError):
-            return None, {}
+            return None, {}, False
         if bucket not in BUCKET_NAMES:
-            return None, {}
+            return None, {}, False
         fracs = {a: 0.0 for a in self.activities}
         by_tag = {self.tag_keys[a]: a for a in self.activities}
+        n_tags = 0
         for tag, value in self._tag_re().findall(stem):
             fracs[by_tag[tag]] = float(value)
-        return bucket, fracs
+            n_tags += 1
+        tagged = n_tags > 0 or bucket not in TAG_BEARING_BUCKETS
+        return bucket, fracs, tagged
+
+    def activities_from_path(self, rel_dir) -> tuple[str, ...]:
+        """Activities named by the clip's DIRECTORY, in `activities` order.
+
+        data_process.py files every clip under a directory that names the
+        activities involved — `ventilation/`, `partial/stimulation/`,
+        `target_overlap/stimulation+ventilation/` — independently of the
+        filename tag. That makes the activity IDENTITY recoverable even for an
+        untagged corpus; only the exact fractions are lost.
+
+        Matching is case-insensitive and tolerant of separators, so a tree that
+        spells the combo differently still resolves.
+        """
+        if not rel_dir:
+            return ()
+        parts = re.split(r"[^a-z0-9]+", str(rel_dir).lower())
+        known = {a.lower(): a for a in self.activities}
+        found = [known[p] for p in parts if p in known]
+        return tuple(a for a in self.activities if a in found)
+
+    @staticmethod
+    def expects_tag(bucket: int) -> bool:
+        """Would data_process.py have written a fraction tag for this bucket?"""
+        return int(bucket) in TAG_BEARING_BUCKETS
 
     def _tag_re(self):
         cached = getattr(self, "_tag_re_cache", None)
@@ -293,14 +339,69 @@ class DataSpec:
             return "negative"
         return "ambiguous"
 
-    def resolve(self, bucket: int, fracs: dict[str, float]) -> ClipLabel | None:
-        """(bucket, fractions) -> ClipLabel, or None if the clip is dropped."""
+    def _states_from_fracs(self, fracs: dict[str, float]) -> dict[str, str]:
+        return {a: self._activity_state(a, float(fracs.get(a, 0.0)))
+                for a in self.activities}
+
+    def _states_from_bucket(self, bucket: int, dir_activities) -> dict[str, str] | None:
+        """Per-activity state for an UNTAGGED clip, from bucket + directory.
+
+        The bucket IS the processor's labelling decision, so it carries the same
+        information the fractions would have been thresholded into — just
+        already thresholded, at the cut the processor used:
+
+            0 / 4 / 5   nothing annotated            -> every activity negative
+            1 / 2 / 3   this activity at/above its threshold, the others below
+                        `weak_threshold` (the processor's purity guard)
+                                                     -> positive / negative
+            7           every activity in the combo is above threshold; a further
+                        activity may be weakly present with no evidence either way
+                                                     -> positive / AMBIGUOUS
+            6 / 8       every activity named is present but BELOW threshold
+                                                     -> ambiguous / negative
+
+        Returns None when the directory names no activity for a bucket that
+        needs one — the identity is then genuinely unrecoverable and the clip
+        must be dropped rather than guessed at.
+        """
+        present = set(dir_activities)
+        if bucket in (0, 4, 5):
+            return {a: "negative" for a in self.activities}
+        if not present:
+            return None
+        if bucket in (1, 2, 3):
+            return {a: ("positive" if a in present else "negative") for a in self.activities}
+        if bucket == 7:
+            return {a: ("positive" if a in present else "ambiguous") for a in self.activities}
+        if bucket in (6, 8):
+            return {a: ("ambiguous" if a in present else "negative") for a in self.activities}
+        return None
+
+    def resolve(self, bucket: int, fracs: dict[str, float], tagged: bool = True,
+                dir_activities=()) -> ClipLabel | None:
+        """(bucket, fractions) -> ClipLabel, or None if the clip is dropped.
+
+        `tagged=False` means the clip's filename carries no fraction tags although
+        its bucket requires them, so the fractions are UNKNOWN (not zero) and the
+        label comes from the bucket and the clip's directory instead — see
+        `_states_from_bucket`. Two consequences worth knowing:
+
+          * `thresholds` and `weak_threshold` are inert for such clips. They were
+            effectively applied when the clips were cut and cannot be re-tuned.
+          * `overlap_resolution: dominant` has nothing to rank by, so a multiclass
+            clip with two positives is dropped rather than assigned arbitrarily.
+        """
         if not self.keeps_bucket(bucket):
+            return None
+
+        states = (self._states_from_fracs(fracs) if tagged
+                  else self._states_from_bucket(int(bucket), dir_activities))
+        if states is None:
             return None
 
         targets, mask = [], []
         for a in self.activities:
-            state = self._activity_state(a, float(fracs.get(a, 0.0)))
+            state = states[a]
             if state == "positive":
                 targets.append(1.0)
                 mask.append(1.0)
@@ -330,17 +431,38 @@ class DataSpec:
             if any(m == 0.0 for m in mask):
                 return None
             return ClipLabel(class_index=0)
-        if self.overlap_resolution == "dominant":
+        if self.overlap_resolution == "dominant" and tagged:
             best = max(positives, key=lambda i: float(fracs.get(self.activities[i], 0.0)))
             return ClipLabel(class_index=1 + best)
         return None
 
+    def evidence_mass(self, bucket: int, fracs: dict[str, float], tagged: bool = True,
+                      dir_activities=()) -> dict[str, float]:
+        """Per-activity "how much of this 3 s window was activity a", for the SPLIT.
+
+        Tagged clips report their real fractions. Untagged ones report a nominal
+        value from the bucket — the split needs a comparable NUMBER per activity
+        to balance sites against each other, and a site whose fractions are all
+        zero would otherwise be balanced on clip counts alone, ignoring its
+        activity mix entirely.
+
+        Config-independent by construction (no threshold is consulted), which is
+        what keeps the split reproducible across data-config edits.
+        """
+        if tagged:
+            return {a: float(fracs.get(a, 0.0)) for a in self.activities}
+        present = set(dir_activities)
+        if not present:
+            return {a: 0.0 for a in self.activities}
+        nominal = NOMINAL_PARTIAL_FRAC if int(bucket) in (6, 8) else NOMINAL_STRONG_FRAC
+        return {a: (nominal if a in present else 0.0) for a in self.activities}
+
     def resolve_stem(self, stem: str) -> ClipLabel | None:
         """Convenience: filename stem -> ClipLabel (both stages at once)."""
-        bucket, fracs = self.parse_stem(stem)
+        bucket, fracs, tagged = self.parse_stem(stem)
         if bucket is None:
             return None
-        return self.resolve(bucket, fracs)
+        return self.resolve(bucket, fracs, tagged=tagged)
 
     # ------------------------------------------------------------------ report
     def describe(self) -> str:

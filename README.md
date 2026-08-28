@@ -171,7 +171,8 @@ data/split_params.json      exactly how this split was made
 with columns
 
 ```
-video_path, case_id, site, bucket, frac_stimulation, frac_ventilation, frac_suction
+video_path, case_id, site, bucket, clip_dir, tagged,
+frac_stimulation, frac_ventilation, frac_suction
 ```
 
 (the three test CSVs carry one more, `thesis_test`, see below).
@@ -206,6 +207,44 @@ bucket                     Haydom     DRC    TOTAL  policy
   usable clips: ... / ... (..%)
 ```
 
+### Two generations of clips (read this before trusting any label)
+
+The Haydom and DRC trees were cut by **different versions of `data_process.py`**,
+and it matters:
+
+| | DRC | Haydom |
+|---|---|---|
+| filename fraction tags (`_vent0.55`) | yes | **no** |
+| activity directory (`partial/stimulation/`) | yes | yes |
+| `thresholds` in the data config | apply | **inert** — frozen at the cut |
+
+`DataSpec.resolve` originally labelled purely from the filename fractions, so
+every untagged Haydom clip read as "all fractions zero" → `non_target`. That
+silently mislabelled **~35,000 Haydom activity clips**, and it is why an early
+audit showed Haydom contributing 0 cases to all three activities.
+
+The identity was never actually lost: `data_process.py` files every clip under a
+directory that names the activities involved (`ventilation/`,
+`partial/stimulation/`, `target_overlap/stimulation+ventilation/`). So the
+manifest now records `clip_dir` and `tagged` per clip, and `DataSpec.resolve`
+falls back to bucket + directory when the fractions are absent:
+
+| bucket | untagged clip resolves to |
+|---|---|
+| 0, 4, 5 | every activity negative |
+| 1, 2, 3 | that activity positive, the others negative (the processor's purity guard) |
+| 7 | every activity in the combo positive; any *other* activity ambiguous |
+| 6, 8 | every activity named ambiguous; the rest negative |
+
+What an untagged site loses is only re-thresholding — its labels are exactly the
+ones `data_process.py` assigned when it cut the clips. `build_manifest` prints a
+`directory → bucket → recovered activities` table so the recovery is auditable,
+and warns on any clip whose directory disagrees with its bucket.
+
+**For multilabel this is the difference between a usable Haydom and no Haydom at
+all:** bucket 6 (`partial`) is 25,354 clips, 20,854 of them Haydom, and with
+`ambiguous: mask` each one still supervises the activities it *can* speak to.
+
 ### One test set per hospital
 
 Haydom and DRC differ in camera, lighting, staff and protocol, so a single pooled
@@ -223,7 +262,7 @@ profile on five dimensions at once:
 | number of cases | without it the selector hits the clip target with many *short* episodes, and the test set ends up systematically shorter than train |
 | number of clips | the size target itself |
 | clips with no annotated activity | keeps the negative/positive balance |
-| fraction-mass of each activity | what puts the rare classes in test in usable numbers |
+| fraction-mass of each activity | what puts the rare classes in test in usable numbers. For an untagged site this is a *nominal* mass from bucket + directory (strong 1.0, partial 0.35) — without it Haydom reports zero activity mass and gets balanced on clip count alone |
 
 All five are **raw evidence, never resolved labels** — so nudging a threshold in
 `configs/data.yaml` cannot reshuffle cases between splits. Validation is chosen

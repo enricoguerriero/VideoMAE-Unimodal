@@ -40,6 +40,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from .manifest import evidence_masses, explain_bad_manifest
 from .spec import BUCKET_NAMES, DataSpec
 
 # A class with fewer than this many clips in an eval split gives an F1 whose
@@ -67,8 +68,9 @@ def resolve_labels(df: pd.DataFrame, spec: DataSpec) -> pd.Series:
     memo: dict[tuple, str] = {}
 
     def name_for(key):
-        bucket, fracs = int(key[0]), dict(zip(spec.activities, key[1:]))
-        label = spec.resolve(bucket, fracs)
+        bucket, fracs = int(key[0]), dict(zip(spec.activities, key[3:]))
+        label = spec.resolve(bucket, fracs, tagged=bool(key[1]),
+                             dir_activities=spec.activities_from_path(key[2]))
         if label is None:
             return DROPPED
         if spec.is_multilabel:
@@ -77,7 +79,11 @@ def resolve_labels(df: pd.DataFrame, spec: DataSpec) -> pd.Series:
             return "+".join(active) or spec.negative_class
         return spec.class_names[label.class_index]
 
-    keys = list(zip(df["bucket"].astype(int), *(df[c].astype(float) for c in frac_cols)))
+    tagged_col = (df["tagged"].astype(int) if "tagged" in df.columns
+                  else pd.Series(1, index=df.index))
+    dir_col = df["clip_dir"] if "clip_dir" in df.columns else pd.Series("", index=df.index)
+    keys = list(zip(df["bucket"].astype(int), tagged_col, dir_col,
+                    *(df[c].astype(float) for c in frac_cols)))
     out = []
     for k in keys:
         if k not in memo:
@@ -94,11 +100,13 @@ def case_table(df: pd.DataFrame, spec: DataSpec) -> pd.DataFrame:
     on bucket policy, which is exactly why the splitter balances on it: moving a
     threshold must not reshuffle cases between splits.
     """
+    masses = evidence_masses(df, spec)
     rows = []
-    for (case, site), g in df.groupby(["case_id", "site"], sort=True):
+    for (case, site), idx in df.groupby(["case_id", "site"], sort=True).groups.items():
+        g = df.loc[idx]
         row = {"case_id": case, "site": site, "clips": len(g)}
         for a in spec.activities:
-            row[f"mass_{a}"] = float(g[f"frac_{a}"].sum())
+            row[f"mass_{a}"] = float(masses.loc[idx, a].sum())
         row["usable"] = int((g["label"] != DROPPED).sum())
         for name in [spec.negative_class, *spec.activities]:
             row[f"n_{name}"] = int((g["label"] == name).sum())
@@ -146,6 +154,24 @@ def report_corpus(df: pd.DataFrame, spec: DataSpec, sites: list[str]) -> None:
         print(f"{b} {BUCKET_NAMES[b]:<24}" + "".join(f"{c:>12,}" for c in counts)
               + f"{sum(counts):>12,}  {policy}")
 
+    if "tagged" in df.columns:
+        print("\nfraction tags (per-activity window coverage in the filename)")
+        print(f"{'':<14}{'tagged':>12}{'untagged':>12}{'':>4}consequence")
+        for s in sites:
+            d = df[df["site"] == s]
+            tg = int(d["tagged"].astype(int).sum())
+            un = len(d) - tg
+            note = ("labelled from bucket + directory; thresholds INERT here"
+                    if un else "thresholds apply normally")
+            print(f"{s:<14}{tg:>12,}{un:>12,}{'':>4}{note}")
+        if int(df["tagged"].astype(int).sum()) < len(df):
+            print("  An untagged site is fully labelled — bucket + directory carry the\n"
+                  "  activity identity — but its labels are frozen at the cut\n"
+                  "  data_process.py applied. Moving `thresholds` in the data config\n"
+                  "  changes the tagged site only; compare sites with that in mind.")
+
+    report_implied_cut(df, spec, sites)
+
     rule(f"2. LABELS under {spec.source} ({spec.task})")
     order = [spec.negative_class, *spec.activities]
     seen = list(dict.fromkeys(order + sorted(set(df["label"]) - set(order) - {DROPPED})))
@@ -160,6 +186,55 @@ def report_corpus(df: pd.DataFrame, spec: DataSpec, sites: list[str]) -> None:
     dropped = [int((df["site"].eq(s) & df["label"].eq(DROPPED)).sum()) for s in sites]
     print(f"{DROPPED:<26}" + "".join(f"{c:>12,}" for c in dropped) + f"{sum(dropped):>12,}")
     print(f"\nusable clips: {usable:,} / {len(df):,} ({100 * usable / max(len(df), 1):.1f}%)")
+
+
+def report_implied_cut(df: pd.DataFrame, spec: DataSpec, sites: list[str]) -> None:
+    """Recover, from the tagged clips themselves, the thresholds each site was CUT at.
+
+    A site's bucket assignment was made once, when the clips were produced, using
+    whatever constants that run of data_process.py held. For a tagged site those
+    constants are still measurable: the smallest `frac_a` among its bucket-a clips
+    IS the strong threshold that was applied, and the largest `frac_other` among
+    them is bounded by the purity guard (`weak_threshold`).
+
+    This matters because an untagged site cannot be re-thresholded at all, so the
+    only way the two hospitals stay comparable is if they were cut the same way.
+    A mismatch here is a cross-site confound, not a tuning opportunity.
+    """
+    if "tagged" not in df.columns:
+        return
+    tagged = df[df["tagged"].astype(int) == 1]
+    if tagged.empty:
+        return
+
+    print("\nimplied cut, measured from the tagged clips (what the processor actually used)")
+    print(f"{'site':<10}{'activity':<14}{'bucket':>7}{'min frac':>10}{'configured':>12}"
+          f"{'max other':>11}{'weak':>7}  verdict")
+    for site in sites:
+        d = tagged[tagged["site"] == site]
+        strong = d[d["bucket"].astype(int).between(1, len(spec.activities))]
+        if strong.empty:
+            print(f"{site:<10}(no tagged activity clips — this site's cut is not "
+                  f"measurable, and not changeable)")
+            continue
+        d = strong
+        for i, activity in enumerate(spec.activities):
+            bucket = i + 1
+            g = d[d["bucket"].astype(int) == bucket]
+            if g.empty:
+                continue
+            own = g[f"frac_{activity}"].astype(float)
+            others = [c for a, c in zip(spec.activities, spec.frac_columns()) if a != activity]
+            max_other = float(g[others].astype(float).to_numpy().max()) if others else 0.0
+            want = spec.thresholds[activity]
+            # fractions are rounded to 2 dp, so allow a rounding step of slack
+            ok = abs(float(own.min()) - want) <= 0.011 and max_other <= spec.weak_threshold + 0.011
+            print(f"{site:<10}{activity:<14}{bucket:>7}{own.min():>10.2f}{want:>12.2f}"
+                  f"{max_other:>11.2f}{spec.weak_threshold:>7.2f}  "
+                  f"{'matches config' if ok else '** DIFFERS **'}")
+    print("  A site whose measured cut differs from the config was produced by a "
+          "different\n  processor run. Aligning the config to it fixes the tagged site "
+          "only — an\n  untagged site keeps the cut it was born with.")
 
 
 # --------------------------------------------------------------------------
@@ -246,24 +321,33 @@ def report_splits(splits: dict[str, pd.DataFrame], df: pd.DataFrame,
         print(f"{name:<20}{len(d):>11,}{pct(len(d), total_clips):>8}"
               f"{d['case_id'].nunique():>8}  {per_site}")
 
-    # label mix, and how far each split drifts from the corpus
+    # Label mix, and how far each split drifts from what it SHOULD look like.
+    # A single-site test file is measured against ITS OWN site: comparing
+    # data/test_drc.csv to the pooled corpus just re-reports that DRC differs
+    # from Haydom, which is not a fact about the split.
     order = [spec.negative_class, *spec.activities]
-    corpus_usable = int((df["label"] != DROPPED).sum())
-    corpus_mix = {n: 100 * int(df["label"].eq(n).sum()) / max(corpus_usable, 1) for n in order}
+
+    def mix_of(d):
+        usable = int((d["label"] != DROPPED).sum())
+        return {n: 100 * int(d["label"].eq(n).sum()) / max(usable, 1) for n in order}, usable
+
+    corpus_mix, corpus_usable = mix_of(df)
+    site_mix = {s: mix_of(df[df["site"] == s])[0] for s in sites}
+
     print("\nlabel mix per split (share of that split's USABLE clips; "
-          "Δ = percentage points vs corpus)")
-    head = f"{'split':<20}{'usable':>10}" + "".join(f"{n[:11]:>13}" for n in order)
+          "Δ = percentage points vs baseline)")
+    head = (f"{'split':<20}{'usable':>10}" + "".join(f"{n[:11]:>13}" for n in order)
+            + "  baseline")
     print(head)
     print(f"{'corpus':<20}{corpus_usable:>10,}" +
           "".join(f"{corpus_mix[n]:>12.1f}%" for n in order))
     for name, d in splits.items():
-        usable = int((d["label"] != DROPPED).sum())
-        cells = ""
-        for n in order:
-            c = int(d["label"].eq(n).sum())
-            share = 100 * c / max(usable, 1)
-            cells += f"{share:>7.1f}% {share - corpus_mix[n]:>+5.1f}"
-        print(f"{name:<20}{usable:>10,}{cells}")
+        present = [s for s in sites if d["site"].eq(s).any()]
+        base = site_mix[present[0]] if len(present) == 1 else corpus_mix
+        label = present[0] if len(present) == 1 else "corpus"
+        mix, usable = mix_of(d)
+        cells = "".join(f"{mix[n]:>7.1f}% {mix[n] - base[n]:>+5.1f}" for n in order)
+        print(f"{name:<20}{usable:>10,}{cells}  vs {label}")
 
     print("\nabsolute class counts per split (what the metrics are computed on)")
     print(f"{'split':<20}" + "".join(f"{n[:12]:>14}" for n in order))
@@ -403,8 +487,7 @@ def main():
     missing = [c for c in ["video_path", "case_id", "site", "bucket"] + spec.frac_columns()
                if c not in df.columns]
     if missing:
-        raise SystemExit(f"{args.manifest} is missing columns {missing}; rebuild it "
-                         f"with the current activity list.")
+        raise SystemExit(explain_bad_manifest(args.manifest, df, missing))
     df["label"] = resolve_labels(df, spec)
     sites = sorted(df["site"].unique())
 

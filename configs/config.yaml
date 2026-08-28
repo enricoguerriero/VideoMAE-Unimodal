@@ -18,9 +18,12 @@
 # ---------------------------------------------------------------- data config
 # WHAT the targets are. Override per run with `--data-config <path>`, which is
 # the clean way to keep several label regimes side by side, e.g.
-#   configs/data.yaml              multiclass, thesis-exact (the default)
 #   configs/data_multilabel.yaml   3 independent activities, co-occurrence kept
-data_config: configs/data.yaml
+#                                  (the default: it is the only regime that can
+#                                  represent a clip where two activities overlap)
+#   configs/data.yaml              multiclass, thesis-exact — use it only for the
+#                                  like-for-like comparison with the thesis
+data_config: configs/data_multilabel.yaml
 
 # ---------------------------------------------------------------- data paths
 train_data:      data/train.csv
