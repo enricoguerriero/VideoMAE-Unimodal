@@ -40,7 +40,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .manifest import evidence_masses, explain_bad_manifest
+from .manifest import evidence_masses, explain_bad_manifest, read_manifest
 from .spec import BUCKET_NAMES, DataSpec
 
 # A class with fewer than this many clips in an eval split gives an F1 whose
@@ -76,7 +76,13 @@ def resolve_labels(df: pd.DataFrame, spec: DataSpec) -> pd.Series:
         if spec.is_multilabel:
             active = [a for a, t, m in zip(spec.activities, label.targets, label.mask)
                       if t == 1.0 and m == 1.0]
-            return "+".join(active) or spec.negative_class
+            masked = any(m == 0.0 for m in label.mask)
+            name = "+".join(active) or spec.negative_class
+            # An all-zero target with something masked out is NOT a clean negative:
+            # a partial/ventilation clip asserts "not stimulation, not suction" and
+            # says nothing about ventilation. Counting it as non_target would
+            # overstate the negatives by the whole partial bucket.
+            return f"{name} (partial)" if masked else name
         return spec.class_names[label.class_index]
 
     tagged_col = (df["tagged"].astype(int) if "tagged" in df.columns
@@ -171,21 +177,73 @@ def report_corpus(df: pd.DataFrame, spec: DataSpec, sites: list[str]) -> None:
                   "  changes the tagged site only; compare sites with that in mind.")
 
     report_implied_cut(df, spec, sites)
+    report_supervision(df, spec, sites)
 
     rule(f"2. LABELS under {spec.source} ({spec.task})")
     order = [spec.negative_class, *spec.activities]
     seen = list(dict.fromkeys(order + sorted(set(df["label"]) - set(order) - {DROPPED})))
-    print(f"{'label':<26}" + "".join(f"{s:>12}" for s in sites) + f"{'TOTAL':>12}{'share':>9}")
+    print(f"{'label':<36}" + "".join(f"{s:>12}" for s in sites) + f"{'TOTAL':>12}{'share':>9}")
     usable = int((df["label"] != DROPPED).sum())
     for name in seen:
         counts = [int((df["site"].eq(s) & df["label"].eq(name)).sum()) for s in sites]
         if sum(counts) == 0:
             continue
-        print(f"{name:<26}" + "".join(f"{c:>12,}" for c in counts)
+        print(f"{name:<36}" + "".join(f"{c:>12,}" for c in counts)
               + f"{sum(counts):>12,}{pct(sum(counts), usable):>9}")
     dropped = [int((df["site"].eq(s) & df["label"].eq(DROPPED)).sum()) for s in sites]
-    print(f"{DROPPED:<26}" + "".join(f"{c:>12,}" for c in dropped) + f"{sum(dropped):>12,}")
+    print(f"{DROPPED:<36}" + "".join(f"{c:>12,}" for c in dropped) + f"{sum(dropped):>12,}")
     print(f"\nusable clips: {usable:,} / {len(df):,} ({100 * usable / max(len(df), 1):.1f}%)")
+
+
+def report_supervision(df: pd.DataFrame, spec: DataSpec, sites: list[str]) -> None:
+    """Per-activity positive / negative / masked counts — the multilabel view.
+
+    Multilabel loss is computed per activity, not per clip, so the clip-level
+    label mix above is the wrong unit for it. What sets `pos_weight` and decides
+    whether an activity is learnable is this table: how many clips assert the
+    activity, how many deny it, and how many decline to say (masked, because the
+    evidence puts it in the ambiguous band).
+    """
+    if not spec.is_multilabel:
+        return
+    tagged_col = (df["tagged"].astype(int) if "tagged" in df.columns
+                  else pd.Series(1, index=df.index))
+    dir_col = df["clip_dir"] if "clip_dir" in df.columns else pd.Series("", index=df.index)
+    keys = list(zip(df["bucket"].astype(int), tagged_col, dir_col,
+                    *(df[c].astype(float) for c in spec.frac_columns())))
+
+    memo, counts = {}, {s: {a: [0, 0, 0] for a in spec.activities} for s in sites}
+    for key, site in zip(keys, df["site"]):
+        if key not in memo:
+            fracs = dict(zip(spec.activities, key[3:]))
+            memo[key] = spec.resolve(int(key[0]), fracs, tagged=bool(key[1]),
+                                     dir_activities=spec.activities_from_path(key[2]))
+        label = memo[key]
+        if label is None:
+            continue
+        for a, t, m in zip(spec.activities, label.targets, label.mask):
+            counts[site][a][0 if m == 0.0 else (1 if t == 1.0 else 2)] += 1
+
+    print("\nper-activity supervision (what the multilabel loss sees)")
+    print(f"{'activity':<16}{'site':<10}{'positive':>11}{'negative':>11}{'masked':>10}"
+          f"{'pos rate':>10}{'pos_weight':>12}")
+    for a in spec.activities:
+        for site in sites:
+            masked, pos, neg = counts[site][a]
+            sup = pos + neg
+            rate = f"{100 * pos / sup:.2f}%" if sup else "-"
+            pw = f"{(neg / pos) ** 0.5:.1f}" if pos else "-"
+            print(f"{a:<16}{site:<10}{pos:>11,}{neg:>11,}{masked:>10,}{rate:>10}{pw:>12}")
+        masked = sum(counts[s][a][0] for s in sites)
+        pos = sum(counts[s][a][1] for s in sites)
+        neg = sum(counts[s][a][2] for s in sites)
+        sup = pos + neg
+        rate = f"{100 * pos / sup:.2f}%" if sup else "-"
+        pw = f"{(neg / pos) ** 0.5:.1f}" if pos else "-"
+        print(f"{'':<16}{'ALL':<10}{pos:>11,}{neg:>11,}{masked:>10,}{rate:>10}{pw:>12}")
+    print("  pos_weight is the sqrt_inv_freq value training would derive from these\n"
+          "  counts. `masked` clips cost nothing and bias nothing — they are simply\n"
+          "  excluded from that activity's loss term.")
 
 
 def report_implied_cut(df: pd.DataFrame, spec: DataSpec, sites: list[str]) -> None:
@@ -288,7 +346,7 @@ def load_splits(paths: list[Path], spec: DataSpec) -> dict[str, pd.DataFrame]:
     for p in paths:
         if not p.exists():
             continue
-        d = pd.read_csv(p)
+        d = read_manifest(p)
         d["case_id"] = d["case_id"].astype(str)
         if "site" not in d.columns:
             d["site"] = "?"
@@ -482,7 +540,7 @@ def main():
     if not args.manifest.exists():
         raise SystemExit(f"manifest not found: {args.manifest} — run build_manifest.py first")
 
-    df = pd.read_csv(args.manifest)
+    df = read_manifest(args.manifest)
     df["case_id"] = df["case_id"].astype(str)
     missing = [c for c in ["video_path", "case_id", "site", "bucket"] + spec.frac_columns()
                if c not in df.columns]

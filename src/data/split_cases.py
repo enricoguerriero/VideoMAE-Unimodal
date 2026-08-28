@@ -84,7 +84,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .manifest import evidence_masses, explain_bad_manifest
+from .manifest import evidence_masses, explain_bad_manifest, read_manifest
 from .spec import DataSpec
 
 # The thesis' 14 held-out cases (DRC: 4, Haydom: 10). They are SEEDS for the
@@ -376,7 +376,7 @@ def main():
     args = p.parse_args()
 
     spec = DataSpec.load(args.data_config)
-    df = pd.read_csv(args.manifest)
+    df = read_manifest(args.manifest)
     df["case_id"] = df["case_id"].astype(str)
 
     required = ["video_path", "case_id", "site", "bucket"] + spec.frac_columns()

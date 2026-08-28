@@ -305,9 +305,9 @@ class DataSpec:
         Matching is case-insensitive and tolerant of separators, so a tree that
         spells the combo differently still resolves.
         """
-        if not rel_dir:
-            return ()
-        parts = re.split(r"[^a-z0-9]+", str(rel_dir).lower())
+        if not isinstance(rel_dir, str) or not rel_dir:
+            return ()  # missing, NaN, or a clip sitting at the site root
+        parts = re.split(r"[^a-z0-9]+", rel_dir.lower())
         known = {a.lower(): a for a in self.activities}
         found = [known[p] for p in parts if p in known]
         return tuple(a for a in self.activities if a in found)

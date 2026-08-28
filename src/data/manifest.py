@@ -19,6 +19,20 @@ import pandas as pd
 from .spec import DataSpec
 
 
+def read_manifest(path) -> pd.DataFrame:
+    """Read a manifest/split CSV with the dtypes it actually needs.
+
+    `case_id` mixes bare digits (Haydom, "11848523") with hyphenated ids (DRC,
+    "2-33998-1"), so pandas infers a mixed-type column and warns. Forcing str
+    also stops "11848523" becoming an int and losing any leading zero.
+
+    `clip_dir` is read with keep_default_na off: an empty directory string is a
+    clip at the site root, not a missing value.
+    """
+    return pd.read_csv(path, dtype={"case_id": str, "clip_dir": str},
+                       keep_default_na=False)
+
+
 def evidence_masses(df: pd.DataFrame, spec: DataSpec) -> pd.DataFrame:
     """Per-clip, per-activity mass — real fractions where the filename carried
     tags, a nominal value from bucket + directory where it did not.

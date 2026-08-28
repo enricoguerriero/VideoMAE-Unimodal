@@ -21,7 +21,9 @@
 #   python -m src.data.explore_data --manifest data/clips_all.csv --splits-dir data
 set -euo pipefail
 
-DATA_CONFIG="${1:-configs/data.yaml}"
+# Defaults to whatever `data_config:` in configs/config.yaml says, so the census
+# you read here is the one training will actually use. Override as argument 1.
+DATA_CONFIG="${1:-$(python -c "import yaml;print(yaml.safe_load(open('configs/config.yaml')).get('data_config','configs/data.yaml'))")}"
 TEST_RATIO="${2:-0.20}"    # share of EACH site's clips held out as its test set
 TRAIN_RATIO="${3:-0.80}"   # share of the remainder used for training
 
