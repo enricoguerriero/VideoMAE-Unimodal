@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Run a trained checkpoint over an ENTIRE episode video and produce a viewer of
-# the video + predicted label per second.
+# the video + predictions per second.
+#
+# The task is read back from the checkpoint. A multiclass model draws ONE
+# colour-coded timeline; a multilabel model draws ONE TIMELINE PER ACTIVITY, so
+# seconds where two activities fire show two lit bars at once.
 #
 # Pick a case interactively from the test set (no paths to type):
 #   bash scripts/infer_video.sh <MODEL> <CKPT> [GPU] [PORT] [CASE]
@@ -25,11 +29,15 @@ CKPT="${2:?path to checkpoint .pt required}"
 GPU="${3:-0}"
 PORT="${4:-8000}"
 CASE="${5:-}"
+DATA_CONFIG="${6:-}"
 SERVE="${SERVE:-0}"
 
 ARGS=(--model "${MODEL}" --model_path "${CKPT}" --test-csv data/test.csv)
 if [[ -n "${CASE}" ]]; then
     ARGS+=(--case "${CASE}")
+fi
+if [[ -n "${DATA_CONFIG}" ]]; then
+    ARGS+=(--data-config "${DATA_CONFIG}")
 fi
 if [[ "${SERVE}" == "1" ]]; then
     ARGS+=(--serve --port "${PORT}")

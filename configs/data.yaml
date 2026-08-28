@@ -1,0 +1,123 @@
+# =============================================================================
+# data.yaml — DATA / LABEL configuration (what the targets ARE)
+# =============================================================================
+# This file owns everything about how a clip on disk becomes a training target.
+# configs/config.yaml owns how the model is trained (LR, epochs, batch size...).
+#
+# Nothing here requires re-cutting videos. Every processed clip written by
+# src/data/data_process.py encodes, IN ITS FILENAME, both its original label
+# bucket and the per-activity fraction of the 3 s window that activity covered:
+#
+#   11848523_interval_7_start_6000_end_9000_stim0.67_vent0.55_7.mp4
+#                                           └────┬─────────┘  └┬┘
+#                                    per-activity fractions   bucket
+#
+# So switching between multiclass and multilabel, moving a threshold, or
+# admitting a previously-dropped bucket is a CONFIG change + a manifest rebuild
+# (`bash scripts/build_data.sh`) — never a re-encode.
+#
+# NOTE ON PRECISION: filename fractions are rounded to 2 decimals by
+# data_process.py (`f"{frac:.2f}"`), i.e. ±0.005 ≈ ±15 ms of a 3 s window. A
+# threshold sitting exactly on a rounding boundary can therefore flip a clip.
+# Irrelevant at the default thresholds; keep it in mind if you set e.g. 0.335.
+# =============================================================================
+
+# ---------------------------------------------------------------- task
+# multiclass : ONE label per clip. Classes = [negative_class] + activities,
+#              indices 0..N. Softmax head + weighted CrossEntropyLoss + argmax.
+#              This is the thesis-comparable setting (4 classes).
+# multilabel : ONE INDEPENDENT BINARY LABEL PER ACTIVITY. Classes = activities
+#              only (3). "no activity" is the all-zero vector, NOT a class.
+#              Sigmoid head + masked BCEWithLogitsLoss + per-class thresholds.
+#              Co-occurring activities (bucket 7) are representable here.
+task: multiclass
+
+# ---------------------------------------------------------------- classes
+# Order matters: it fixes the logit order and every reported metric key.
+activities: [stimulation, ventilation, suction]
+
+# multiclass: the name of index 0 (the "no activity being performed" class).
+# multilabel: used only for reporting the projected multiclass view.
+negative_class: non_target
+
+# Maps each activity to the abbreviation data_process.py writes in the filename
+# tag (`_overlap_suffix`). Change only if you re-generate clips with new tags.
+tag_keys:
+  stimulation: stim
+  ventilation: vent
+  suction: suct
+
+# ---------------------------------------------------------------- labeling
+# THE CORE RULE. For each activity independently, given `frac` = the share of
+# the 3 s window that activity covers:
+#
+#     frac >= thresholds[activity]   ->  POSITIVE   (certain)
+#     frac <= weak_threshold         ->  NEGATIVE   (certain)
+#     otherwise                      ->  AMBIGUOUS  (see `ambiguous` below)
+#
+# Defaults are the thesis' values (data_process.py: STRONG_THRESHOLD = 0.50,
+# suction_threshold = 0.25, weak_threshold = 0.20).
+#
+# Buckets decide which clips are ELIGIBLE; thresholds decide their LABEL. If you
+# set `buckets: {6: keep}` expecting "partial stimulation -> stimulation", also
+# lower `thresholds.stimulation` — otherwise those clips stay sub-threshold.
+thresholds:
+  stimulation: 0.50
+  ventilation: 0.50
+  suction: 0.25
+
+weak_threshold: 0.20
+
+# What to do with an activity whose fraction lands in the ambiguous band:
+#   drop     : discard the whole clip (the thesis' purity behaviour)
+#   negative : treat it as a 0 (more data, more label noise)
+#   mask     : multilabel only — supervise the OTHER activities of that clip and
+#              exclude this one from the loss. Keeps the clip, keeps labels clean.
+#              (In multiclass, `mask` behaves like `drop` when the clip would
+#              otherwise be all-negative, since "no activity" cannot be asserted
+#              while one activity is unknown.)
+ambiguous: drop
+
+# multiclass only: a clip with >= 2 positive activities has no single class.
+#   dominant : assign the activity with the largest fraction
+#   drop     : discard the clip (the thesis' behaviour — bucket 7 was dropped)
+# Ignored in multilabel, where co-occurrence is the point.
+overlap_resolution: drop
+
+# ---------------------------------------------------------------- buckets
+# The trailing `_N` in every clip filename, assigned by data_process.py. Set each
+# to `keep` or `drop`. The defaults reproduce build_manifest.py's original
+# behaviour exactly, so this whole config file is a no-op until you edit it.
+#
+# Bucket 6 is more interesting than its name suggests: because the ventilation
+# branch in data_process.py also requires `other == 0`, a clip with
+# vent >= 0.50 contaminated by an "Ignored label" interval was demoted to
+# partial/ventilation/ rather than ventilation/. Keeping bucket 6 readmits those.
+buckets:
+  0: keep   # non_target            — nt >= 0.20, zero activity, no ignored-label
+  1: keep   # stimulation           — stim >= 0.50, pure
+  2: keep   # ventilation           — vent >= 0.50, pure, no ignored-label
+  3: keep   # suction               — suct >= 0.25, pure
+  4: keep   # no_overlap            — nothing annotated at all (-> negative)
+  5: drop   # no_label              — zero activity, but nt < 0.20 or ignored-label present
+  6: drop   # partial               — exactly one activity, sub-threshold
+  7: drop   # target_overlap        — >= 2 activities ALL above threshold  <-- co-occurrence
+  8: drop   # partial_overlap       — >= 2 activities present, none above threshold
+
+# ---------------------------------------------------------------- inference
+# multilabel only: per-activity sigmoid cut used for prediction and for every
+# F1/precision/recall figure. Threshold-free metrics (average precision) are
+# reported alongside, so tune these on validation and report both.
+decision_thresholds:
+  stimulation: 0.5
+  ventilation: 0.5
+  suction: 0.5
+
+# ---------------------------------------------------------------- annotations
+# Only used by src/infer_video.py, to read ground truth out of the 5-column
+# annotation TSVs (Unprocessed_data/anot_files/<case>.txt) when overlaying it on
+# a full-episode prediction. Each activity's `Event` string defaults to its
+# title-cased name — "stimulation" -> "Stimulation" — which is what the Haydom
+# and DRC files use. Override only the ones that differ.
+annotation_events: {}
+#   suction: Suction / bulb

@@ -6,13 +6,17 @@ Thin, optional Weights & Biases helpers shared by training.py and test.py.
 All functions are no-ops when wandb is not installed or no run is active, so the
 pipeline runs unchanged with `wandb_mode: disabled` in the config. Metric dicts
 from compute_metrics() carry both scalar entries ("macro/f1", "suction/f1", ...)
-and flattened confusion-matrix counts ("cm/<true>-><pred>"); the scalar/plot
-split is handled here so callers stay clean.
+and flattened confusion-matrix counts ("cm/..."); the scalar/plot split is
+handled here so callers stay clean.
+
+Nothing here knows about the task. Class names and the single-label view needed
+for the confusion-matrix plot are supplied by the caller via the DataSpec, so the
+same helpers serve both multiclass and multilabel runs.
 """
 
 from __future__ import annotations
 
-from .metrics import CLASSES
+from .metrics import single_label_view
 
 try:
     import wandb
@@ -64,24 +68,27 @@ def log_metrics(metrics: dict, prefix: str, extra: dict | None = None) -> None:
     wandb.log(payload)
 
 
-def log_confusion_matrix(logits, labels, key: str, extra: dict | None = None) -> None:
-    """
-    Log a wandb confusion-matrix plot from raw logits (N,C) and ground-truth
-    class indices (N,). Predictions are argmax over the logits.
+def log_confusion_matrix(logits, labels, spec, key: str, masks=None,
+                         extra: dict | None = None) -> None:
+    """Log a wandb confusion-matrix plot from raw logits and ground truth.
+
+    multiclass: the NxN argmax-vs-truth matrix.
+    multilabel: the PROJECTED single-label matrix (see metrics.project_to_single)
+                — a plot needs one label per sample, and this keeps the figure
+                comparable with the thesis' 4-class table. Clips with >= 2 true
+                activities are excluded from it; the "proj/excluded" metric
+                reports how many.
     """
     if not available():
         return
-    import torch  # local import: only needed when actually logging
-
-    y_pred = torch.as_tensor(logits).detach().cpu().argmax(dim=1).numpy().astype(int)
-    lab = torch.as_tensor(labels).detach().cpu()
-    y_true = (lab.argmax(dim=1) if lab.ndim == 2 else lab).numpy().astype(int)
-
+    y_true, y_pred, class_names = single_label_view(logits, labels, spec, masks)
+    if len(y_true) == 0:
+        return
     payload = {
         key: wandb.plot.confusion_matrix(
-            y_true=y_true.tolist(),
-            preds=y_pred.tolist(),
-            class_names=CLASSES,
+            y_true=[int(v) for v in y_true],
+            preds=[int(v) for v in y_pred],
+            class_names=list(class_names),
         )
     }
     if extra:

@@ -1,14 +1,15 @@
 """
 videomae.py
 
-VideoMAE — wraps the MCG-NJU/videomae-base-finetuned-ssv2 encoder for
-single-label 4-class activity classification (non_target / stimulation /
-ventilation / suction) on 3-second clips.
+VideoMAE — wraps the MCG-NJU/videomae-base-finetuned-ssv2 encoder for neonatal
+resuscitation activity recognition on 3-second clips.
 
 Adapted from the multimodal repo: inherits the trimmed `VideoModel` base
-(no LoRA), and `num_classes` now defaults to 4. The backbone/forward logic is
-unchanged — it still emits raw logits; only the head width and the downstream
-loss (CrossEntropy) differ.
+(no LoRA). `num_classes` and `task` come from configs/data.yaml via DataSpec
+(see src/utils/model_loading.py), so the same backbone serves both the
+multiclass (softmax, 1+N logits) and multilabel (sigmoid, N logits) tasks.
+The backbone/forward logic is unchanged — it still emits raw logits; only the
+head width and the downstream loss differ.
 """
 
 import torch
@@ -19,8 +20,10 @@ from .base import VideoModel
 
 class VideoMAE(VideoModel):
     def __init__(self, device: str = "cuda", num_classes: int = 4,
-                 backbone_id: str = "MCG-NJU/videomae-base-finetuned-ssv2"):
-        super().__init__(num_classes=num_classes, backbone_id=backbone_id, device=device)
+                 backbone_id: str = "MCG-NJU/videomae-base-finetuned-ssv2",
+                 task: str = "multiclass"):
+        super().__init__(num_classes=num_classes, backbone_id=backbone_id,
+                         device=device, task=task)
         self.model_name = "VideoMAE"
         # Encoder only (no HF classification head) — we attach our own head.
         self.backbone = VideoMAEModel.from_pretrained(backbone_id, ignore_mismatched_sizes=True)
@@ -34,7 +37,9 @@ class VideoMAE(VideoModel):
         Args:
             pixel_values (Tensor): (B, 16, 3, 224, 224) as produced by the processor.
         Returns:
-            Tensor: (B, num_classes) raw logits (feed to CrossEntropyLoss / argmax).
+            Tensor: (B, num_classes) RAW logits — no output activation applied.
+                    Feed to the task's loss, or call `self.probs()` for
+                    softmax/sigmoid probabilities.
         """
         device = next(self.backbone.parameters()).device
         outputs = self.backbone(pixel_values=pixel_values.to(device), return_dict=True)

@@ -6,8 +6,9 @@ embeddings into a single fixed-size vector. Used as an optional temporal
 aggregation head for the VideoMAE backbones, replacing the default CLS/mean
 pooling with a learned weighted combination over frames/patches.
 
-Unchanged from the multimodal-repo implementation — it is task-agnostic and works
-identically for single-label 4-class classification.
+Unchanged from the multimodal-repo implementation — it is genuinely task-agnostic:
+it acts on the backbone's token sequence, before the classifier head, so it is
+unaffected by whether the run is multiclass or multilabel.
 """
 
 import torch

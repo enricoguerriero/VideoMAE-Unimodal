@@ -1,8 +1,12 @@
 # Lazy exports: importing the package must NOT pull heavy deps (av/torch), so the
-# pure-stdlib data-prep scripts (build_manifest, split_cases) run on a machine
-# without the ML stack installed. VideoMAEDataset is imported on first access.
+# pure-stdlib+PyYAML data-prep scripts (spec, build_manifest, split_cases) run on
+# a machine without the ML stack installed. VideoMAEDataset is imported on first
+# access.
 
-__all__ = ["VideoMAEDataset"]
+from .spec import DataSpec, ClipLabel, load_spec, spec_from_checkpoint, BUCKET_NAMES
+
+__all__ = ["VideoMAEDataset", "DataSpec", "ClipLabel", "load_spec",
+           "spec_from_checkpoint", "BUCKET_NAMES"]
 
 
 def __getattr__(name):

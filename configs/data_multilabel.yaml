@@ -1,0 +1,74 @@
+# =============================================================================
+# data_multilabel.yaml — 3 INDEPENDENT ACTIVITIES, co-occurrence kept
+# =============================================================================
+# Use with:  bash scripts/train.sh VideoMAE 0 configs/data_multilabel.yaml
+#        or: python -m src.training --model VideoMAE --data-config configs/data_multilabel.yaml
+#
+# See configs/data.yaml for the full commentary on every field. This file only
+# differs in the four decisions that make it multilabel:
+#
+#   1. task: multilabel     -> 3 logits, sigmoid head, masked BCE. "No activity"
+#                              becomes the ALL-ZERO vector instead of a class, so
+#                              non_target disappears as a training target.
+#   2. bucket 7 kept        -> target_overlap: the clips where two activities are
+#                              BOTH above threshold. This is the co-occurrence
+#                              evidence; the multiclass config has to drop it
+#                              because a single label cannot express it.
+#   3. buckets 6 and 8 kept -> partial / partial-overlap: clips with an activity
+#                              present but sub-threshold. Previously discarded
+#                              wholesale; now usable because of...
+#   4. ambiguous: mask      -> ...per-activity masking. A clip that is 40 %
+#                              stimulation and 60 % ventilation supervises
+#                              ventilation as a confident positive and simply
+#                              does not supervise stimulation. No invented
+#                              negatives, no discarded clip.
+#
+# Bucket 5 (no_label) stays dropped: those clips have zero activity overlap but
+# were rejected for containing "Ignored label" intervals, i.e. spans the
+# annotators marked as not-to-be-trusted. Admitting them as all-zero negatives
+# would train the model that unannotated activity is "nothing". Flip it to `keep`
+# only if you have checked what those spans contain.
+# =============================================================================
+
+task: multilabel
+
+activities: [stimulation, ventilation, suction]
+negative_class: non_target
+
+tag_keys:
+  stimulation: stim
+  ventilation: vent
+  suction: suct
+
+thresholds:
+  stimulation: 0.50
+  ventilation: 0.50
+  suction: 0.25
+
+weak_threshold: 0.20
+
+ambiguous: mask
+
+# Ignored in multilabel (co-occurrence is representable), kept for round-tripping.
+overlap_resolution: drop
+
+buckets:
+  0: keep   # non_target       -> all-zero target
+  1: keep   # stimulation
+  2: keep   # ventilation
+  3: keep   # suction
+  4: keep   # no_overlap       -> all-zero target
+  5: drop   # no_label         -- ignored-label contamination; see the header
+  6: keep   # partial          -- sub-threshold activity, masked per activity
+  7: keep   # target_overlap   -- CO-OCCURRENCE, the point of this config
+  8: keep   # partial_overlap  -- >=2 present but weak, masked per activity
+
+# Tune these on VALIDATION, then report both the thresholded F1 and the
+# threshold-free average precision (macro/ap) so the numbers are not
+# threshold-shopped. 0.5 is a starting point, not a result.
+decision_thresholds:
+  stimulation: 0.5
+  ventilation: 0.5
+  suction: 0.5
+
+annotation_events: {}

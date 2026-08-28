@@ -2,10 +2,12 @@
 videomae_giant.py
 
 VideoMAEGiant — wraps the OpenGVLab/VideoMAEv2-giant backbone (~1B params, ViT-g)
-for single-label 4-class activity classification.
+for neonatal resuscitation activity recognition.
 
 Adapted from the multimodal repo: inherits the trimmed `VideoModel` base
-(no LoRA), `num_classes` defaults to 4. The three-step manual loading strategy
+(no LoRA). `num_classes` and `task` come from configs/data.yaml via DataSpec,
+so the same backbone serves both the multiclass (softmax) and multilabel
+(sigmoid) tasks. The three-step manual loading strategy
 (bypassing AutoModel.from_pretrained's meta-device init, which is incompatible
 with VideoMAEv2's custom __init__) is kept verbatim.
 
@@ -23,8 +25,10 @@ from .base import VideoModel
 
 class VideoMAEGiant(VideoModel):
     def __init__(self, device: str = "cuda", num_classes: int = 4,
-                 backbone_id: str = "OpenGVLab/VideoMAEv2-giant"):
-        super().__init__(num_classes=num_classes, backbone_id=backbone_id, device=device)
+                 backbone_id: str = "OpenGVLab/VideoMAEv2-giant",
+                 task: str = "multiclass"):
+        super().__init__(num_classes=num_classes, backbone_id=backbone_id,
+                         device=device, task=task)
         self.model_name = "VideoMAEGiant"
 
         # 1. Config
@@ -51,7 +55,7 @@ class VideoMAEGiant(VideoModel):
         Args:
             pixel_values (Tensor): (B, 16, 3, 224, 224) in (B, T, C, H, W) order.
         Returns:
-            Tensor: (B, num_classes) raw logits.
+            Tensor: (B, num_classes) RAW logits — no output activation applied.
         """
         device = next(self.backbone.parameters()).device
         # VideoMAEv2 expects (B, C, T, H, W).

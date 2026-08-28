@@ -1,19 +1,45 @@
 # =============================================================================
-# config.yaml — single-label 4-class VideoMAE (unimodal, Haydom + DRC combined)
+# config.yaml — TRAINING configuration for VideoMAE (Haydom + DRC combined)
 # =============================================================================
-# Task: classify each 3-second clip into ONE of
-#   0 non_target, 1 stimulation, 2 ventilation, 3 suction
-# comparable to the multimodal thesis' MoViNet video base model.
+# This file owns HOW the model is trained. WHAT the labels are — multiclass vs
+# multilabel, the activity list, the per-activity duration thresholds, which
+# label buckets to keep — lives in configs/data.yaml (see `data_config` below).
+#
+# Nothing here needs to change when you switch task: the head width, the output
+# activation (softmax vs sigmoid), the loss (CrossEntropy vs masked BCE) and the
+# metric set all follow the data config automatically.
 #
 # Select the model at the CLI: --model VideoMAE | VideoMAEGiant
+# Select the data config at the CLI: --data-config configs/data_multilabel.yaml
 # The two model blocks below differ only in learning-rate strategy; switch the
 # commented block to match your model.
 # =============================================================================
 
+# ---------------------------------------------------------------- data config
+# WHAT the targets are. Override per run with `--data-config <path>`, which is
+# the clean way to keep several label regimes side by side, e.g.
+#   configs/data.yaml              multiclass, thesis-exact (the default)
+#   configs/data_multilabel.yaml   3 independent activities, co-occurrence kept
+data_config: configs/data.yaml
+
 # ---------------------------------------------------------------- data paths
 train_data:      data/train.csv
 validation_data: data/validation.csv
-test_data:       data/test.csv
+
+# ONE TEST SET PER HOSPITAL. The sites differ in camera, lighting, staff and
+# protocol, so a single pooled score hides the number that matters — does the
+# model work at THIS hospital. test.py evaluates every entry below in turn, each
+# writing its own results_*.csv and logging under its own `test/<name>/` prefix,
+# then prints a side-by-side comparison. The two sets are NOT the same size:
+# each is ~20 % of its own site's clips (see src/data/split_cases.py).
+#
+# The thesis' 14 frozen cases still live inside these files, flagged by the
+# `thesis_test` column, so the thesis-comparable score is
+#     bash scripts/test.sh VideoMAE <ckpt> 0 "" --thesis-only
+# A plain string is still accepted here (one pooled test set, e.g. data/test.csv).
+test_data:
+  haydom: data/test_haydom.csv
+  drc:    data/test_drc.csv
 
 # ---------------------------------------------------------------- runtime
 device: cuda
@@ -25,8 +51,18 @@ attention_pooling: false # false => CLS token (base) / internal mean pool (giant
 validation_step: null    # e.g. 5000 to validate mid-epoch; null = end-of-epoch only
 
 # ---------------------------------------------------------------- loss / imbalance
-# Matches the thesis: sqrt inverse-frequency class weights (computed from the
-# train split at runtime) + label smoothing. No sampler.
+# The loss TYPE follows configs/data.yaml:
+#   multiclass -> CrossEntropyLoss(weight=class weights, label_smoothing)
+#   multilabel -> masked BCEWithLogitsLoss(pos_weight=per-activity, label_smoothing)
+# Weights are always computed from the TRAIN split at runtime. No sampler.
+#
+# class_weighting: how hard to correct the imbalance.
+#   sqrt_inv_freq : sqrt(n/(C*count_c))  multiclass  |  sqrt(neg_c/pos_c) multilabel
+#                   — the thesis' choice; damped, so rare classes are boosted
+#                     without destabilising training
+#   inv_freq      : the undamped ratio (aggressive; expect more false positives)
+#   none          : unweighted
+class_weighting: sqrt_inv_freq
 label_smoothing: 0.1
 minority_class: suction  # class whose F1 drives the "best minority" checkpoint
 
@@ -43,10 +79,13 @@ plateau_patience: 8
 early_stopping_patience: 20   # epochs without macro/minority F1 gain; 0 disables
 
 # ---------------------------------------------------------------- classifier head
+# Output width and activation come from the data config, not from here:
+#   multiclass -> 1 + len(activities) logits, softmax
+#   multilabel ->     len(activities) logits, sigmoid
 classifier_config:
   dims: []               # [] = single linear layer; e.g. [64] for one hidden layer
-  activation: relu
-  use_bias: true         # bias initialised to per-class log-priors
+  activation: relu       # HIDDEN-layer activation (not the output activation)
+  use_bias: true         # bias init: log-prior (softmax) / logit-prior (sigmoid)
   dropout: 0.3
 
 # ---------------------------------------------------------------- optimizer

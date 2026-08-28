@@ -2,16 +2,26 @@
 classifier.py
 
 Configurable MLP classification head sitting on top of the VideoMAE backbone.
-Maps the pooled backbone embedding to raw logits for the FOUR mutually-exclusive
-activity classes: non_target (0), stimulation (1), ventilation (2), suction (3).
+Maps the pooled backbone embedding to `num_classes` RAW LOGITS.
 
-Difference vs. the multimodal repo:
-    * The head now emits `num_classes` (=4) logits for a single-label softmax
-      task instead of 3 independent sigmoid logits. The layer stack itself is
-      unchanged; only the meaning of the output layer differs (consumed by
-      CrossEntropyLoss instead of BCEWithLogitsLoss).
-    * The optional `bias` init is now the per-class log-prior (log p_c), which
-      anchors the softmax at the empirical class frequencies.
+The head is deliberately task-agnostic: its width comes from
+DataSpec.num_classes and it never applies an output activation. What changes
+between tasks is what those logits MEAN, and that is expressed entirely through
+the `bias` init and the loss:
+
+    multiclass  1 + len(activities) logits, consumed by CrossEntropyLoss.
+                bias = log(p_c)            — softmax log-prior, so an untrained
+                                             head predicts the class frequencies.
+    multilabel      len(activities) logits, consumed by BCEWithLogitsLoss.
+                bias = log(p_c/(1-p_c))    — sigmoid logit-prior, so each
+                                             independent activity starts at its
+                                             own base rate. Critical here: the
+                                             activities are rare, and a
+                                             zero-bias sigmoid head starts at
+                                             p=0.5 for every one of them.
+
+Both bias vectors are computed from the TRAIN split by
+VideoMAEDataset.compute_bias() and passed in by training.py.
 """
 
 import torch
@@ -24,11 +34,13 @@ class ClassifierHead(nn.Module):
         Args:
             in_dim      (int): input embedding dim (768 base / 1408 giant).
             dims        (list[int]): hidden layer widths; [] = single linear layer.
-            num_classes (int): number of output logits (4).
-            activation  (str): "relu" | "gelu" | "tanh" (default relu).
+            num_classes (int): number of output logits (DataSpec.num_classes).
+            activation  (str): HIDDEN-layer activation, "relu" | "gelu" | "tanh".
+                               Not the output activation — see the module docstring.
             dropout     (float): dropout after each hidden activation.
             bias        (Tensor|None): optional (num_classes,) output-bias init
-                                       (log-priors). None => default zero bias.
+                                       (log-prior or logit-prior, per task).
+                                       None => default zero bias.
         """
         super().__init__()
 
@@ -43,6 +55,10 @@ class ClassifierHead(nn.Module):
                 layers.append(nn.Dropout(dropout))
         layers.append(nn.Linear(dims[-2], dims[-1], bias=(bias is not None)))
         if bias is not None:
+            if bias.shape[-1] != num_classes:
+                raise ValueError(
+                    f"bias init has {bias.shape[-1]} entries but the head emits "
+                    f"{num_classes} logits")
             with torch.no_grad():
                 layers[-1].bias.copy_(bias)
         self.seq = nn.Sequential(*layers)
@@ -52,6 +68,8 @@ class ClassifierHead(nn.Module):
         Args:
             x (Tensor): (batch, in_dim) pooled clip embedding.
         Returns:
-            Tensor: (batch, num_classes) raw logits for CrossEntropyLoss / argmax.
+            Tensor: (batch, num_classes) RAW logits — no softmax/sigmoid applied.
+                    Feed to CrossEntropyLoss / BCEWithLogitsLoss, or call
+                    VideoModel.probs() for probabilities.
         """
         return self.seq(x)
