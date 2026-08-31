@@ -374,6 +374,49 @@ bash scripts/test.sh VideoMAE <ckpt>.pt 0 "" --thesis-only          # just the 1
 bash scripts/test.sh VideoMAE <ckpt>.pt 0 "" --test_data data/test.csv   # one pooled score
 ```
 
+#### Which clips get scored: `--full-coverage`
+
+`ambiguous: mask` is right for training — an activity whose window coverage falls
+between `weak_threshold` and its `thresholds` value has no defensible binary
+label, and inventing one puts noise in the loss. For **reporting** it makes the
+score optimistic: deployment is a continuous stream of 3 s windows, many of them
+transitional, and those are exactly the ones being set aside.
+
+It is also not applied evenly. Haydom's clips carry no fraction tags, so every
+bucket-6 clip means "present but sub-threshold" and gets masked; DRC's fractions
+resolve many of the same clips outright. Grading the hospitals on subsets of
+different difficulty contaminates the very comparison the per-site test sets
+exist to make.
+
+```bash
+bash scripts/test.sh VideoMAE <ckpt>.pt --full-coverage
+```
+
+One inference pass, both conventions, printed side by side:
+
+```
+[haydom] AMBIGUITY CONVENTIONS
+convention                  clips  supervised          macro/f1        suction/f1
+full coverage (all)        13,224      39,672            0.xxxx            0.xxxx
+confident subset           13,180      35,380            0.xxxx            0.xxxx
+
+  clips dropped entirely : 44
+  activity decisions set aside : 4,292 (10.8% of all)
+  clips with >=1 masked activity : 4,292 (32.5% of this site)
+```
+
+Full coverage reads a sub-threshold activity as **not performed** and scores every
+clip. Both go to wandb (`test/<site>/…` and `test/<site>/confident/…`) and into
+the results CSV, and the file gets a `_fullcov` suffix so the two never overwrite
+each other. Compare hospitals on the same convention, and say which one you used.
+
+Note this removes the **ambiguity** exclusion, not the **bucket** one: bucket 5
+(`no_label`) is still dropped, because those clips overlap spans the annotators
+marked untrustworthy — admitting them as all-zero negatives asserts "nothing is
+happening" where the annotation declines to say. The run prints how many are
+still excluded that way. To include them too, copy the data config with
+`buckets: {5: keep}` and pass it as `DATA_CONFIG`.
+
 #### Multilabel: tune the decision thresholds, do not leave them at 0.5
 
 Training uses `pos_weight` (`class_weighting: sqrt_inv_freq`), which inflates the

@@ -60,6 +60,58 @@ DEFAULT_TEST_SETS = {"haydom": "data/test_haydom.csv", "drc": "data/test_drc.csv
 THESIS_COLUMN = "thesis_test"
 
 
+def full_coverage_spec(spec: DataSpec) -> DataSpec:
+    """The same spec, but with the ambiguous band read as "not performed".
+
+    `ambiguous: mask` is right for TRAINING — an activity whose window coverage
+    lands between `weak_threshold` and `thresholds` has no defensible binary
+    label, and inventing one puts noise in the loss. For REPORTING it makes the
+    score optimistic: deployment is a continuous stream of 3 s windows and many
+    of them are transitional, so measuring only the clean ones answers an easier
+    question than the one you care about.
+
+    Worse, the masking rate is not equal across sites. Haydom's clips carry no
+    fraction tags, so every bucket-6 clip means "present but sub-threshold" and
+    is masked; DRC's fractions resolve many of the same clips outright. Grading
+    the two hospitals on subsets of different difficulty contaminates exactly the
+    comparison the per-site test sets exist to make. This spec applies one rule
+    to both.
+    """
+    d = spec.to_dict()
+    d["ambiguous"] = "negative"
+    return DataSpec.from_dict(d, source=f"{spec.source} [full-coverage]")
+
+
+def confident_subset(rows, spec: DataSpec):
+    """Rows the ORIGINAL spec would keep, with its labels/masks.
+
+    Returns (indices into `rows`, labels, masks). Used to recompute the
+    confident-subset metrics from the same logits, so the two conventions are
+    compared on one inference pass and cannot drift apart.
+    """
+    idx, targets, masks = [], [], []
+    for i, row in enumerate(rows.itertuples(index=False)):
+        fracs = {a: float(getattr(row, f"frac_{a}")) for a in spec.activities}
+        label = spec.resolve(int(row.bucket), fracs,
+                             tagged=bool(int(getattr(row, "tagged", 1))),
+                             dir_activities=spec.activities_from_path(
+                                 getattr(row, "clip_dir", "")))
+        if label is None:
+            continue
+        idx.append(i)
+        if spec.is_multilabel:
+            targets.append(label.targets)
+            masks.append(label.mask)
+        else:
+            targets.append(label.class_index)
+    if not idx:
+        return [], None, None
+    if spec.is_multilabel:
+        return (idx, torch.tensor(targets, dtype=torch.float32),
+                torch.tensor(masks, dtype=torch.float32))
+    return idx, torch.tensor(targets, dtype=torch.long), None
+
+
 def resolve_test_sets(cli, config) -> list[tuple[str, str]]:
     """[(name, csv_path)] from --test_data, else the checkpoint config, else the
     per-site defaults.
@@ -87,6 +139,11 @@ def main():
     parser.add_argument("--test_data", type=str, nargs="*", default=None,
                         help="Override the test CSVs from the checkpoint config. "
                              "Repeatable; each entry is PATH or NAME=PATH.")
+    parser.add_argument("--full-coverage", action="store_true",
+                        help="Score EVERY clip: an activity below its threshold counts "
+                             "as not performed instead of being masked out, and no clip "
+                             "is dropped for ambiguity. Reports this alongside the "
+                             "confident-subset numbers so the two are comparable.")
     parser.add_argument("--thesis-only", action="store_true",
                         help=f"Score only the thesis' frozen cases (rows with "
                              f"{THESIS_COLUMN} == 1), for a like-for-like comparison "
@@ -198,11 +255,21 @@ def run_test_set(name, test_csv, *, model, spec, args, config, device, amp_dtype
                 logger.warning(f"[{name}] no thesis cases in this set — skipped.")
                 return None, []
 
-    test_dataset = VideoMAEDataset(rows, processor=model.processor, spec=spec, num_frames=16)
+    # With --full-coverage the DATASET is built from the permissive spec, so no
+    # clip is dropped for ambiguity; the strict spec is then re-applied to the
+    # same logits below. One inference pass, two conventions.
+    eval_spec = full_coverage_spec(spec) if args.full_coverage else spec
+    test_dataset = VideoMAEDataset(rows, processor=model.processor, spec=eval_spec,
+                                   num_frames=16)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False,
                              num_workers=config.get("num_workers", 4),
                              collate_fn=collate_fn)
     logger.info(f"[{name}] {len(test_dataset)} clips")
+    if args.full_coverage and test_dataset.n_dropped:
+        logger.info(f"[{name}] {test_dataset.n_dropped} clips still excluded by BUCKET "
+                    f"policy (buckets {sorted(set(range(9)) - set(spec.kept_buckets()))} "
+                    f"are dropped in {spec.source}) — --full-coverage removes the "
+                    f"ambiguity exclusion, not the bucket one.")
     logger.info(f"[{name}] label distribution:\n" + test_dataset.describe_labels())
 
     n, c = len(test_dataset), spec.num_classes
@@ -229,6 +296,20 @@ def run_test_set(name, test_csv, *, model, spec, args, config, device, amp_dtype
 
     metrics = compute_metrics(logits_t, labels_t, spec, masks=masks_t,
                               minority_class=minority_class)
+
+    sub_metrics, sub_idx = None, None
+    if args.full_coverage and spec.ambiguous != "negative":
+        sub_idx, sub_labels, sub_masks_t = confident_subset(test_dataset.data, spec)
+        if sub_idx:
+            sub_metrics = compute_metrics(logits_t[sub_idx], sub_labels, spec,
+                                          masks=sub_masks_t, minority_class=minority_class)
+        else:
+            logger.warning(f"[{name}] the strict spec keeps no clips — "
+                           f"confident-subset metrics skipped.")
+    elif args.full_coverage:
+        logger.info(f"[{name}] {spec.source} already uses `ambiguous: negative`, so "
+                    f"full coverage and the confident subset are the same set.")
+
     logger.info(f"[{name}] macro/f1={metrics['macro/f1']:.4f}  "
                 f"macro/accuracy={metrics['macro/accuracy']:.4f}  "
                 f"{minority_class}/f1={metrics.get('minority/f1', float('nan')):.4f}")
@@ -240,13 +321,63 @@ def run_test_set(name, test_csv, *, model, spec, args, config, device, amp_dtype
         logger.info(f"[{name}] co-occurrence: {metrics['true/multi_active']} clips truly "
                     f"have >=2 activities, {metrics['pred/multi_active']} were predicted so")
 
+    if sub_metrics is not None:
+        # Under `ambiguous: mask` a clip is DROPPED only when every activity is
+        # ambiguous; far more often it is kept with individual activities masked
+        # out. Counting dropped clips alone would badly understate what the
+        # confident convention sets aside, so account for both: whole clips, and
+        # individual activity decisions.
+        n_all, n_sub = len(test_dataset), len(sub_idx)
+        ent_all = n_all * spec.num_classes if spec.is_multilabel else n_all
+        if spec.is_multilabel:
+            ent_sub = int(sub_masks_t.sum().item())
+            clips_touched = int((sub_masks_t.min(dim=1).values == 0).sum().item())
+        else:
+            ent_sub, clips_touched = n_sub, 0
+
+        keys = ["macro/f1", "minority/f1", "macro/ap", "hamming/accuracy"]
+        label = {"minority/f1": f"{minority_class}/f1"}
+        head = (f"{'convention':<24}{'clips':>9}{'supervised':>12}"
+                + "".join(f"{label.get(k, k):>18}" for k in keys))
+        lines = ["", f"[{name}] AMBIGUITY CONVENTIONS", "-" * len(head), head]
+        lines.append(f"{'full coverage (all)':<24}{n_all:>9,}{ent_all:>12,}" + "".join(
+            f"{metrics.get(k, float('nan')):>18.4f}" for k in keys))
+        lines.append(f"{'confident subset':<24}{n_sub:>9,}{ent_sub:>12,}" + "".join(
+            f"{sub_metrics.get(k, float('nan')):>18.4f}" for k in keys))
+        lines.append("")
+        lines.append(f"  clips dropped entirely : {n_all - n_sub:,}")
+        if spec.is_multilabel:
+            lines.append(f"  activity decisions set aside : {ent_all - ent_sub:,} "
+                         f"({100 * (ent_all - ent_sub) / max(ent_all, 1):.1f}% of all)")
+            lines.append(f"  clips with >=1 masked activity : {clips_touched:,} "
+                         f"({100 * clips_touched / max(n_all, 1):.1f}% of this site)")
+        lines.append("")
+        lines.append("Full coverage reads a sub-threshold activity as NOT PERFORMED and "
+                     "scores every")
+        lines.append("clip — the deployment question. The confident subset scores only "
+                     "decisions whose")
+        lines.append("label is unambiguous — the cleaner question, and an easier one. The "
+                     "set-aside")
+        lines.append("rate differs per site, so compare hospitals on the SAME convention.")
+        logger.info("\n".join(lines))
+
+        wu.log_metrics(sub_metrics, prefix=f"test/{name}/confident/")
+        wu.update_summary({f"test/{name}/confident/{k}": float(v)
+                           for k, v in sub_metrics.items() if not k.startswith("cm/")})
+        wu.update_summary({
+            f"test/{name}/confident/n_clips": n_sub,
+            f"test/{name}/confident/n_supervised": ent_sub,
+            f"test/{name}/set_aside_frac": (ent_all - ent_sub) / max(ent_all, 1),
+            f"test/{name}/clips_with_masked_frac": clips_touched / max(n_all, 1)})
+
     wu.log_metrics(metrics, prefix=f"test/{name}/")
     wu.log_confusion_matrix(logits_t, labels_t, spec,
                             key=f"test/{name}/confusion_matrix", masks=masks_t)
     wu.update_summary({f"test/{name}/{k}": float(v) for k, v in metrics.items()
                        if not k.startswith("cm/")})
 
-    suffix = f"{base}_{name}{'_thesis' if args.thesis_only else ''}_{ts}"
+    suffix = (f"{base}_{name}{'_thesis' if args.thesis_only else ''}"
+              f"{'_fullcov' if args.full_coverage else ''}_{ts}")
     csv_path = os.path.join(args.results_dir, f"results_{suffix}.csv")
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
@@ -255,6 +386,8 @@ def run_test_set(name, test_csv, *, model, spec, args, config, device, amp_dtype
         w.writerow(["test_set", name])
         w.writerow(["test_data", test_csv])
         w.writerow(["n_clips", n])
+        w.writerow(["ambiguity", "negative (full coverage)" if args.full_coverage
+                    else spec.ambiguous])
         w.writerow(["task", spec.task])
         w.writerow(["classes", "|".join(spec.class_names)])
         if spec.is_multilabel:
@@ -263,6 +396,11 @@ def run_test_set(name, test_csv, *, model, spec, args, config, device, amp_dtype
                                  zip(spec.activities, spec.sigmoid_thresholds()))])
         for k, v in metrics.items():
             w.writerow([k, round(float(v), 6) if not k.startswith("cm/") else int(v)])
+        if sub_metrics is not None:
+            w.writerow(["confident/n_clips", len(sub_idx)])
+            for k, v in sub_metrics.items():
+                w.writerow([f"confident/{k}",
+                            round(float(v), 6) if not k.startswith("cm/") else int(v)])
     logger.info(f"[{name}] results -> {csv_path}")
 
     scores_path = os.path.join(args.results_dir, f"scores_{suffix}.npz")
