@@ -15,17 +15,33 @@
 # checkpoint at different `decision_thresholds` (use "" to skip the argument).
 #
 # Useful EXTRA args:
-#   --thesis-only                 score only the thesis' 14 frozen cases (the
+#   --thesis-only                 score only the thesis' frozen cases (the
 #                                 like-for-like multimodal comparison)
 #   --test_data data/test.csv     one pooled score over both sites instead
-#   --test_data haydom=data/test_haydom.csv   an explicit, named subset
+#   --test_data val=data/validation.csv   score validation, to tune thresholds on
+#                                 (see src/tune_thresholds.py)
+#
+# GPU and DATA_CONFIG may be omitted even when passing EXTRA flags:
+#   bash scripts/test.sh VideoMAE <ckpt>.pt --test_data val=data/validation.csv
 set -euo pipefail
 
-MODEL="${1:-VideoMAE}"
-CKPT="${2:?path to checkpoint .pt required}"
-GPU="${3:-0}"
-DATA_CONFIG="${4:-}"
-shift $(( $# > 4 ? 4 : $# ))
+# Positional args are collected only until the first flag, so a passthrough like
+# `--test_data ...` can never be mistaken for the GPU or DATA_CONFIG slot. Both
+# of these therefore work:
+#   test.sh VideoMAE ckpt.pt --test_data val=data/validation.csv
+#   test.sh VideoMAE ckpt.pt 0 "" --test_data val=data/validation.csv
+POS=()
+while [[ $# -gt 0 && "$1" != -* ]]; do POS+=("$1"); shift; done
+if [[ ${#POS[@]} -gt 4 ]]; then
+    echo "error: too many positional arguments (${POS[*]})." >&2
+    echo "usage: test.sh [MODEL] <CKPT> [GPU] [DATA_CONFIG] [EXTRA...]" >&2
+    exit 2
+fi
+
+MODEL="${POS[0]:-VideoMAE}"
+CKPT="${POS[1]:?path to checkpoint .pt required}"
+GPU="${POS[2]:-0}"
+DATA_CONFIG="${POS[3]:-}"
 
 ARGS=(--model "${MODEL}" --model_path "${CKPT}" --results_dir results/)
 if [[ -n "${DATA_CONFIG}" ]]; then
