@@ -370,6 +370,11 @@ def run_test_set(name, test_csv, *, model, spec, args, config, device, amp_dtype
             f"test/{name}/set_aside_frac": (ent_all - ent_sub) / max(ent_all, 1),
             f"test/{name}/clips_with_masked_frac": clips_touched / max(n_all, 1)})
 
+    # Always shown: the macro numbers average three very differently sized
+    # classes, so the per-class rows are where a collapsed rare activity is
+    # actually visible.
+    report_per_class(name, metrics, sub_metrics, spec, logger)
+
     wu.log_metrics(metrics, prefix=f"test/{name}/")
     wu.log_confusion_matrix(logits_t, labels_t, spec,
                             key=f"test/{name}/confusion_matrix", masks=masks_t)
@@ -413,6 +418,71 @@ def run_test_set(name, test_csv, *, model, spec, args, config, device, amp_dtype
              task=np.array(spec.task))
     logger.info(f"[{name}] scores -> {scores_path}")
     return metrics, [csv_path, scores_path]
+
+
+def report_per_class(name, metrics, sub_metrics, spec, logger):
+    """Per-class table — what the macro averages are hiding.
+
+    A macro F1 is three very different numbers averaged: with prevalences of
+    ~43 %, ~7 % and ~5 % here, one collapsed rare class barely moves it. The
+    per-class row is where you see which activity actually failed, and `sup`
+    (supervised decisions) is where you see how much of it was set aside.
+
+    With --full-coverage both conventions are shown side by side, computed from
+    the same logits, so the columns are directly comparable.
+    """
+    classes = spec.class_names
+    if spec.is_multilabel:
+        cols = [("support", "pos"), ("n_supervised", "sup"), ("precision", "prec"),
+                ("recall", "rec"), ("f1", "F1"), ("ap", "AP")]
+    else:
+        cols = [("precision", "prec"), ("recall", "rec"), ("f1", "F1")]
+
+    def cells(m, cls):
+        out = ""
+        for key, _ in cols:
+            v = m.get(f"{cls}/{key}")
+            if v is None:
+                out += f"{'-':>8}"
+            elif key in ("support", "n_supervised"):
+                out += f"{int(v):>8,}"
+            else:
+                out += f"{v:>8.4f}"
+        return out
+
+    width = 15 + 8 * len(cols)
+    both = sub_metrics is not None
+    lines = ["", f"[{name}] PER-CLASS"]
+    if both:
+        lines.append(f"{'':<15}{'full coverage (all clips)':^{8 * len(cols)}}   "
+                     f"{'confident subset':^{8 * len(cols)}}")
+    header = f"{'class':<15}" + "".join(f"{h:>8}" for _, h in cols)
+    if both:
+        header += "   " + "".join(f"{h:>8}" for _, h in cols)
+    lines.append(header)
+    lines.append("-" * (width + (3 + 8 * len(cols) if both else 0)))
+    for cls in classes:
+        row = f"{cls:<15}" + cells(metrics, cls)
+        if both:
+            row += "   " + cells(sub_metrics, cls)
+        lines.append(row)
+
+    macro = f"{'MACRO':<15}" + "".join(
+        f"{metrics.get('macro/' + k, float('nan')):>8.4f}"
+        if k in ("precision", "recall", "f1", "ap") else f"{'':>8}" for k, _ in cols)
+    if both:
+        macro += "   " + "".join(
+            f"{sub_metrics.get('macro/' + k, float('nan')):>8.4f}"
+            if k in ("precision", "recall", "f1", "ap") else f"{'':>8}" for k, _ in cols)
+    lines.append(macro)
+    if spec.is_multilabel:
+        lines.append("pos = positive clips | sup = clips whose label for this activity is "
+                     "supervised")
+        if both:
+            lines.append("AP is threshold-free: if it barely moves between the two "
+                         "conventions while F1 does,\nthe change is about which clips "
+                         "were scored, not about the model.")
+    logger.info("\n".join(lines))
 
 
 def report_comparison(all_metrics, spec, minority_class, logger):

@@ -405,6 +405,24 @@ confident subset           13,180      35,380            0.xxxx            0.xxx
   clips with >=1 masked activity : 4,292 (32.5% of this site)
 ```
 
+A **per-class table** follows it on every run (with or without the flag) — macro
+averages hide a collapsed rare class, since ventilation is ~43 % of clips and
+suction ~5 %:
+
+```
+[haydom] PER-CLASS
+                    full coverage (all clips)              confident subset
+class          pos     sup   prec    rec     F1     AP     pos     sup   prec    rec     F1     AP
+stimulation  1,102  13,224 0.4120 0.8910 0.5632 0.6431   1,102   9,800 0.5030 0.8890 0.6425 0.6702
+ventilation  5,680  13,224 0.7740 0.9020 0.8331 0.9012   5,680  10,108 0.8610 0.9050 0.8824 0.9105
+suction        171  13,224 0.0930 0.7600 0.1657 0.4128     171  12,990 0.1180 0.7600 0.2043 0.4210
+MACRO                      0.4260 0.8510 0.5207 0.6524                   0.4940 0.8510 0.5764 0.6672
+```
+
+`sup` is the number of clips whose label for that activity is supervised, so the
+gap between the two `sup` columns is exactly what the confident convention set
+aside — per class, which is where the site asymmetry shows up.
+
 Full coverage reads a sub-threshold activity as **not performed** and scores every
 clip. Both go to wandb (`test/<site>/…` and `test/<site>/confident/…`) and into
 the results CSV, and the file gets a `_fullcov` suffix so the two never overwrite
