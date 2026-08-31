@@ -7,6 +7,7 @@ tokenizers
 
 av
 opencv-python
+matplotlib          # src/inference_demo.py only (Agg backend, headless)
 
 numpy
 pandas

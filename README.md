@@ -74,6 +74,7 @@ videomae-unimodal/
     ├── training.py              # task-blind training loop; dual best-checkpoints
     ├── test.py                  # eval on every per-site test set (task from the ckpt)
     ├── tune_thresholds.py       # pick multilabel decision thresholds on validation
+    ├── inference_demo.py        # one episode per hospital + probability plot under it
     ├── infer_video.py           # whole-episode inference + annotated mp4 / HTML viewer
     ├── data/
     │   ├── spec.py              # [CORE] DataSpec: reads data.yaml, resolves targets
@@ -344,6 +345,40 @@ those three lines to confirm you got the regime you meant.
 Saves best-macro-F1 and best-minority-F1 checkpoints to `checkpoints/`, a final
 model to `models/`, and per-epoch metrics to `results/metrics_*.csv`. Every
 checkpoint embeds its DataSpec.
+
+### Qualitative demo — one episode per hospital
+
+```bash
+bash scripts/inference_demo.sh VideoMAE checkpoints/<ckpt>.pt
+```
+
+Picks a random case from `data/test_haydom.csv` and one from `data/test_drc.csv`,
+resolves each full episode from the sibling `Unprocessed_data` tree, and writes
+into `inference_output/`:
+
+```
+inference_output/haydom_<case>/
+  source.mp4          copy of the original episode
+  annotated.mp4       episode on top, per-second probabilities underneath
+  probabilities.csv   one row per second: p_<activity> and active_<activity>
+inference_output/drc_<case>/ ...
+```
+
+Pin specific episodes with `--haydom-video` / `--drc-video`, or make the random
+choice reproducible with `--seed`.
+
+The plot is **small multiples** — one thin panel per activity rather than three
+lines on shared axes. Three activities each carry their own decision threshold,
+so a single threshold line cannot serve all of them, and overlaid lines occlude
+each other exactly where two activities co-occur (the case worth looking at).
+Each panel shows its probability curve, its own threshold, and the spans the
+model calls "performed"; a playhead tracks the video. Panels are titled with the
+activity name so identity never depends on colour alone.
+
+Inference is `src/infer_video.py`'s — 3 s window, 1 s stride, each window
+assigned to the second nearest its centre — so the demo and the quantitative
+evaluation cannot disagree. Pass `--data-config` to use tuned
+`decision_thresholds`; the shaded "performed" spans follow them.
 
 ### Step 3 — Test
 

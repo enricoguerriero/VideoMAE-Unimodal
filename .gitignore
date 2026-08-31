@@ -17,3 +17,4 @@ __pycache__/
 .venv/
 .ipynb_checkpoints/
 viewer_out/
+inference_output/
