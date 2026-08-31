@@ -73,6 +73,7 @@ videomae-unimodal/
 └── src/
     ├── training.py              # task-blind training loop; dual best-checkpoints
     ├── test.py                  # eval on every per-site test set (task from the ckpt)
+    ├── tune_thresholds.py       # pick multilabel decision thresholds on validation
     ├── infer_video.py           # whole-episode inference + annotated mp4 / HTML viewer
     ├── data/
     │   ├── spec.py              # [CORE] DataSpec: reads data.yaml, resolves targets
@@ -372,6 +373,35 @@ Variants:
 bash scripts/test.sh VideoMAE <ckpt>.pt 0 "" --thesis-only          # just the 14 frozen cases
 bash scripts/test.sh VideoMAE <ckpt>.pt 0 "" --test_data data/test.csv   # one pooled score
 ```
+
+#### Multilabel: tune the decision thresholds, do not leave them at 0.5
+
+Training uses `pos_weight` (`class_weighting: sqrt_inv_freq`), which inflates the
+odds of the positive class on purpose so rare activities are not ignored. The
+model therefore does **not** output calibrated probabilities: with weight `w` the
+balanced operating point sits near `w/(1+w)`, not 0.5. Left at 0.5 a rare class
+degenerates into "positive everywhere" — recall 1, precision = prevalence, so
+`F1 = 2p/(1+p)`. A suction F1 of 0.24 next to a suction **AP of 0.86** is exactly
+this: good ranking, wrong cut.
+
+```bash
+# 1. score VALIDATION as if it were a test set
+bash scripts/test.sh VideoMAE checkpoints/<ckpt>.pt 0 "" \
+    --test_data val=data/validation.csv
+
+# 2. tune on it, writing the block back into the data config
+python -m src.tune_thresholds results/scores_<ckpt>_val_<ts>.npz \
+    --write configs/data_multilabel.yaml
+
+# 3. report on TEST with the tuned cuts
+bash scripts/test.sh VideoMAE checkpoints/<ckpt>.pt 0 configs/data_multilabel.yaml
+```
+
+Each activity is optimised independently over every distinct score (exact, not a
+grid), masked entries excluded. `--beta 2` favours recall if a missed event costs
+more than a false alarm. The script warns if you hand it anything that does not
+look like validation — thresholds fitted on the split you then report are
+threshold-shopped, and `test.py` prints AP alongside F1 so that stays visible.
 
 The task is read back from the checkpoint — a multilabel model needs no extra
 flags. Writes `results/results_<ckpt>_<site>_<ts>.csv` and the matching

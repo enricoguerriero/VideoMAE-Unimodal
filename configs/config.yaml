@@ -50,7 +50,8 @@ batch_size: 4            # thesis MoViNet used 48; VideoMAE is heavier — tune 
 num_workers: 8
 num_epochs: 20
 train_backbone: true     # full-backbone fine-tuning (VideoMAE has no LoRA)
-attention_pooling: false # false => CLS token (base) / internal mean pool (giant)
+attention_pooling: false # false => mean over patch tokens + pretrained fc_norm
+                         #          (VideoMAE has no CLS token); giant pools internally
 validation_step: null    # e.g. 5000 to validate mid-epoch; null = end-of-epoch only
 
 # ---------------------------------------------------------------- loss / imbalance
