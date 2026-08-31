@@ -33,11 +33,15 @@ Concrete subclasses (videomae.py, videomae_giant.py) implement only their
 backbone-specific __init__ and forward.
 """
 
+import logging
+
 import torch
 import torch.nn as nn
 
 from .classifier import ClassifierHead
 from .attentionpooling import AttentionPooling
+
+logger = logging.getLogger(__name__)
 
 MULTICLASS = "multiclass"
 MULTILABEL = "multilabel"
@@ -126,14 +130,35 @@ class VideoModel(nn.Module):
     # Checkpoint restore
     # ------------------------------------------------------------------
     def load_backbone(self, checkpoint: dict, config: dict = None):
-        """Restore backbone weights (no LoRA). Subclasses may override."""
-        self.backbone.load_state_dict(checkpoint["backbone"], strict=False)
+        """Restore backbone weights (no LoRA). Subclasses may override.
+
+        strict=False is deliberate here (checkpoints predating `fc_norm` must
+        still load), but anything skipped is REPORTED — a silently half-restored
+        backbone is indistinguishable from a badly trained one.
+        """
+        missing, unexpected = self.backbone.load_state_dict(
+            checkpoint["backbone"], strict=False)
+        if missing or unexpected:
+            logger.warning(f"backbone restore skipped keys — missing {list(missing)[:8]}"
+                           f"{'...' if len(missing) > 8 else ''}, unexpected "
+                           f"{list(unexpected)[:8]}{'...' if len(unexpected) > 8 else ''}")
 
     def load_classifier(self, checkpoint: dict, config: dict = None):
-        """Build the head from config, restore its weights, move to backbone device."""
+        """Build the head from config, restore its weights, move to backbone device.
+
+        The head's bias is CONSTRUCTED CONDITIONALLY — ClassifierHead builds
+        `nn.Linear(..., bias=(bias is not None))` — so the head must be rebuilt
+        with a bias whenever the checkpoint has one. Building it without and
+        relying on `strict=False` silently drops the trained bias: the weights
+        still load, so the ranking (and average precision) look perfect, while
+        every logit shifts by the bias that went missing. For a rare activity
+        that bias is a large negative number — the logit prior, e.g.
+        ln(0.05/0.95) = -2.9 — so dropping it pushes the sigmoid over 0.5
+        almost everywhere and F1 collapses to 2p/(1+p) while AP stays high.
+        """
         classifier_config = (config or {}).get("classifier_config", {})
-        self.build_classifier(classifier_config)
         saved = checkpoint["classifier"]
+
         out_w = [v for k, v in saved.items() if k.endswith("weight")]
         if out_w and out_w[-1].shape[0] != self.num_classes:
             raise ValueError(
@@ -141,13 +166,31 @@ class VideoModel(nn.Module):
                 f"data config asks for {self.num_classes} ({self.task}). The "
                 f"checkpoint was trained for a different task — load the matching "
                 f"data config (checkpoints store theirs under 'data_spec').")
-        self.classifier.load_state_dict(saved, strict=False)
+
+        # Mirror the saved head's shape: a placeholder bias vector is enough,
+        # since load_state_dict overwrites it with the trained values.
+        has_bias = any(k.endswith(".bias") for k in saved)
+        placeholder = torch.zeros(self.num_classes) if has_bias else None
+        self.build_classifier(classifier_config, bias=placeholder)
+
+        missing, unexpected = self.classifier.load_state_dict(saved, strict=False)
+        if missing or unexpected:
+            raise ValueError(
+                f"classifier head does not match the checkpoint — missing "
+                f"{list(missing)}, unexpected {list(unexpected)}. Loading it "
+                f"anyway would silently change what the logits mean; this used to "
+                f"be swallowed by strict=False. Check `classifier_config` "
+                f"(dims/use_bias) against the one stored in the checkpoint.")
         device = next(self.backbone.parameters()).device
         self.classifier = self.classifier.to(device)
 
     def load_attention_pooling(self, checkpoint: dict):
         """Restore a saved AttentionPooling layer."""
         self.build_attention_pooling()
-        self.attn_pool.load_state_dict(checkpoint["attention_pooling"], strict=False)
+        missing, unexpected = self.attn_pool.load_state_dict(
+            checkpoint["attention_pooling"], strict=False)
+        if missing or unexpected:
+            logger.warning(f"attention pooling restore skipped keys — missing "
+                           f"{list(missing)}, unexpected {list(unexpected)}")
         device = next(self.backbone.parameters()).device
         self.attn_pool = self.attn_pool.to(device)

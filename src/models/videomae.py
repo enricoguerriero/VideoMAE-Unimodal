@@ -97,4 +97,8 @@ class VideoMAE(VideoModel):
                 "token) and is now being fed the mean over all 1568 tokens. The two "
                 "feature spaces are unrelated; expect meaningless predictions. "
                 "Retrain rather than evaluating this checkpoint.")
-        self.backbone.load_state_dict(saved, strict=False)
+        missing, unexpected = self.backbone.load_state_dict(saved, strict=False)
+        if missing or unexpected:
+            logger.warning(f"backbone restore skipped keys — missing {list(missing)[:8]}"
+                           f"{'...' if len(missing) > 8 else ''}, unexpected "
+                           f"{list(unexpected)[:8]}{'...' if len(unexpected) > 8 else ''}")
