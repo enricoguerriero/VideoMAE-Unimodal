@@ -49,6 +49,7 @@ except Exception:  # pragma: no cover
 from src.utils import (load_model, collate_fn, compute_metrics, build_criterion,
                        DEFAULT_MINORITY_CLASS, wandb_utils as wu)
 from src.data import VideoMAEDataset, DataSpec
+from src.data.manifest import read_manifest
 
 VIT_MODELS = ["VideoMAE", "VideoMAEGiant"]
 
@@ -105,6 +106,46 @@ def save_metrics_to_csv(csv_path, metrics, val_loss, epoch, split, batch=None):
         writer.writerow(row)
 
 
+def select_sites(csv_path, sites, split_name, logger):
+    """Restrict a split CSV to `sites`, or hand the path straight through.
+
+    The hospitals differ in camera, lighting, staff and protocol, so training a
+    single-site model is a question worth asking on its own. The split CSVs are
+    built at WHOLE-CASE level (src/data/split_cases.py), so filtering by site
+    keeps the no-leakage guarantee intact — a case belongs to one site and one
+    split.
+
+    Returns the path itself when no filter is asked for, so an unfiltered run
+    reads the file exactly as it did before. With a filter it returns the
+    DataFrame, read through `read_manifest` so `case_id` keeps its leading zeros
+    and an empty `clip_dir` stays "" rather than becoming NaN.
+
+    Matching is case-insensitive ("haydom" finds the manifest's "Haydom"), but an
+    unrecognised site is an ERROR: a typo that silently produced an empty split
+    would look exactly like a site with no data.
+    """
+    if not sites:
+        return csv_path
+    df = read_manifest(csv_path)
+    if "site" not in df.columns:
+        raise SystemExit(
+            f"--sites was given but {csv_path} has no `site` column — it predates "
+            f"the per-site manifest. Rebuild it with `bash scripts/build_data.sh`.")
+    available = {str(v).lower(): str(v) for v in df["site"].unique()}
+    unknown = [s for s in sites if s.lower() not in available]
+    if unknown:
+        raise SystemExit(
+            f"--sites {unknown} not present in {csv_path}. "
+            f"Available: {sorted(available.values())}")
+    keep = sorted({available[s.lower()] for s in sites})
+    out = df[df["site"].isin(keep)].reset_index(drop=True)
+    if out.empty:
+        raise SystemExit(f"no {split_name} clips left after --sites {keep}")
+    cases = f", {out['case_id'].nunique()} cases" if "case_id" in out.columns else ""
+    logger.info(f"{split_name}: --sites {keep} keeps {len(out):,}/{len(df):,} clips{cases}")
+    return out
+
+
 def alloc_targets(n, spec):
     """Pre-allocate the ground-truth buffers for one evaluation pass.
 
@@ -159,12 +200,44 @@ def main():
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--only_train", action="store_true", default=False)
     parser.add_argument("--attention_pooling", action="store_true", default=False)
+    parser.add_argument("--sites", nargs="+", default=None, metavar="SITE",
+                        help="Train and validate on these hospitals only, e.g. "
+                             "`--sites Haydom`. Case-insensitive; repeatable "
+                             "(`--sites Haydom DRC`). Filters `train_data` and "
+                             "`validation_data` on their `site` column. Omit to use "
+                             "every site in the split CSVs. Test sets are already "
+                             "per-hospital files — see `test_data:` in the config.")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Override `num_epochs` from configs/config.yaml.")
+    parser.add_argument("--patience", type=int, default=None,
+                        help="Override `early_stopping_patience`. 0 disables early "
+                             "stopping.")
+    parser.add_argument("--freeze-backbone", action="store_true",
+                        help="Train the classifier head ONLY: the backbone keeps its "
+                             "pretrained weights and receives no gradient. Equivalent "
+                             "to `train_backbone: false` in the config.")
+    parser.add_argument("--run-name", default=None,
+                        help="Name this run. Used for the checkpoint / metrics "
+                             "filenames and the W&B run name in place of the model "
+                             "name; a timestamp is still appended, so runs never "
+                             "overwrite each other. Useful when a sweep writes many "
+                             "checkpoints into one directory.")
     args = parser.parse_args()
 
     with open("configs/config.yaml", "r") as f:
         config = yaml.safe_load(f)
     if args.attention_pooling:
         config["attention_pooling"] = True
+    # Recorded in the run config so the checkpoint, and W&B, say which hospitals
+    # the model actually saw — the class weights and the head's prior are derived
+    # from this split, so it is part of what the model IS.
+    config["sites"] = list(args.sites) if args.sites else None
+    if args.epochs is not None:
+        config["num_epochs"] = args.epochs
+    if args.patience is not None:          # `is not None`, so --patience 0 disables
+        config["early_stopping_patience"] = args.patience
+    if args.freeze_backbone:
+        config["train_backbone"] = False
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(levelname)s: %(message)s")
@@ -174,9 +247,20 @@ def main():
     logger.info(f"Training {args.model}\n{spec.describe()}")
 
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    site_tag = "_" + "-".join(sorted(s.lower() for s in args.sites)) if args.sites else ""
+    regime = "full" if config.get("train_backbone", True) else "head"
+    # Defaults to the model name, so naming is unchanged unless --run-name is given.
+    run_label = args.run_name or args.model
     results_dir = config.get("results_dir", "results/")
     os.makedirs(results_dir, exist_ok=True)
-    metrics_csv_path = os.path.join(results_dir, f"metrics_{args.model}_{run_ts}.csv")
+    metrics_csv_path = os.path.join(results_dir, f"metrics_{run_label}_{run_ts}.csv")
+
+    # Resolve (and validate) the split sources BEFORE the backbone is built: a
+    # mistyped --sites should fail in a second, not after a 1B-parameter download.
+    sites_note = f" [sites={'+'.join(sorted(args.sites))}]" if args.sites else ""
+    train_source = select_sites(config["train_data"], args.sites, "train", logger)
+    val_source = (None if args.only_train else
+                  select_sites(config["validation_data"], args.sites, "validation", logger))
 
     device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     model = load_model(args.model, spec=spec, **config.get("model_params", {}))
@@ -184,7 +268,8 @@ def main():
 
     if _HAS_WANDB:
         wandb.init(project=config.get("wandb_project", "videomae-unimodal"),
-                   name=f"train_{model.model_name}_{spec.task}_{run_ts}",
+                   name=(f"{args.run_name}_{run_ts}" if args.run_name else
+                         f"train_{model.model_name}_{spec.task}{site_tag}_{regime}_{run_ts}"),
                    config={**config, "data_spec": spec.to_dict()},
                    mode=config.get("wandb_mode", "online"),
                    job_type="train")
@@ -197,11 +282,13 @@ def main():
                        f"best-minority checkpoint will be meaningless.")
 
     # ------------------------------------------------------------------ datasets
-    train_dataset = VideoMAEDataset(config["train_data"], processor=model.processor,
-                                    spec=spec, num_frames=16)
+    train_dataset = VideoMAEDataset(train_source, processor=model.processor,
+                                    spec=spec, num_frames=16,
+                                    source=f"{config['train_data']}{sites_note}")
     if not args.only_train:
-        val_dataset = VideoMAEDataset(config["validation_data"], processor=model.processor,
-                                      spec=spec, num_frames=16)
+        val_dataset = VideoMAEDataset(val_source, processor=model.processor,
+                                      spec=spec, num_frames=16,
+                                      source=f"{config['validation_data']}{sites_note}")
 
     logger.info(f"Train size: {len(train_dataset)}"
                 + ("" if args.only_train else f" | Val size: {len(val_dataset)}"))
@@ -297,7 +384,7 @@ def main():
     os.makedirs(ckpt_dir, exist_ok=True)
 
     def save_ckpt(tag, epoch, metrics, val_loss):
-        path = os.path.join(ckpt_dir, f"{model.model_name}_{tag}_{run_ts}.pt")
+        path = os.path.join(ckpt_dir, f"{run_label}_{tag}_{run_ts}.pt")
         torch.save({
             "backbone": model.backbone.state_dict(),
             "classifier": model.classifier.state_dict(),
@@ -356,7 +443,11 @@ def main():
                                extra={"val_step/loss": val_loss, "train/global_step": global_step})
 
         train_loss /= max(seen, 1)
-        current_lr = optimizer.param_groups[0]["lr"]
+        # First group that actually holds parameters: with --freeze-backbone the
+        # backbone group is empty, and charting its LR would plot a number that is
+        # training nothing.
+        current_lr = next((g["lr"] for g in optimizer.param_groups if g["params"]),
+                          optimizer.param_groups[0]["lr"])
         wu.log({"train/loss_epoch": train_loss, "lr": current_lr, "epoch": epoch + 1})
 
         if args.only_train:
@@ -403,7 +494,7 @@ def main():
             break
 
     # -------------------------------------------------------------- final model
-    final_path = os.path.join(config.get("save_path", "models/"), f"{model.model_name}_final_{run_ts}.pt")
+    final_path = os.path.join(config.get("save_path", "models/"), f"{run_label}_final_{run_ts}.pt")
     os.makedirs(os.path.dirname(final_path) or ".", exist_ok=True)
     torch.save({
         "backbone": model.backbone.state_dict(),

@@ -43,7 +43,8 @@ WEIGHTINGS = ("sqrt_inv_freq", "inv_freq", "none")
 
 class VideoMAEDataset(Dataset):
 
-    def __init__(self, video_csv: str, processor, spec: DataSpec, num_frames: int = 16):
+    def __init__(self, video_csv: str, processor, spec: DataSpec, num_frames: int = 16,
+                 source: str | None = None):
         """
         Args:
             video_csv (str | pd.DataFrame): manifest CSV path, or an already
@@ -53,6 +54,10 @@ class VideoMAEDataset(Dataset):
             processor: HuggingFace VideoMAEImageProcessor.
             spec (DataSpec): loaded configs/data.yaml — decides the targets.
             num_frames (int): ignored — hard-fixed to 16 (VideoMAE requirement).
+            source (str|None): label for log lines and error messages. Worth
+                passing whenever `video_csv` is a DataFrame, so "no clips
+                survived" still names the file (and the filter) it came from
+                instead of the useless "<dataframe>".
         """
         super().__init__()
         self.processor = processor
@@ -62,7 +67,8 @@ class VideoMAEDataset(Dataset):
         # A DataFrame is accepted so callers can evaluate a SUBSET of a manifest
         # (e.g. `df[df.thesis_test == 1]`) without writing a temporary CSV.
         raw = video_csv if isinstance(video_csv, pd.DataFrame) else pd.read_csv(video_csv)
-        source = "<dataframe>" if isinstance(video_csv, pd.DataFrame) else video_csv
+        source = source or ("<dataframe>" if isinstance(video_csv, pd.DataFrame)
+                            else video_csv)
         self.data, self.labels, self.masks, self.n_dropped = self._resolve_rows(raw, spec)
         if len(self.data) == 0:
             raise ValueError(

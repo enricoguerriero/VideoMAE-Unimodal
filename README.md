@@ -337,6 +337,28 @@ bash scripts/train.sh VideoMAE 0                                # multilabel (co
 bash scripts/train.sh VideoMAE 0 configs/data.yaml               # 4-class, thesis-comparable
 ```
 
+#### Training on one hospital: `--sites`
+
+The two sites differ in camera, lighting, staff and protocol, so "how good is a
+model that only ever saw Haydom" is a question worth asking on its own. `--sites`
+restricts `train_data` and `validation_data` to the named hospitals:
+
+```bash
+bash scripts/train.sh VideoMAE 0 configs/data.yaml --sites Haydom
+bash scripts/train.sh VideoMAE 0 configs/data.yaml --sites Haydom DRC   # == no flag
+```
+
+Names are case-insensitive and an unrecognised one is an error, not an empty
+split. The split CSVs are built at whole-case level, so filtering by site keeps
+the no-leakage guarantee. Note that the loss weights and the head's prior bias are
+derived from the split you train on, so a single-site run gets that site's priors
+— which is the point, and is why the site list is stored in the checkpoint under
+`config["sites"]` and appears in the W&B run name.
+
+Test sets need no such flag: they are already one file per hospital, and
+`scripts/test.sh` scores each separately (`--test_data haydom=data/test_haydom.csv`
+to score just one).
+
 The third argument (or `--data-config`) picks the label regime; nothing in
 `configs/config.yaml` has to change. The run logs the resolved spec, the class
 distribution, the loss weights and the head bias before the first epoch — read
