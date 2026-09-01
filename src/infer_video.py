@@ -112,7 +112,9 @@ def entry_text(entry, spec):
     """The label chip's text for one per-second entry."""
     if spec.is_multilabel:
         names = [spec.activities[i] for i in entry.get("active", [])]
-        return " + ".join(names) if names else f"no {spec.negative_class.replace('_', ' ')}"
+        # "no activity" — matching the HTML viewer's wording. Spelling it from
+        # `negative_class` rendered as "no non target", which reads as a typo.
+        return " + ".join(names) if names else "no activity"
     return spec.class_names[entry["label"]]
 
 
@@ -998,8 +1000,8 @@ def main():
     elif not args.render_video:
         logger.info("No display? Re-run with --render-video for a standalone annotated.mp4,")
         logger.info("or copy the whole folder off the VM and open viewer.html locally:")
-        logger.info(f"  python -m src.infer_video ... --render-video   (offline, single file)")
-        logger.info(f"  (viewer.html needs --copy-video so video.mp4 is a real file, not a symlink)")
+        logger.info("  python -m src.infer_video ... --render-video   (offline, single file)")
+        logger.info("  (viewer.html needs --copy-video so video.mp4 is a real file, not a symlink)")
 
 
 if __name__ == "__main__":

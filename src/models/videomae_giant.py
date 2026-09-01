@@ -14,6 +14,8 @@ with VideoMAEv2's custom __init__) is kept verbatim.
 Extra deps: pip install timm easydict
 """
 
+import logging
+
 import torch
 from transformers import VideoMAEImageProcessor, AutoConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
@@ -21,6 +23,8 @@ from safetensors.torch import load_file
 from huggingface_hub import hf_hub_download
 
 from .base import VideoModel
+
+logger = logging.getLogger(__name__)
 
 
 class VideoMAEGiant(VideoModel):
@@ -61,15 +65,35 @@ class VideoMAEGiant(VideoModel):
         # VideoMAEv2 expects (B, C, T, H, W).
         pixel_values = pixel_values.to(device).permute(0, 2, 1, 3, 4)
 
-        # Backbone returns a (B, hidden_size) mean-pooled feature vector.
+        # Backbone returns a (B, hidden_size) mean-pooled feature vector — there is
+        # no token sequence left to pool over, which is why attention pooling is
+        # rejected outright (see build_attention_pooling).
         features = self.backbone(pixel_values=pixel_values)
-
-        if self.attn_pool is not None:
-            mask = torch.ones(features.shape[:1], dtype=torch.bool, device=device).unsqueeze(1)
-            features = self.attn_pool(features.unsqueeze(1), mask)
 
         logits = self.classifier(features.float())
         return logits
+
+    def build_attention_pooling(self):
+        """Not available on this backbone — rejected instead of silently no-op'ing.
+
+        VideoMAEv2-giant pools internally and hands back a single (B, hidden)
+        vector. Wrapping AttentionPooling around it pools a length-1 sequence: the
+        softmax over one element is the constant 1, so the module is an exact
+        identity whose parameters get a gradient of exactly zero. It trained
+        nothing and was written into every checkpoint as dead weight.
+        """
+        raise ValueError(
+            "attention_pooling is not supported for VideoMAEGiant: the backbone "
+            "already returns a pooled (B, hidden) vector, so pooling over it is an "
+            "identity with zero gradient. Set `attention_pooling: false` in "
+            "configs/config.yaml (and drop --attention_pooling).")
+
+    def load_attention_pooling(self, checkpoint: dict):
+        """Skip with a warning: any saved layer here was the identity described
+        above, so restoring it would change nothing but would now raise."""
+        logger.warning(
+            "ignoring the saved attention-pooling layer — on VideoMAEGiant it was "
+            "an identity over a length-1 sequence and never affected the output.")
 
     def load_backbone(self, checkpoint: dict, config: dict = None):
         self.backbone.load_state_dict(checkpoint["backbone"], strict=False)

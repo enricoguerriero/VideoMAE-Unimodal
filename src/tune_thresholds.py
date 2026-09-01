@@ -101,8 +101,12 @@ def write_thresholds(path: Path, thresholds: dict[str, float]) -> bool:
     """Rewrite the `decision_thresholds:` block in place, comments intact.
 
     Only the activity lines inside that block are touched, and only when every
-    activity is found exactly once. Anything unexpected leaves the file alone —
-    a config is hand-maintained and worth more than the convenience.
+    TUNED activity is found exactly once. A line for an activity that was not
+    tuned (no positive examples, so the sweep had nothing to optimise) is left
+    exactly as it is — that is what "threshold left unchanged" above means, and
+    bailing on it used to abort the whole write with a message about a missing
+    `decision_thresholds:` block. Anything else unexpected still leaves the file
+    alone: a config is hand-maintained and worth more than the convenience.
     """
     text = path.read_text()
     lines = text.splitlines(keepends=True)
@@ -120,7 +124,8 @@ def write_thresholds(path: Path, thresholds: dict[str, float]) -> bool:
             continue
         indent, name = m.group(1), m.group(2)
         if name not in thresholds:
-            return False
+            i += 1          # not tuned this run — leave its line untouched
+            continue
         lines[i] = f"{indent}{name}: {thresholds[name]:.3f}\n"
         seen.add(name)
         i += 1
@@ -199,8 +204,8 @@ def main():
             print("Re-score the TEST sets with this config to see the effect:\n"
                   f"  bash scripts/test.sh VideoMAE <ckpt>.pt 0 {args.write}")
         else:
-            print(f"\n[SKIPPED] could not find a `decision_thresholds:` block in "
-                  f"{args.write} listing exactly {sorted(chosen)}.\n"
+            print(f"\n[SKIPPED] {args.write} has no `decision_thresholds:` block "
+                  f"listing {sorted(chosen)}.\n"
                   f"          Paste the block above by hand.")
 
 

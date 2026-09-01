@@ -29,7 +29,6 @@ Expected input layout (per site):
 """
 
 import os
-from collections import Counter
 
 import cv2
 import pandas as pd
@@ -37,7 +36,7 @@ import pandas as pd
 
 class VideoDataProcessor:
     def __init__(self, video_file, annotation_file, segment_size, shift,
-                 date_of_recording, folder_name, for_predict=False):
+                 date_of_recording, folder_name, for_predict=False, base_dir=None):
         self.video_file = video_file
         self.annotation_file = annotation_file
         self.segment_size = segment_size
@@ -52,7 +51,14 @@ class VideoDataProcessor:
         self.non_target_threshold = 0.20 # explicit non-target
         self.weak_threshold = 0.20       # purity guard for "other" target leakage
 
-        self.BasePath = os.path.dirname(self.folder_name)
+        # Where the RAW inputs live: <BasePath>/Unprocessed_data/{videos,anot_files}.
+        # It must be passed in, because the input staging dir and the output clip
+        # root are independent paths — in the documented layout they are SIBLINGS
+        # (.../Data_processing and .../Processed_video_clips), so deriving the
+        # input root from the output one read a directory that does not exist and
+        # every case failed. `os.path.dirname(folder_name)` survives only as the
+        # fallback for the old single-argument call.
+        self.BasePath = str(base_dir) if base_dir is not None else os.path.dirname(self.folder_name)
         os.makedirs(self.folder_name, exist_ok=True)
         os.makedirs(os.path.join(self.folder_name, "videos", "no_label"), exist_ok=True)
 
@@ -244,7 +250,10 @@ class VideoDataProcessor:
                 if not ret:
                     break
                 frames.append(cv2.resize(frame, (256, 192)))
-                current += (self.shift / fps) * 1000 if fps else 0
+                # one cap.read() advances exactly ONE frame, so the cursor moves
+                # by one frame period. Using `shift / fps` happened to agree only
+                # because SHIFT == 1; any other stride truncated the clip.
+                current += 1000.0 / fps if fps else 0
 
             if label == "Stimulation":
                 label_num, out_dir = 1, "videos/stimulation/"

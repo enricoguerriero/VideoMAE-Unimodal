@@ -333,8 +333,8 @@ already-cleaned annotations, or reuse the existing processed clips (Step 1).
 
 ```bash
 # edit configs/config.yaml (paths, batch_size, LR, epochs) first
-bash scripts/train.sh VideoMAE 0                                # multiclass (default)
-bash scripts/train.sh VideoMAE 0 configs/data_multilabel.yaml    # 3 independent activities
+bash scripts/train.sh VideoMAE 0                                # multilabel (config default)
+bash scripts/train.sh VideoMAE 0 configs/data.yaml               # 4-class, thesis-comparable
 ```
 
 The third argument (or `--data-config`) picks the label regime; nothing in

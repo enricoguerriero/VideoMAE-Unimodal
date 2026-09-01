@@ -53,19 +53,56 @@ from src.data import VideoMAEDataset, DataSpec
 VIT_MODELS = ["VideoMAE", "VideoMAEGiant"]
 
 
+FIXED_CSV_COLUMNS = ["timestamp", "split", "epoch", "batch", "val_loss"]
+
+
 def save_metrics_to_csv(csv_path, metrics, val_loss, epoch, split, batch=None):
-    """Append one row of validation metrics to a persistent CSV (W&B-independent)."""
-    scalar = {k: v for k, v in metrics.items() if not k.startswith("cm/")}
-    file_exists = os.path.isfile(csv_path)
-    with open(csv_path, "a", newline="") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["timestamp", "split", "epoch", "batch", "val_loss"] + sorted(scalar.keys()))
-        writer.writerow(
-            [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), split, epoch,
-             batch if batch is not None else "epoch_end", round(float(val_loss), 6)]
-            + [round(float(scalar[k]), 6) for k in sorted(scalar.keys())]
-        )
+    """Append one row of validation metrics to a persistent CSV (W&B-independent).
+
+    Written through a DictWriter keyed on the file's own header, so a column
+    always means the same metric. The previous version wrote the header once and
+    then emitted every later row in that row's own `sorted(keys())` order, which
+    silently shifted every column after any key that came or went. compute_metrics
+    does not guarantee a fixed key set — `proj/macro_f1`, `proj/accuracy` and the
+    projected `cm/...` counts only exist when the projected single-label view has
+    a clip to score (see metrics._multilabel_metrics). In practice that depends on
+    the ground truth alone, so it holds still within one run; it is not something
+    the writer should be relying on.
+
+    A genuinely new key rewrites the file with a widened header rather than
+    dropping the value or misaligning the row.
+    """
+    scalar = {k: round(float(v), 6) for k, v in metrics.items() if not k.startswith("cm/")}
+    row = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "split": split,
+        "epoch": epoch,
+        "batch": batch if batch is not None else "epoch_end",
+        "val_loss": round(float(val_loss), 6),
+        **scalar,
+    }
+
+    header, old_rows, widen = [], [], True
+    if os.path.isfile(csv_path):
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            header = list(reader.fieldnames or [])
+            widen = bool(set(scalar) - set(header)) or not header
+            if widen and header:
+                old_rows = list(reader)   # only pay the re-read when the header grows
+
+    if not widen:
+        with open(csv_path, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=header, restval="",
+                           extrasaction="ignore").writerow(row)
+        return
+
+    header = FIXED_CSV_COLUMNS + sorted((set(header) - set(FIXED_CSV_COLUMNS)) | set(scalar))
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=header, restval="", extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(old_rows)
+        writer.writerow(row)
 
 
 def alloc_targets(n, spec):
@@ -282,6 +319,12 @@ def main():
         logger.info(f"Epoch {epoch + 1}/{num_epochs}")
         model.train()
         train_loss, seen = 0.0, 0
+        # `seen` counts SAMPLES and advances in whole batches, so `seen % val_step`
+        # only ever hit multiples of lcm(batch_size, val_step) — with batch_size 6
+        # and validation_step 1000 that is every 3000 samples, and for batch_size 3
+        # / val_step 5000 it never fires inside a normal epoch at all. Track the
+        # next threshold instead, so validation runs as soon as the step is passed.
+        next_val_at = val_step if val_step is not None else None
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1} train", total=N // config.get("batch_size", 8)):
             labels = batch.pop("labels").to(device)
@@ -303,7 +346,8 @@ def main():
                 wu.log({"train/loss": train_loss / seen, "train/global_step": global_step,
                         "epoch": epoch + 1})
 
-            if val_step is not None and seen % val_step == 0:
+            if next_val_at is not None and seen >= next_val_at:
+                next_val_at += val_step
                 metrics, val_loss, _, _, _ = run_validation(
                     model, val_loader, criterion, device, amp_dtype, N_val, spec, minority_class)
                 model.train()

@@ -65,6 +65,7 @@ def main():
                 date_of_recording=case_id,
                 folder_name=str(args.folder_name),
                 for_predict=False,
+                base_dir=str(args.base_dir),
             )
             proc.run_video_only()
             print(f"[{i}/{len(cases)}] {case_id} done")

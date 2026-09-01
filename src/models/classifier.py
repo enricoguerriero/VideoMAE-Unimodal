@@ -38,9 +38,11 @@ class ClassifierHead(nn.Module):
             activation  (str): HIDDEN-layer activation, "relu" | "gelu" | "tanh".
                                Not the output activation — see the module docstring.
             dropout     (float): dropout after each hidden activation.
-            bias        (Tensor|None): optional (num_classes,) output-bias init
+            bias        (Tensor|None): optional (num_classes,) OUTPUT-bias init
                                        (log-prior or logit-prior, per task).
-                                       None => default zero bias.
+                                       None => the output layer is built with no
+                                       bias term at all (`use_bias: false`).
+                                       Hidden layers always keep theirs.
         """
         super().__init__()
 
@@ -49,7 +51,12 @@ class ClassifierHead(nn.Module):
         act_cls = act_lookup.get(activation.lower(), nn.ReLU)
         layers = []
         for i in range(len(dims) - 2):
-            layers.append(nn.Linear(dims[i], dims[i + 1], bias=(bias is not None)))
+            # Hidden layers ALWAYS keep their bias. `bias` is the output-layer
+            # prior; gating every Linear on it silently stripped the biases from
+            # the whole MLP whenever `use_bias: false` (or a checkpoint whose head
+            # had none) was in play, which is a different architecture, not a
+            # different initialisation.
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
             layers.append(act_cls())
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))

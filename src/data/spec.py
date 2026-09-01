@@ -31,7 +31,6 @@ manifest. Only `buckets` and `tag_keys` affect Stage 1.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
@@ -303,13 +302,21 @@ class DataSpec:
         untagged corpus; only the exact fractions are lost.
 
         Matching is case-insensitive and tolerant of separators, so a tree that
-        spells the combo differently still resolves.
+        spells the combo differently still resolves. An activity name is matched
+        as a CONTIGUOUS RUN OF TOKENS, not as a single token: the directory is
+        split on every non-alphanumeric character, so a multi-word activity like
+        `chest_compression` would never equal one token and was previously
+        unmatchable — which silently dropped every untagged clip of that activity.
         """
         if not isinstance(rel_dir, str) or not rel_dir:
             return ()  # missing, NaN, or a clip sitting at the site root
-        parts = re.split(r"[^a-z0-9]+", rel_dir.lower())
-        known = {a.lower(): a for a in self.activities}
-        found = [known[p] for p in parts if p in known]
+        parts = [p for p in re.split(r"[^a-z0-9]+", rel_dir.lower()) if p]
+        found = set()
+        for a in self.activities:
+            want = [t for t in re.split(r"[^a-z0-9]+", a.lower()) if t]
+            n = len(want)
+            if n and any(parts[i:i + n] == want for i in range(len(parts) - n + 1)):
+                found.add(a)
         return tuple(a for a in self.activities if a in found)
 
     @staticmethod
@@ -472,8 +479,8 @@ class DataSpec:
             f"  task              : {self.task}  ({self.activation} head, "
             f"{'masked BCE' if self.is_multilabel else 'weighted CE'})",
             f"  outputs           : {self.num_classes} — {', '.join(self.class_names)}",
-            f"  LABEL cut (frac of the 3 s window that must be the activity)",
-            f"    positive if     : " + ", ".join(
+            "  LABEL cut (frac of the 3 s window that must be the activity)",
+            "    positive if     : " + ", ".join(
                 f"{a}>={self.thresholds[a]:.2f}" for a in self.activities),
             f"    negative if     : frac <= {self.weak_threshold:.2f}",
             f"  ambiguous band    : {self.ambiguous}",

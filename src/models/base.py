@@ -25,7 +25,7 @@ requires. `model.task` / `model.activation` say which one that is.
 
 Shared responsibilities kept here:
     * classifier-head construction (build_classifier)
-    * optional attention pooling (build_attention_pooling / pooling)
+    * optional attention pooling (build_attention_pooling)
     * checkpoint restore helpers (load_backbone / load_classifier /
       load_attention_pooling)
 
@@ -99,16 +99,6 @@ class VideoModel(nn.Module):
         return torch.sigmoid(logits) if self.is_multilabel else torch.softmax(logits, dim=-1)
 
     # ------------------------------------------------------------------
-    # Pooling
-    # ------------------------------------------------------------------
-    def pooling(self, x, mask):
-        """Masked mean pool, or learned attention pool if built."""
-        if self.attn_pool is not None:
-            return self.attn_pool(x, mask)
-        pooled = (x * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True).clamp(min=1)
-        return pooled
-
-    # ------------------------------------------------------------------
     # Head / pooling factories
     # ------------------------------------------------------------------
     def build_classifier(self, classifier_config: dict, bias=None):
@@ -146,9 +136,9 @@ class VideoModel(nn.Module):
     def load_classifier(self, checkpoint: dict, config: dict = None):
         """Build the head from config, restore its weights, move to backbone device.
 
-        The head's bias is CONSTRUCTED CONDITIONALLY — ClassifierHead builds
-        `nn.Linear(..., bias=(bias is not None))` — so the head must be rebuilt
-        with a bias whenever the checkpoint has one. Building it without and
+        The head's OUTPUT bias is CONSTRUCTED CONDITIONALLY — ClassifierHead
+        builds its last layer as `nn.Linear(..., bias=(bias is not None))` — so the
+        head must be rebuilt with a bias whenever the checkpoint has one. Building it without and
         relying on `strict=False` silently drops the trained bias: the weights
         still load, so the ranking (and average precision) look perfect, while
         every logit shifts by the bias that went missing. For a rare activity
@@ -159,18 +149,26 @@ class VideoModel(nn.Module):
         classifier_config = (config or {}).get("classifier_config", {})
         saved = checkpoint["classifier"]
 
-        out_w = [v for k, v in saved.items() if k.endswith("weight")]
-        if out_w and out_w[-1].shape[0] != self.num_classes:
+        # Locate the OUTPUT layer explicitly (highest `seq.<i>` index) rather than
+        # trusting state_dict ordering, and read its bias — not "any bias anywhere
+        # in the head". Hidden layers always carry a bias, so `any(...bias)` would
+        # claim an output bias for a `use_bias: false` MLP and rebuild the wrong
+        # architecture.
+        idxs = [int(k.split(".")[1]) for k in saved
+                if len(k.split(".")) > 2 and k.split(".")[1].isdigit()]
+        last = max(idxs, default=None)
+        out_w = saved.get(f"seq.{last}.weight") if last is not None else None
+        if out_w is not None and out_w.shape[0] != self.num_classes:
             raise ValueError(
-                f"checkpoint head emits {out_w[-1].shape[0]} logits but this run's "
+                f"checkpoint head emits {out_w.shape[0]} logits but this run's "
                 f"data config asks for {self.num_classes} ({self.task}). The "
                 f"checkpoint was trained for a different task — load the matching "
                 f"data config (checkpoints store theirs under 'data_spec').")
 
         # Mirror the saved head's shape: a placeholder bias vector is enough,
         # since load_state_dict overwrites it with the trained values.
-        has_bias = any(k.endswith(".bias") for k in saved)
-        placeholder = torch.zeros(self.num_classes) if has_bias else None
+        has_out_bias = last is not None and f"seq.{last}.bias" in saved
+        placeholder = torch.zeros(self.num_classes) if has_out_bias else None
         self.build_classifier(classifier_config, bias=placeholder)
 
         missing, unexpected = self.classifier.load_state_dict(saved, strict=False)
