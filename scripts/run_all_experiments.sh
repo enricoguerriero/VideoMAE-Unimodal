@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_all_experiments.sh — the full VideoMAEv2-giant experiment matrix
+# run_all_experiments.sh — the full VideoMAE experiment matrix
 # =============================================================================
 # 12 trainings + their evaluations, run back to back:
 #
@@ -38,7 +38,7 @@
 # Knobs (environment variables)
 # -----------------------------------------------------------------------------
 #   GPU=0                which CUDA device
-#   MODEL=VideoMAEGiant  VideoMAEGiant | VideoMAE
+#   MODEL=VideoMAE       VideoMAE (ViT-B base, the default) | VideoMAEGiant (ViT-g)
 #   CKPT_TAGS="best_macro"
 #                        which saved checkpoints to evaluate. Training always
 #                        keeps best_macro AND best_<minority_class>; add
@@ -53,10 +53,10 @@
 # -----------------------------------------------------------------------------
 # Before you start
 # -----------------------------------------------------------------------------
-# * DISK: a VideoMAEv2-giant state_dict is ~4 GB, and each run writes three of
-#   them (best_macro, best_<minority>, final) => ~12 GB per run, ~146 GB for the
-#   full matrix. The preflight below checks you have room. Point
-#   `checkpoint_path:` / `save_path:` in configs/config.yaml at a big disk if not.
+# * DISK: each run writes three state_dicts (best_macro, best_<minority>, final).
+#   VideoMAE base is ~0.35 GB each (~2 GB per run, ~24 GB for the matrix);
+#   VideoMAEGiant is ~4 GB each (~12 GB per run, ~146 GB). The preflight sizes
+#   this from $MODEL and checks you have room.
 # * W&B: if `wandb_mode: online` and you are not logged in, wandb.init() blocks
 #   on an interactive prompt and the whole unattended job hangs. The preflight
 #   refuses to start in that state — run `wandb login`, or set
@@ -69,7 +69,7 @@
 set -uo pipefail          # deliberately NOT -e: one bad run must not kill the rest
 
 GPU="${GPU:-0}"
-MODEL="${MODEL:-VideoMAEGiant}"
+MODEL="${MODEL:-VideoMAE}"
 CKPT_TAGS="${CKPT_TAGS:-best_macro}"
 CROSS_SITE="${CROSS_SITE:-0}"
 ONLY="${ONLY:-}"
@@ -105,6 +105,8 @@ test_sets() {
 preflight() {
     local fail=0
     echo "── preflight ────────────────────────────────────────────────────────"
+    echo "  python  $(python -c 'import sys; print(sys.executable)' 2>/dev/null \
+                      || echo 'NOT FOUND on PATH')"
 
     for f in configs/config.yaml "$MULTICLASS_CONFIG" "$MULTILABEL_CONFIG" \
              data/train.csv data/validation.csv "$HAYDOM_TEST" "$DRC_TEST"; do
@@ -129,7 +131,23 @@ try:
     from src.data.manifest import read_manifest
 except Exception as exc:
     print(f"  FAIL    cannot import src.data.manifest ({type(exc).__name__}: {exc}).")
-    print("          Is the project environment activated? Training needs it too.")
+    print(f"          interpreter: {sys.executable}")
+    for mod in ("numpy", "pandas", "torch"):
+        try:
+            m = __import__(mod)
+            print(f"          {mod:<7} {getattr(m, '__version__', '?'):<10} {m.__file__}")
+        except Exception as e:
+            print(f"          {mod:<7} FAILS TO IMPORT ({type(e).__name__})")
+    print()
+    print("          Training imports this same stack, so it would fail identically —")
+    print("          this is an environment problem, not a repo problem.")
+    print("          A numpy in ~/.local shadowing the env's own, with pandas compiled")
+    print("          against the other major version, is the usual cause. Confirm with:")
+    print("            PYTHONNOUSERSITE=1 python -c 'import pandas; print(pandas.__version__)'")
+    print("          If that works, ~/.local is the culprit. The durable fix is a")
+    print("          dedicated environment for this project:")
+    print("            python -m venv .venv && source .venv/bin/activate")
+    print("            pip install -r requirements.txt")
     raise SystemExit(1)
 need = {"Haydom", "DRC"}
 for split in ("train", "validation"):
@@ -168,12 +186,17 @@ print("            # or set `wandb_mode: offline` in configs/config.yaml")
 raise SystemExit(1)
 PY
 
-    # Disk: ~12 GB of checkpoints per run.
-    local runs_planned free_gb need_gb
+    # Disk: three fp32 state_dicts per run, sized from the backbone.
+    local runs_planned free_gb need_gb gb_per_run
+    case "$MODEL" in
+        VideoMAEGiant) gb_per_run=12 ;;   # 3 x ~4.1 GB  (ViT-g, 1.01B params)
+        VideoMAE)      gb_per_run=2  ;;   # 3 x ~0.35 GB (ViT-B, 87M params)
+        *)             gb_per_run=12 ;;   # unknown: assume the worst
+    esac
     runs_planned=$(( ${#EXPERIMENTS[@]} ))
-    need_gb=$(( runs_planned * 12 ))
+    need_gb=$(( runs_planned * gb_per_run ))
     free_gb=$(df -BG --output=avail . | tail -1 | tr -dc '0-9')
-    echo "  disk    ${free_gb} GB free, ~${need_gb} GB needed (${runs_planned} runs x ~12 GB of checkpoints)"
+    echo "  disk    ${free_gb} GB free, ~${need_gb} GB needed (${runs_planned} runs x ~${gb_per_run} GB of checkpoints)"
     if [[ "$free_gb" -lt "$need_gb" ]]; then
         echo "  FAIL    not enough space. Point checkpoint_path:/save_path: in"
         echo "          configs/config.yaml at a bigger disk, or trim CKPT_TAGS."
