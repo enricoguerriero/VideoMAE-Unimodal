@@ -172,11 +172,22 @@ def read_annotation(path: Path):
         ncols[len(parts)] += 1
         if len(parts) < 3:
             continue
-        original = parts[4] if len(parts) >= 5 else ""
-        try:
-            start, end = int(float(parts[1])), int(float(parts[2]))
-        except ValueError:
+        # Column layout varies by export generation (4, 5 and 6 columns all
+        # occur). Rather than assume positions 1 and 2, take the first adjacent
+        # pair that parses as numbers — the 6-column FullDataset exports put the
+        # timestamps elsewhere and were silently yielding zero rows.
+        start = end = None
+        for i in range(1, len(parts) - 1):
+            try:
+                a, b = int(float(parts[i])), int(float(parts[i + 1]))
+            except ValueError:
+                continue
+            if b >= a:
+                start, end = a, b
+                break
+        if start is None:
             continue
+        original = parts[4] if len(parts) >= 5 else ""
         rows.append((parts[0], start, end, original))
     return (rows, ncols), None
 
@@ -718,15 +729,18 @@ def section_hunt(sites, roots):
         hits = Counter()
         if s_["present"].get("anot_files") is not None:
             print("   anot_files/ present; fingerprinting it too for comparison")
-            d0 = s_["present"]["anot_files"]
-            hits[d0] = sum(1 for f in d0.glob("*.txt") if f.stem in cases)
-        for root in roots or []:
+        # NB: do NOT pre-seed anot_files here — the rglob below walks it too, and
+        # counting it twice reported 200% coverage.
+        seen_dirs = set()
+        for root in list(roots or []) + (
+                [s_["present"]["anot_files"]] if s_["present"].get("anot_files") else []):
             root = Path(root).expanduser()
             if not root.is_dir():
                 continue
             try:
                 for f in root.rglob("*.txt"):
-                    if f.stem in cases:
+                    if f.stem in cases and (f.parent, f.stem) not in seen_dirs:
+                        seen_dirs.add((f.parent, f.stem))
                         hits[f.parent] += 1
             except OSError as exc:
                 print(f"   [error walking {root}: {exc}]")
@@ -912,6 +926,150 @@ def section_vintage_diff(sites):
                         f"'{other}' — these vintages use different labelling policies")
 
 
+def _tagged_from_any_vintage(site, cap=20000):
+    """Every tagged clip of a site, from WHICHEVER vintage carries tags.
+
+    The training tree may be untagged while a small sibling tree is not. Because
+    the vintage diff shows those trees agree bucket-for-bucket, tags from the
+    sibling describe the training tree's policy too.
+    """
+    out = []
+    for v in site.get("vintages", []):
+        try:
+            for c in (v / "videos").rglob("*.mp4"):
+                info = parse_clip(c.stem)
+                if info and info["tagged"]:
+                    info["rel_dir"] = c.parent.relative_to(v / "videos").as_posix()
+                    info["vintage"] = v.name
+                    out.append(info)
+                    if len(out) >= cap:
+                        return out
+        except OSError:
+            continue
+    return out
+
+
+def _dir_activities(rel_dir):
+    """Codes named by a clip's directory (1=stim, 2=vent, 3=suct)."""
+    low = rel_dir.lower()
+    return {c for c, w in ((1, "stimulation"), (2, "ventilation"), (3, "suction"))
+            if w in low}
+
+
+def section_policy(sites):
+    """Bracket each site's ACTUAL thresholds, and decide whether they agree.
+
+    The heart of the cross-site question. An untagged site's labels are frozen at
+    whatever cut the processor used; a tagged site's are recomputed from the
+    config every run. They describe the same policy ONLY if the config equals the
+    frozen constants — and nothing else in this audit can tell you that.
+
+    Tagged clips make it decidable without guessing, because a bucket is a
+    THRESHOLD DECISION and the tag is the number it was taken on:
+
+        bucket a  (pure "strong")        => frac_a >= T_a     -> upper bound on T_a
+        partial/a (bucket 6, only a)     => frac_a <  T_a     -> lower bound on T_a
+        bucket a, other activity's frac  => frac_o <  T_weak  -> lower bound on T_weak
+
+    A bracket is exact, not statistical: one clip on each side pins the interval.
+    More clips only tighten it.
+    """
+    rule("11. POLICY EQUIVALENCE — is the FROZEN cut the same as the LIVE one?")
+    print("An untagged site cannot be re-thresholded, so its labels only match the")
+    print("tagged site's if the configured cut equals the one baked into its buckets.")
+    print("Tagged clips from ANY vintage of a site bracket that cut exactly.\n")
+
+    brackets = {}
+    for name, s_ in sites.items():
+        tagged = _tagged_from_any_vintage(s_)
+        h(f"{name}")
+        if not tagged:
+            print("   no tagged clip in ANY vintage — this site's cut is UNKNOWABLE from")
+            print("   the clips alone. Equivalence with the other site cannot be shown.")
+            finding(f"{name}: no tagged clip in any vintage — its labelling cut cannot "
+                    f"be verified against the other site's at all")
+            continue
+        vints = sorted({t["vintage"] for t in tagged})
+        print(f"   {len(tagged):,} tagged clips, from: {', '.join(vints)}")
+        if s_.get("clips") and all(v != s_["clips"].parent.name for v in vints):
+            print("   NOTE: none are from the audited tree "
+                  f"({s_['clips'].parent.name}); the vintage diff (section 10) is what")
+            print("   justifies carrying these thresholds over to it.")
+
+        site_b = {}
+        print(f"\n   {'activity':<13}{'strong n':>9}{'min frac':>10}"
+              f"{'partial n':>11}{'max frac':>10}   bracket for T")
+        for code in (1, 2, 3):
+            strong = [t["tags"][code] for t in tagged
+                      if t["bucket"] == code and code in t["tags"]]
+            partial = [t["tags"][code] for t in tagged
+                       if t["bucket"] == 6 and _dir_activities(t["rel_dir"]) == {code}
+                       and code in t["tags"]]
+            if not strong and not partial:
+                print(f"   {CODE_NAME[code]:<13}{'-':>9}{'-':>10}{'-':>11}{'-':>10}   "
+                      f"no evidence")
+                continue
+            up = min(strong) if strong else None       # T <= up
+            lo = max(partial) if partial else None     # T >  lo
+            site_b[code] = (lo, up)
+            desc = (f"({lo:.2f}, {up:.2f}]" if lo is not None and up is not None
+                    else f"<= {up:.2f}" if up is not None else f"> {lo:.2f}")
+            print(f"   {CODE_NAME[code]:<13}{len(strong):>9,}"
+                  f"{(up if up is not None else float('nan')):>10.2f}{len(partial):>11,}"
+                  f"{(lo if lo is not None else float('nan')):>10.2f}   {desc}")
+
+        # weak_threshold: inside a pure bucket the OTHER activities stayed under it
+        others = [v for t in tagged if t["bucket"] in (1, 2, 3)
+                  for k, v in t["tags"].items() if k != t["bucket"]]
+        if others:
+            site_b["weak"] = (max(others), None)
+            print(f"   {'weak_thresh':<13}{len(others):>9,}{float('nan'):>10.2f}"
+                  f"{'-':>11}{max(others):>10.2f}   > {max(others):.2f}")
+        brackets[name] = site_b
+
+        print("\n   against the processor constants "
+              f"(stim {PROCESSOR_CUT[1]:.2f}, vent {PROCESSOR_CUT[2]:.2f}, "
+              f"suct {PROCESSOR_CUT[3]:.2f}, weak {PROCESSOR_WEAK:.2f}):")
+        for code in (1, 2, 3):
+            if code not in site_b:
+                continue
+            lo, up = site_b[code]
+            cut = PROCESSOR_CUT[code]
+            inside = ((lo is None or cut > lo - 1e-9) and (up is None or cut <= up + 1e-9))
+            print(f"       {CODE_NAME[code]:<13} {'CONSISTENT' if inside else '** OUTSIDE THE BRACKET **'}")
+            if not inside:
+                finding(f"{name}: the cut actually used for {CODE_NAME[code]} is in "
+                        f"({lo}, {up}] which EXCLUDES the configured "
+                        f"{cut:.2f} — this site is labelled by a different rule")
+
+    # ---- the cross-site verdict -------------------------------------------
+    names = [n for n in brackets if brackets[n]]
+    h("VERDICT")
+    if len(names) < 2:
+        print("   only one site has measurable thresholds, so equivalence cannot be")
+        print("   demonstrated. Treat the two sites' labels as NOT known to agree.")
+        return
+    a, b = names[0], names[1]
+    for code in (1, 2, 3):
+        if code not in brackets[a] or code not in brackets[b]:
+            print(f"   {CODE_NAME[code]:<13} not measurable at both sites — UNRESOLVED")
+            finding(f"{CODE_NAME[code]}: cut not measurable at both sites, so the two "
+                    f"hospitals cannot be shown to use the same rule")
+            continue
+        (la, ua), (lb, ub) = brackets[a][code], brackets[b][code]
+        lo = max(x for x in (la, lb) if x is not None) if (la or lb) else None
+        up = min(x for x in (ua, ub) if x is not None) if (ua or ub) else None
+        overlap = (lo is None or up is None or lo < up + 1e-9)
+        print(f"   {CODE_NAME[code]:<13} {a} ({la}, {ua}]   {b} ({lb}, {ub}]   "
+              f"-> {'brackets OVERLAP (compatible)' if overlap else '** DISJOINT — different cuts **'}")
+        if not overlap:
+            finding(f"{CODE_NAME[code]}: {a} and {b} were cut with DIFFERENT thresholds "
+                    f"— their brackets ({la}, {ua}] and ({lb}, {ub}] do not overlap")
+    print("\n   Overlapping brackets mean the two sites are COMPATIBLE with a single")
+    print("   cut, not that they are identical — a bracket is only as tight as the")
+    print("   clips that pin it. Disjoint brackets are proof of a difference.")
+
+
 def section_findings():
     rule("9. FINDINGS")
     if not FINDINGS:
@@ -1003,7 +1161,8 @@ def main():
                     ("8", lambda: section_backfill(sites)),
                     ("8b", lambda: _hunt(sites, args)),
                     ("8c", lambda: section_validate(sites, HUNT_RESULT)),
-                    ("10", lambda: section_vintage_diff(sites))]:
+                    ("10", lambda: section_vintage_diff(sites)),
+                    ("11", lambda: section_policy(sites))]:
         if num in skip:
             print(f"\n[skipped section {num}]")
             continue
