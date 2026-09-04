@@ -127,28 +127,65 @@ preflight() {
     python - "$MULTICLASS_CONFIG" <<'PY' || fail=1
 import sys
 sys.path.insert(0, ".")
-try:
-    from src.data.manifest import read_manifest
-except Exception as exc:
-    print(f"  FAIL    cannot import src.data.manifest ({type(exc).__name__}: {exc}).")
+
+# Inventory the WHOLE import stack in one pass. training.py pulls src.utils and
+# src.data at module load, so torch / transformers / sklearn / pandas / av / yaml
+# / tqdm all have to work before epoch 1 — reporting them one failure per run is
+# a slow way to find out. cv2 is only needed by the clip re-cutting and the
+# viewers, so it is reported but not fatal.
+REQUIRED = ["torch", "transformers", "huggingface_hub", "safetensors",
+            "numpy", "pandas", "sklearn", "yaml", "tqdm"]
+OPTIONAL = ["cv2", "av", "wandb", "matplotlib"]
+
+def probe(mod):
+    try:
+        m = __import__(mod)
+        return None, getattr(m, "__version__", "?"), getattr(m, "__file__", "") or ""
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}", None, None
+
+broken = {}
+versions = {}
+for mod in REQUIRED + OPTIONAL:
+    err, ver, path = probe(mod)
+    if err is None:
+        versions[mod] = ver
+    elif mod in REQUIRED:
+        broken[mod] = err
+    else:
+        versions[mod] = f"absent ({mod} is optional)"
+
+if broken:
+    print(f"  FAIL    {len(broken)} required package(s) unusable in this interpreter.")
     print(f"          interpreter: {sys.executable}")
-    for mod in ("numpy", "pandas", "torch"):
-        try:
-            m = __import__(mod)
-            print(f"          {mod:<7} {getattr(m, '__version__', '?'):<10} {m.__file__}")
-        except Exception as e:
-            print(f"          {mod:<7} FAILS TO IMPORT ({type(e).__name__})")
     print()
-    print("          Training imports this same stack, so it would fail identically —")
-    print("          this is an environment problem, not a repo problem.")
-    print("          A numpy in ~/.local shadowing the env's own, with pandas compiled")
-    print("          against the other major version, is the usual cause. Confirm with:")
-    print("            PYTHONNOUSERSITE=1 python -c 'import pandas; print(pandas.__version__)'")
-    print("          If that works, ~/.local is the culprit. The durable fix is a")
-    print("          dedicated environment for this project:")
+    for mod in REQUIRED + OPTIONAL:
+        err, ver, path = probe(mod)
+        tag = "FAIL" if err else " ok "
+        if err:
+            print(f"          [{tag}] {mod:<16} {err[:74]}")
+        else:
+            print(f"          [{tag}] {mod:<16} {ver:<12} {path}")
+    print()
+    print("          Training imports this same stack — it would fail identically.")
+    print("          Compare the paths above: packages split across ~/.local and a")
+    print("          conda prefix, with different numpy major versions, is the usual")
+    print("          cause (conda envs inherit ~/.local; venvs do not).")
+    print("          Durable fix — a venv, which ignores ~/.local:")
     print("            python -m venv .venv && source .venv/bin/activate")
     print("            pip install -r requirements.txt")
     raise SystemExit(1)
+
+print(f"  deps    numpy {versions['numpy']}, pandas {versions['pandas']}, "
+      f"torch {versions['torch']}, transformers {versions['transformers']}")
+
+try:
+    from src.data.manifest import read_manifest
+except Exception as exc:
+    print(f"  FAIL    cannot import src.data.manifest ({type(exc).__name__}: {exc})")
+    print(f"          Run from the repo root; this needs ./src on the path.")
+    raise SystemExit(1)
+
 need = {"Haydom", "DRC"}
 for split in ("train", "validation"):
     df = read_manifest(f"data/{split}.csv")
