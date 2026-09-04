@@ -25,6 +25,8 @@ What it checks
  1  FILE FORMAT     column counts of anot_files (4-col = older vintage)
  2  VOCABULARY      original Event string -> mapped category, PER SITE, diffed.
                     This is where a bulb/penguin/tube suction difference shows up.
+                    A site with no anot_files/ is read from its raw export
+                    instead, so the diff still runs.
  3  INTERVALS       per-class interval counts and durations per site
  4  RAW vs CLEANED  interval counts before/after cleaning — detects whether
                     merge_close_intervals() was applied asymmetrically
@@ -50,6 +52,35 @@ Usage
 
 `--site NAME=BASEPATH` points at the dir CONTAINING `Unprocessed_data/`.
 Clip roots are auto-discovered as `<BASEPATH>/Processed_*/videos` unless given.
+
+--------------------------------------------------------------------------
+Reading HAYDOM: three conventions borrowed from Ronald Paleczny's pipeline
+--------------------------------------------------------------------------
+This audit was first written against the DRC exports, which are tidy. Haydom's
+are not, and each difference produced a silent false negative that read as
+"the annotations are gone":
+
+  FILENAMES    Haydom files are not named `<case_id>.txt`. Matching on the
+               exact stem found 61 of 246 cases in a 489-file directory.
+               Files are now indexed by case KEY — the exact stem plus any
+               run of >= 5 digits — which is Ronald's canonical-id rule
+               (`data_preprocessing.extract_digits`) widened to a lookup.
+  TIME UNITS   Haydom rows mix HH:MM:SS(.mmm) tokens with decimal SECONDS.
+               Reading "83.400" as 83 shrinks every interval ~1000x, which is
+               indistinguishable from "this case has no suction". Colon tokens
+               are dropped and decimals scaled by 1000
+               (`data_preprocessing.to_milliseconds`); section 1 reports the
+               counts so a wrong guess is visible.
+  SPELLING     Every Haydom suction string on disk is the misspelled
+               "penguine" form. The notebooks fix typos in a separate
+               `corrections` pass before `relevant_patterns`; both are folded
+               into `classify_event()`. Applying `relevant_patterns` alone
+               mapped every Haydom suction interval to "Ignored label".
+
+Ronald's own CATEGORY choices are deliberately NOT copied — he tracks T-piece
+ventilation and ignores "Bag-mask squeezed - sound", the thesis does the
+reverse. The thesis rules are authoritative here because they are what cut the
+clip trees on disk.
 """
 
 from __future__ import annotations
@@ -58,6 +89,7 @@ import argparse
 import re
 import sys
 from collections import Counter, defaultdict
+from decimal import Decimal
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -68,12 +100,16 @@ MAP_LABELS = {"Ignored label": 4, "Suction": 3, "Ventilation": 2,
               "Stimulation": 1, "Non-target": 0}
 CODE_NAME = {0: "Non-target", 1: "Stimulation", 2: "Ventilation", 3: "Suction",
              4: "Ignored label"}
-#: rows with this in the last column are dropped before anything else
-DROP_ORIGINAL = "Newborn visible in video frame"
-#: `relevant_patterns` from the thesis notebooks — the ORIGINAL annotator string
-#: -> category map applied to raw exports before anything else. Identical in the
-#: Haydom and DRC notebooks in the final snapshot. Anything absent maps to
-#: "Ignored label", which is how "Suction using tube" gets discarded.
+#: `relevant_patterns` from the thesis notebooks — the CANONICAL annotator
+#: string -> category map. Identical in the Haydom and DRC notebooks in the
+#: final snapshot. Anything absent maps to "Ignored label", which is how
+#: "Suction using tube" and "T-piece ventilation" get discarded.
+#:
+#: Kept for reference only: the notebooks run a `corrections` typo pass BEFORE
+#: this one, so on its own it does not match real annotator text. Use
+#: `classify_event()`, which folds both passes together — see EVENT_CATEGORY.
+#: Likewise the visibility filter, which is `is_visibility()` and not an exact
+#: compare against one spelling.
 RELEVANT_PATTERNS = {
     "Bag-mask ventilation": "Ventilation",
     "Bag-mask squeezed - sound": "Ventilation",
@@ -127,6 +163,170 @@ STAGES = {
 _TAG_RE = re.compile(r"_(stim|vent|suct)(\d+\.\d+)")
 _WINDOW_RE = re.compile(r"_start_([\d.]+)_end_([\d.]+)")
 
+# ---------------------------------------------------------------------------
+# Haydom's raw conventions, taken from Ronald Paleczny's Haydom-only pipeline
+# (Master-project/src/data/data_preprocessing.py + clips_and_video_stats.py)
+# ---------------------------------------------------------------------------
+# The DRC exports are tidy: one file per case named `<case_id>.txt`, timestamps
+# as bare integer milliseconds, event strings already spelled canonically. This
+# audit was written against those, and every one of those assumptions is FALSE
+# at Haydom. Ronald's preprocessing stage exists purely to absorb the
+# difference, so his rules are reused verbatim here:
+#
+#   * FILE NAMING. Haydom annotation files are not named after the case id — in
+#     the March2026Sync export 489 files matched only 61 of 246 cases on an
+#     exact stem compare, which read as "the annotations are gone" when they
+#     are merely named differently. Ronald renames every file to the first run
+#     of digits in its stem; `case_keys` indexes both spellings so either finds
+#     the file.
+#   * TIME UNITS. Haydom rows carry HH:MM:SS(.mmm) tokens AND decimal-SECOND
+#     timestamps in the same line. Reading "83.400" as 83 makes every interval
+#     ~1000x too short, which is indistinguishable from "this case has no
+#     suction". Ronald drops the colon tokens and multiplies decimals by 1000;
+#     bare integers are already milliseconds.
+#   * SPELLING. Every Haydom suction string on disk is the misspelled
+#     "penguine" form. RELEVANT_PATTERNS lists only the canonical "penguin",
+#     because the notebook fixes typos in a SEPARATE `corrections` pass first.
+#     Applying RELEVANT_PATTERNS alone to a raw export maps every Haydom
+#     suction interval to "Ignored label" and yields a site with zero suction.
+#     EVENT_CATEGORY below folds both notebook passes into one lookup.
+_DIGITS_RE = re.compile(r"(\d+)")
+_HHMMSS_RE = re.compile(r"^\d{1,2}:\d{2}:\d{2}(?:\.\d+)?$")
+_INT_RE = re.compile(r"^[+-]?\d+$")
+_DEC_RE = re.compile(r"^[+-]?\d+\.\d+$")
+_SPLIT_RE = re.compile(r"\t+| {2,}")
+
+#: minimum length of a digit run that may stand in for a case id. Haydom ids
+#: run 5-8 digits ("30097" .. "11848523"); a 4-digit floor would let a leading
+#: year collide every file in a directory onto one key.
+_CASE_KEY_MIN_DIGITS = 5
+
+#: how timestamps were read, so a wrong unit assumption shows up in section 1
+#: instead of silently shrinking every interval.
+UNIT_STATS = Counter()
+
+
+def normalize_tokens(line: str) -> list:
+    """One raw annotation line -> tokens, timestamps normalised to milliseconds.
+
+    Ronald's `process_annotation_line` / `to_milliseconds` policy: split on tabs
+    or runs of 2+ spaces, DROP any HH:MM:SS(.mmm) token, keep a bare integer as
+    milliseconds, multiply a decimal (seconds) by 1000. Non-numeric tokens pass
+    through unchanged, so a multi-word event name survives intact.
+    """
+    out = []
+    for part in _SPLIT_RE.split(line.rstrip("\n")):
+        token = part.strip()
+        if not token:
+            continue
+        if _HHMMSS_RE.match(token):
+            UNIT_STATS["hhmmss_dropped"] += 1
+            continue
+        if _INT_RE.match(token):
+            UNIT_STATS["integer_ms"] += 1
+            out.append(str(int(token)))
+        elif _DEC_RE.match(token):
+            UNIT_STATS["decimal_seconds_scaled"] += 1
+            out.append(str(int(Decimal(token) * 1000)))
+        else:
+            out.append(token)
+    return out
+
+
+def case_keys(stem: str) -> set:
+    """Every id a file or clip may be addressed by: the exact stem, plus each
+    run of >= 5 digits in it (Ronald's canonical-id rule, widened from "first
+    run" to "any run" because we only need to LOOK UP a file, not rename it)."""
+    keys = {stem}
+    keys.update(d for d in _DIGITS_RE.findall(stem)
+                if len(d) >= _CASE_KEY_MIN_DIGITS)
+    return keys
+
+
+def _norm_event(text) -> str:
+    """Ronald's `normalize_label`: lowercase, punctuation -> space, collapse."""
+    text = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+#: The thesis notebooks map an annotator string to a category in TWO passes: a
+#: `corrections` dict of typo fixes, then `relevant_patterns`. Merged here into
+#: one table keyed on the NORMALISED string, so both passes happen at once.
+#:
+#: The spellings come from the notebooks' `corrections` dict; Ronald's variant
+#: sets were cross-checked against it and agree exactly on suction (the same
+#: five "penguine" misspellings) and on stimulation. They deliberately DIVERGE
+#: on ventilation and that divergence is NOT copied: Ronald tracks `T-piece
+#: ventilation` and ignores `Bag-mask squeezed - sound`, whereas the thesis does
+#: the reverse. The thesis reading is authoritative here, because these are the
+#: rules the clip trees on disk were cut with.
+_EVENT_VARIANTS = {
+    "Ventilation": [
+        "Bag-mask ventilation", "Bag mask ventilation", "Bag-mask ventilatio",
+        "Bagmask ventilation", "BMV", "Bag-mask ventiltation",
+        "Badmask ventilation", "Bag-mask ventiation", "Bag-mask ventilatioon",
+        "Bag-mask vintilation",
+        "Bag-mask squeezed - sound", "Bag mask squeezed-sound",
+        "Bagmask squeezed -sound", "BagMask squeezed sound",
+        "BagMask Squeezed sound", "Bagmask squeezed-sound",
+        "Bag-mask squeezed sound", "Bag-mask squeezed- -sound",
+        "Bag-mask squeezed- sound", "BagMask squeeed sound",
+        "Bagmask Squeezed sound", "Bagmask squeezed sound",
+        "Bag mask squeezed -sound", "Bagmak squeezed - sound",
+        "Bagmask squeezed- sound", "Bagmask squezeed-sound",
+        "Bagmsk squeezed-sound", "Bag-mask squeezed-sound",
+    ],
+    "Stimulation": [
+        "Stimulation of trunk", "Stimulation of Trunk", "Stimulation of tunk",
+        "Stiomulation of trunk", "Stumulation of trunk",
+        "Stimulation of the Trunk", "Stimualtion of trunk",
+        "Stimuklation of trunk", "Stimulation of  trunk",
+        "Stimulationof trunk", "Stiomulation of Trunk",
+        "Stimulation of the trunk",
+    ],
+    "Suction": [
+        "Suction using penguin device", "Suction using penguine device",
+        "Suction using Penguine Device", "Suction using Penguine device",
+        "Suction using penguine devece", "Sunction using penguine device",
+        "Suction using bulb device",
+    ],
+    "Non-target": [
+        "Crying",
+        "Chest/abdomen movement", "Chest/Abdomen movement",
+        "Chest/adomen movement", "Chest/abdomen device",
+        "Chest/abdomen ventilation",
+    ],
+}
+EVENT_CATEGORY = {_norm_event(v): cat
+                  for cat, variants in _EVENT_VARIANTS.items() for v in variants}
+
+#: `Newborn visible in video frame` and its 18 known misspellings. These rows
+#: are dropped before anything else (data_process.py line 92). Matching only the
+#: canonical spelling leaves a typo'd one to become an "Ignored label" interval
+#: spanning most of the episode, which suppresses the ventilation and non-target
+#: branches for the whole case (both require `other == 0`).
+VISIBILITY_VARIANTS = {_norm_event(v) for v in [
+    "Newborn visible in video frame", "New born visible in video frame",
+    "Newborn in video frame", "Newborn visible in vedeo frame",
+    "Newborn visible in video fgrame", "Newborn visible in video Frame",
+    "Newborn visible on video frame", "Newboen visible in video frame",
+    "Newborn Visible in video Frame", "Newborn Visible in vodeo frame",
+    "Newborn visible in visible frame", "Newborn visisble in video frame",
+    "Neborn visible in video frame", "New-born visible in video frame",
+    "Newborn visible in frame", "Newborn visible in the video frame",
+    "Newborn visible in video  frame", "Newborn visible in videon frame",
+    "Newborn visivle in video frame", "Newborn Visible in video frame",
+]}
+
+
+def classify_event(text):
+    """Original annotator string -> thesis category, or None if untracked."""
+    return EVENT_CATEGORY.get(_norm_event(text))
+
+
+def is_visibility(text) -> bool:
+    return _norm_event(text) in VISIBILITY_VARIANTS
+
 FINDINGS: list[str] = []      # things that are WRONG or inconsistent
 NOTES: list[str] = []         # things that are USEFUL — capabilities, not faults
 HUNT_RESULT: dict = {}
@@ -159,6 +359,11 @@ def read_annotation(path: Path):
 
     Tolerant on purpose: a short or unparseable row is reported, not fatal, so a
     single bad file cannot hide the rest of the audit.
+
+    Timestamps go through `normalize_tokens`, so a Haydom row written as
+    HH:MM:SS plus decimal seconds yields the same milliseconds a DRC row states
+    outright. `ncols_seen` still counts RAW tab-separated fields, so section 1's
+    "4-col = older vintage" reading is unchanged.
     """
     rows, ncols = [], Counter()
     try:
@@ -168,23 +373,38 @@ def read_annotation(path: Path):
     for line in text.splitlines():
         if not line.strip():
             continue
-        parts = line.rstrip("\n").split("\t")
-        ncols[len(parts)] += 1
+        ncols[len(line.rstrip("\n").split("\t"))] += 1
+        parts = normalize_tokens(line)
+        if len(parts) == 1 and " " in parts[0]:
+            # Single-space-separated export. Ronald's `parse_annotation_line`
+            # rule: the last three tokens are start/end/duration, everything
+            # before them is the event name (which may contain spaces).
+            toks = parts[0].split()
+            if len(toks) >= 4:
+                tail = normalize_tokens("\t".join(toks[-3:]))
+                if len(tail) == 3 and all(_INT_RE.match(t) for t in tail):
+                    parts = [" ".join(toks[:-3])] + tail
         if len(parts) < 3:
             continue
         # Column layout varies by export generation (4, 5 and 6 columns all
-        # occur). Rather than assume positions 1 and 2, take the first adjacent
-        # pair that parses as numbers — the 6-column FullDataset exports put the
-        # timestamps elsewhere and were silently yielding zero rows.
+        # occur) and so does the position of the timestamps, so nothing is
+        # assumed from the index. Prefer the first ADJACENT TRIPLE that is
+        # self-consistent (end - start == duration): that identifies the real
+        # start/end pair even in a 6-column row that also carries a redundant
+        # copy of the times. Fall back to the first ascending adjacent pair.
+        nums = [(i, int(t)) for i, t in enumerate(parts) if _INT_RE.match(t)]
         start = end = None
-        for i in range(1, len(parts) - 1):
-            try:
-                a, b = int(float(parts[i])), int(float(parts[i + 1]))
-            except ValueError:
-                continue
-            if b >= a:
+        for j in range(len(nums) - 2):
+            (i0, a), (i1, b), (i2, d) = nums[j], nums[j + 1], nums[j + 2]
+            if i1 == i0 + 1 and i2 == i1 + 1 and b >= a and abs((b - a) - d) <= 2:
                 start, end = a, b
                 break
+        if start is None:
+            for j in range(len(nums) - 1):
+                (i0, a), (i1, b) = nums[j], nums[j + 1]
+                if i1 == i0 + 1 and b >= a:
+                    start, end = a, b
+                    break
         if start is None:
             continue
         original = parts[4] if len(parts) >= 5 else ""
@@ -210,7 +430,7 @@ def annotation_kind(rows):
 
     A cleaned anot_files row reads  Suction \t start \t end \t dur \t Suction using bulb device
     A raw export reads              Suction using bulb device \t start \t end \t dur
-    Telling them apart decides whether RELEVANT_PATTERNS still has to be applied.
+    Telling them apart decides whether the event mapping still has to be applied.
     """
     if not rows:
         return "empty"
@@ -219,17 +439,21 @@ def annotation_kind(rows):
 
 
 def intervals_by_code(rows, kind=None):
-    """DROP_ORIGINAL filter -> category -> merge, for either annotation stage.
+    """visibility filter -> category -> merge, for either annotation stage.
 
-    For a raw export the category comes from RELEVANT_PATTERNS (what the
-    notebook applies); for a cleaned file column 1 is already the category.
+    For a raw export the category comes from `classify_event`, which folds the
+    notebook's `corrections` and `relevant_patterns` passes into one lookup on
+    the normalised string; for a cleaned file column 1 is already the category.
+    Visibility rows are matched typo-tolerantly, because a missed one becomes an
+    "Ignored label" interval spanning the episode and suppresses the ventilation
+    and non-target branches for the whole case.
     """
     kind = kind or annotation_kind(rows)
     buckets = defaultdict(list)
     for event, start, end, original in rows:
-        if original == DROP_ORIGINAL or event == DROP_ORIGINAL:
+        if is_visibility(original) or is_visibility(event):
             continue
-        cat = event if kind == "cleaned" else RELEVANT_PATTERNS.get(event, "Ignored label")
+        cat = event if kind == "cleaned" else (classify_event(event) or "Ignored label")
         code = MAP_LABELS.get(cat)
         if code is None:
             continue
@@ -282,6 +506,102 @@ def discover(base: Path):
 
 
 # ---------------------------------------------------------------------------
+# Locating a site's annotations — by case KEY, not by exact filename
+# ---------------------------------------------------------------------------
+def index_annotation_dir(d: Path):
+    """One directory -> ({case key: file}, {case key: [conflicting files]}).
+
+    A file is reachable under its exact stem AND under any >= 5-digit run in it,
+    so Haydom's `LS_11848523_reviewed.txt` answers to `11848523`. When two files
+    claim the same key, Ronald's rule applies: byte-identical content keeps the
+    first, differing content drops BOTH and records a conflict — silently
+    picking one of two disagreeing versions of a case's annotations is exactly
+    what his conflicts/ folder exists to prevent.
+    """
+    index, claims = {}, defaultdict(list)
+    try:
+        files = sorted(d.glob("*.txt"))
+    except OSError:
+        return {}, {}
+    for f in files:
+        for k in case_keys(f.stem):
+            claims[k].append(f)
+    conflicts = {}
+    for k, fs in claims.items():
+        if len(fs) == 1:
+            index[k] = fs[0]
+            continue
+        blobs = set()
+        for f in fs:
+            try:
+                blobs.add(f.read_bytes())
+            except OSError:
+                blobs.add(None)
+        if len(blobs) == 1:
+            index[k] = fs[0]          # duplicates of the same content
+        else:
+            conflicts[k] = fs         # genuinely different versions — refuse
+    return index, conflicts
+
+
+def locate_annotations(site, roots):
+    """Every annotation directory reachable for a site, best source first.
+
+    The site's own `anot_files/` leads (it is the CLEANED stage the clips were
+    actually cut from); the `--find-annotations` roots follow in the order given.
+    Each directory keeps its own index so section 8b can still report coverage
+    per directory, and the merged view resolves a case to its best source.
+    """
+    out, seen = [], set()
+    own = site["present"].get("anot_files")
+    for root in ([own] if own is not None else []) + [Path(r).expanduser() for r in roots]:
+        if not root.is_dir():
+            continue
+        try:
+            dirs = sorted({f.parent for f in root.rglob("*.txt")})
+        except OSError:
+            continue
+        for d in dirs:
+            if d in seen:
+                continue
+            seen.add(d)
+            idx, conf = index_annotation_dir(d)
+            if idx:
+                out.append({"dir": d, "index": idx, "conflicts": conf})
+    return out
+
+
+def annotation_files_for(site):
+    """(files, raw_source_dir) — the best annotation stage available for a site.
+
+    The cleaned `anot_files/` when the site still has one (raw_source_dir None),
+    otherwise the highest-priority LOCATED directory. Sections 1, 2 and 3 all go
+    through this, so a site whose cleaned stage was deleted reports a real
+    column shape, vocabulary and interval census instead of a row of dashes —
+    which previously read as "this hospital annotates nothing at all".
+    """
+    d = site["present"].get("anot_files")
+    if d is not None:
+        return sorted(d.glob("*.txt")), None
+    if site.get("annot_dirs"):
+        e = site["annot_dirs"][0]
+        return sorted(set(e["index"].values())), e["dir"]
+    return [], None
+
+
+def lookup_annotation(site, case_id):
+    """Best annotation file for one case id, or None. Tries the exact id first,
+    then every digit run in it, over the located directories in priority order."""
+    keys = [case_id] + sorted(case_keys(case_id) - {case_id})
+    for entry in site.get("annot_dirs", []):
+        for k in keys:
+            f = entry["index"].get(k)
+            if f is not None:
+                return f
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Sections
 # ---------------------------------------------------------------------------
 def section_layout(sites):
@@ -321,14 +641,14 @@ def section_layout(sites):
 
 
 def section_format(sites):
-    rule("1. ANNOTATION FILE FORMAT — column counts in anot_files/")
+    rule("1. ANNOTATION FILE FORMAT — column counts and time units")
     print(f"{'site':<10}{'files':>8}{'rows':>10}   column-count histogram")
+    UNIT_STATS.clear()
     for name, s in sites.items():
-        d = s["present"].get("anot_files")
-        if d is None:
-            print(f"{name:<10}{'-':>8}{'-':>10}   (no anot_files/)")
+        files, raw_src = annotation_files_for(s)
+        if not files:
+            print(f"{name:<10}{'-':>8}{'-':>10}   (no annotation file located)")
             continue
-        files = sorted(d.glob("*.txt"))
         ncols, nrows, bad = Counter(), 0, []
         for f in files:
             got, err = read_annotation(f)
@@ -337,14 +657,33 @@ def section_format(sites):
             rows, cols = got
             ncols.update(cols); nrows += len(rows)
         hist = ", ".join(f"{c} cols x{n:,}" for c, n in sorted(ncols.items()))
-        print(f"{name:<10}{len(files):>8,}{nrows:>10,}   {hist or '(empty)'}")
-        s["anot_dir"] = d
+        print(f"{name:<10}{len(files):>8,}{nrows:>10,}   {hist or '(empty)'}"
+              + (f"   [RAW: {raw_src}]" if raw_src else ""))
+        s["anot_dir"] = raw_src or s["present"].get("anot_files")
         s["anot_files"] = files
-        if any(c < 5 for c in ncols):
+        s["anot_raw_src"] = raw_src
+        # <5 columns only matters for the CLEANED stage, where the 5th column is
+        # the preserved original label. A raw export legitimately has 4 or 6.
+        if raw_src is None and any(c < 5 for c in ncols):
             finding(f"{name}: some anot_files rows have <5 columns — the 5th column "
                     f"(Corrected_Original_Event) is what makes re-mapping possible")
         for fn, err in bad[:3]:
             print(f"           [WARN] {fn}: {err}")
+
+    # How the timestamps were read, across everything parsed so far. A file that
+    # states seconds ("83.400") and one that states milliseconds ("83400") look
+    # identical to a positional parser; Ronald's rule scales the first and not
+    # the second, and this line is where a wrong guess becomes visible instead
+    # of silently shrinking every interval by ~1000x.
+    if UNIT_STATS:
+        print(f"\n  time tokens: {UNIT_STATS['integer_ms']:,} bare integers "
+              f"(already ms), {UNIT_STATS['decimal_seconds_scaled']:,} decimals "
+              f"scaled x1000 (seconds -> ms), "
+              f"{UNIT_STATS['hhmmss_dropped']:,} HH:MM:SS tokens dropped")
+        if UNIT_STATS["decimal_seconds_scaled"]:
+            print("  (decimal-second rows follow Ronald's data_preprocessing rule; if a "
+                  "site\n   writes fractional MILLISECONDS instead, this scaling is wrong "
+                  "— check\n   section 3's max_ms against the real episode length)")
 
 
 def section_vocabulary(sites):
@@ -356,12 +695,25 @@ def section_vocabulary(sites):
     per_site = {}
     for name, s in sites.items():
         pairs = Counter()
-        for f in s.get("anot_files", []):
+        # A site with no anot_files/ is not a site with no vocabulary: fall back
+        # to the best LOCATED directory, mapping its raw strings the way the
+        # notebooks do. Without this the cross-site diff below — the check that
+        # actually answers the suction question — could never run for Haydom.
+        files, raw_src = annotation_files_for(s)
+        if raw_src is not None:
+            print(f"   [{name}: no anot_files/ — reading {len(files)} raw file(s) from")
+            print(f"    {raw_src}, mapped with the notebooks' corrections + patterns]")
+        for f in files:
             got, err = read_annotation(f)
             if err:
                 continue
             for event, _, _, original in got[0]:
-                pairs[(original or "<no 5th col>", event)] += 1
+                if raw_src is None:
+                    pairs[(original or "<no 5th col>", event)] += 1
+                elif is_visibility(event):
+                    pairs[(event, "(visibility — dropped)")] += 1
+                else:
+                    pairs[(event, classify_event(event) or "Ignored label")] += 1
         per_site[name] = pairs
         h(f"{name}: original -> mapped  (interval counts)")
         if not pairs:
@@ -406,14 +758,32 @@ def section_vocabulary(sites):
     else:
         print("   no string maps to different categories between the two sites")
 
-    for label, only, site in ((f"only in {a}", only_a, a), (f"only in {b}", only_b, b)):
-        if only:
-            print(f"   [{label}] {len(only)} original string(s):")
-            for o in only[:12]:
-                print(f"       {o[:50]:<50} -> {sorted(map_a[o] if site == a else map_b[o])}")
-            sucty = [o for o in only if "suction" in o.lower()]
-            if sucty:
-                finding(f"SUCTION VOCABULARY: {sucty} present only at {site}")
+    # A string that appears at ONE site only is not automatically a fault. Two
+    # hospitals genuinely use different equipment — Haydom suctions with a
+    # penguin device, DRC also with a bulb — and a spelling can simply be one
+    # annotator's habit. What matters is whether the missing string would have
+    # landed in a category the other site DOES populate: only then is the class
+    # itself built from different evidence at the two sites. Anything that maps
+    # to "Ignored label" at both is noise either way.
+    for label, only, site, mp in ((f"only in {a}", only_a, a, map_a),
+                                  (f"only in {b}", only_b, b, map_b)):
+        if not only:
+            continue
+        print(f"   [{label}] {len(only)} original string(s):")
+        for o in only[:12]:
+            print(f"       {o[:50]:<50} -> {sorted(mp[o])}")
+        tracked = sorted({c for o in only for c in mp[o]} - {"Ignored label",
+                                                             "(visibility — dropped)"})
+        if tracked:
+            for cat in tracked:
+                strings = sorted(o for o in only if cat in mp[o])
+                print(f"       -> {cat} at {site} draws on {len(strings)} string(s) the "
+                      f"other site never uses")
+                note(f"{cat}: {site} annotates it with {strings[:4]}"
+                     f"{' ...' if len(strings) > 4 else ''}, which the other site never "
+                     f"uses — expected when the two hospitals differ in equipment or "
+                     f"annotator habit, but it does mean this class is built from "
+                     f"different evidence per site")
 
 
 def section_intervals(sites):
@@ -423,7 +793,10 @@ def section_intervals(sites):
     for name, s in sites.items():
         per_code = defaultdict(list)
         cases_with = defaultdict(set)
-        for f in s.get("anot_files", []):
+        files, raw_src = annotation_files_for(s)
+        if raw_src is not None:
+            print(f"{name:<10}(from raw export {raw_src})")
+        for f in files:
             got, err = read_annotation(f)
             if err:
                 continue
@@ -536,16 +909,20 @@ def section_clips(sites):
 
 
 def _load_case_intervals(site, case_id, cache):
+    """Merged intervals for one case, from whichever located source has it.
+
+    Goes through `lookup_annotation` rather than `anot_files/<case>.txt`, so a
+    site whose cleaned stage was deleted can still be checked against a raw
+    export whose filenames do not equal the case ids.
+    """
     if case_id in cache:
         return cache[case_id]
-    d = site["present"].get("anot_files")
     ivs = None
-    if d is not None:
-        f = d / f"{case_id}.txt"
-        if f.is_file():
-            got, err = read_annotation(f)
-            if not err:
-                ivs = intervals_by_code(got[0])
+    f = lookup_annotation(site, case_id)
+    if f is not None:
+        got, err = read_annotation(f)
+        if not err:
+            ivs = intervals_by_code(got[0])
     cache[case_id] = ivs
     return ivs
 
@@ -685,15 +1062,20 @@ def section_backfill(sites):
             continue
         have_window = [c for c in untagged if c["start_ms"] is not None]
         cases = {c["case_id"] for c in untagged}
-        d = s["present"].get("anot_files")
-        found = {c for c in cases if d is not None and (d / f"{c}.txt").is_file()}
+        # Every LOCATED source counts, not just anot_files/ — a site whose
+        # cleaned stage was deleted is not a site whose annotations are gone.
+        # Checking anot_files/ alone reported 0% recoverable for Haydom while
+        # section 8b was finding the same cases in four other directories.
+        found = {c for c in cases if lookup_annotation(s, c) is not None}
         print(f"   {len(untagged):,} untagged clips across {len(cases)} cases")
         print(f"   with a parseable time window in the filename : "
               f"{len(have_window):,}/{len(untagged):,} "
               f"({100*len(have_window)/max(len(untagged),1):.1f}%)")
-        print(f"   cases with a matching anot_files/<case>.txt   : "
+        print(f"   cases with an annotation file anywhere located: "
               f"{len(found)}/{len(cases)} "
               f"({100*len(found)/max(len(cases),1):.1f}%)")
+        if not s.get("annot_dirs"):
+            print("   (no annotation directory located — pass --find-annotations DIR)")
         covered = sum(1 for c in untagged
                       if c["start_ms"] is not None and c["case_id"] in found)
         print(f"   => RECOVERABLE fractions: {covered:,}/{len(untagged):,} clips "
@@ -702,7 +1084,8 @@ def section_backfill(sites):
             miss = sorted(cases - found)
             print(f"   cases with NO annotation file ({len(miss)}): {miss[:8]}"
                   f"{' ...' if len(miss) > 8 else ''}")
-            finding(f"{name}: {len(miss)} case(s) have clips but no anot_files entry")
+            finding(f"{name}: {len(miss)} case(s) have clips but no annotation file "
+                    f"in any located directory")
         if covered < len(untagged):
             finding(f"{name}: only {100*covered/max(len(untagged),1):.1f}% of untagged "
                     f"clips can have their fractions recovered")
@@ -717,6 +1100,10 @@ def section_hunt(sites, roots):
     suction question answerable for a site with no anot_files/ of its own.
 
     Returns {site: [directories that matched]} for the validation section.
+
+    Directories and their case-key indexes are built once in main()
+    (`locate_annotations`), so this section, section 8 and section 8c all agree
+    on what was found instead of each re-deriving it with different rules.
     """
     rule("8b. ANNOTATION SOURCES — locate and fingerprint")
     found_dirs = {}
@@ -731,19 +1118,16 @@ def section_hunt(sites, roots):
             print("   anot_files/ present; fingerprinting it too for comparison")
         # NB: do NOT pre-seed anot_files here — the rglob below walks it too, and
         # counting it twice reported 200% coverage.
-        seen_dirs = set()
-        for root in list(roots or []) + (
-                [s_["present"]["anot_files"]] if s_["present"].get("anot_files") else []):
-            root = Path(root).expanduser()
-            if not root.is_dir():
-                continue
-            try:
-                for f in root.rglob("*.txt"):
-                    if f.stem in cases and (f.parent, f.stem) not in seen_dirs:
-                        seen_dirs.add((f.parent, f.stem))
-                        hits[f.parent] += 1
-            except OSError as exc:
-                print(f"   [error walking {root}: {exc}]")
+        # Matching is by case KEY (exact stem OR a >= 5-digit run), not by exact
+        # filename: Haydom's exports are not named after the case id, and an
+        # exact-stem compare found 61 of 246 cases in a 489-file directory.
+        by_dir = {}
+        for entry in s_.get("annot_dirs", []):
+            matched = {c for c in cases if any(k in entry["index"] for k in
+                                               ([c] + sorted(case_keys(c) - {c})))}
+            if matched:
+                hits[entry["dir"]] = len(matched)
+                by_dir[entry["dir"]] = (matched, entry)
         if not hits:
             print("   no directory anywhere in the searched roots holds a .txt named")
             print("   after one of this site's cases — the annotations are genuinely gone")
@@ -753,9 +1137,19 @@ def section_hunt(sites, roots):
 
         union = set()
         for d, n in sorted(hits.items(), key=lambda kv: -kv[1]):
-            files = sorted(f for f in d.glob("*.txt") if f.stem in cases)
-            union |= {f.stem for f in files}
+            matched, entry = by_dir[d]
+            files = sorted({entry["index"][k] for c in matched
+                            for k in ([c] + sorted(case_keys(c) - {c}))
+                            if k in entry["index"]})
+            union |= matched
             found_dirs[name].append(d)
+            if entry["conflicts"]:
+                bad = sorted(entry["conflicts"])[:4]
+                print(f"\n   [{len(entry['conflicts'])} ambiguous case key(s) in "
+                      f"{d.name}/ — two files, different content, e.g. {bad}]")
+                finding(f"{name}: {len(entry['conflicts'])} case key(s) in {d.name}/ "
+                        f"map to two annotation files with DIFFERENT content — "
+                        f"neither is used (Ronald's conflict rule)")
             ncols, kinds, vocab, rows_total = Counter(), Counter(), Counter(), 0
             for f in files[:400]:                       # fingerprint a slice; enough
                 got, err = read_annotation(f)
@@ -816,7 +1210,7 @@ def section_validate(sites, found_dirs):
         ref = None
         for v in s_.get("vintages", []):
             vroot = v / "videos"
-            if s_.get("clips") and vroot == s_["clips"]:
+            if s_.get("clips") and vroot.resolve() == s_["clips"].resolve():
                 continue
             try:
                 sample = [c for c in list(vroot.rglob("*.mp4"))[:4000]]
@@ -841,11 +1235,15 @@ def section_validate(sites, found_dirs):
         for d in dirs:
             cache, checked, ok = {}, 0, 0
             mism = []
+            idx = next((e["index"] for e in s_.get("annot_dirs", [])
+                        if e["dir"] == d), {})
             for c in tagged:
                 if c["case_id"] not in cache:
-                    f = d / f"{c['case_id']}.txt"
+                    cid = c["case_id"]
+                    f = next((idx[k] for k in [cid] + sorted(case_keys(cid) - {cid})
+                              if k in idx), None)
                     ivs = None
-                    if f.is_file():
+                    if f is not None:
                         got, err = read_annotation(f)
                         if not err:
                             ivs = intervals_by_code(got[0])
@@ -926,29 +1324,6 @@ def section_vintage_diff(sites):
                         f"'{other}' — these vintages use different labelling policies")
 
 
-def _tagged_from_any_vintage(site, cap=20000):
-    """Every tagged clip of a site, from WHICHEVER vintage carries tags.
-
-    The training tree may be untagged while a small sibling tree is not. Because
-    the vintage diff shows those trees agree bucket-for-bucket, tags from the
-    sibling describe the training tree's policy too.
-    """
-    out = []
-    for v in site.get("vintages", []):
-        try:
-            for c in (v / "videos").rglob("*.mp4"):
-                info = parse_clip(c.stem)
-                if info and info["tagged"]:
-                    info["rel_dir"] = c.parent.relative_to(v / "videos").as_posix()
-                    info["vintage"] = v.name
-                    out.append(info)
-                    if len(out) >= cap:
-                        return out
-        except OSError:
-            continue
-    return out
-
-
 def _dir_activities(rel_dir):
     """Codes named by a clip's directory (1=stim, 2=vent, 3=suct)."""
     low = rel_dir.lower()
@@ -956,98 +1331,164 @@ def _dir_activities(rel_dir):
             if w in low}
 
 
+def _policy_evidence(site):
+    """Stream every tagged clip of one vintage, keeping only the extremes.
+
+    Returns (vintage_name, n_tagged, evidence) where evidence[code] is
+    {"strong_min", "strong_n", "partial_max", "partial_n"} and
+    evidence["weak_max"] is the largest OTHER-activity fraction inside a pure
+    bucket. Streaming means no sample cap, so no directory can be missed —
+    an earlier capped version silently sampled only the first 20,000 paths and
+    reported `partial n = 0` for a site that has 1,220 such clips.
+
+    Prefers the vintage the pipeline actually trains on; falls back to whichever
+    tagged vintage is largest.
+    """
+    audited = site.get("clips")
+    candidates = []
+    for v in site.get("vintages", []):
+        vroot = v / "videos"
+        ev = {c: {"strong_min": None, "strong_n": 0,
+                  "partial_max": None, "partial_n": 0} for c in (1, 2, 3)}
+        weak_max, n_tag = None, 0
+        try:
+            for c in vroot.rglob("*.mp4"):
+                info = parse_clip(c.stem)
+                if not info or not info["tagged"]:
+                    continue
+                n_tag += 1
+                b, tags = info["bucket"], info["tags"]
+                rel = c.parent.relative_to(vroot).as_posix()
+                if b in (1, 2, 3) and b in tags:
+                    e = ev[b]
+                    e["strong_n"] += 1
+                    e["strong_min"] = tags[b] if e["strong_min"] is None \
+                        else min(e["strong_min"], tags[b])
+                    for k, val in tags.items():
+                        if k != b:
+                            weak_max = val if weak_max is None else max(weak_max, val)
+                elif b == 6:
+                    named = _dir_activities(rel)
+                    if len(named) == 1:
+                        code = next(iter(named))
+                        if code in tags:
+                            e = ev[code]
+                            e["partial_n"] += 1
+                            e["partial_max"] = tags[code] if e["partial_max"] is None \
+                                else max(e["partial_max"], tags[code])
+        except OSError:
+            continue
+        if n_tag:
+            ev["weak_max"] = weak_max
+            candidates.append((v.name, n_tag, ev,
+                               audited is not None
+                               and vroot.resolve() == audited.resolve()))
+    if not candidates:
+        return None, 0, None
+    preferred = [c for c in candidates if c[3]]
+    name, n, ev, _ = (preferred or sorted(candidates, key=lambda c: -c[1]))[0]
+    return name, n, ev
+
+
 def section_policy(sites):
     """Bracket each site's ACTUAL thresholds, and decide whether they agree.
 
-    The heart of the cross-site question. An untagged site's labels are frozen at
-    whatever cut the processor used; a tagged site's are recomputed from the
-    config every run. They describe the same policy ONLY if the config equals the
-    frozen constants — and nothing else in this audit can tell you that.
+    An untagged site's labels are frozen at whatever cut the processor used; a
+    tagged site's are recomputed from the config every run. They describe the
+    same policy ONLY if the config equals the frozen constants.
 
-    Tagged clips make it decidable without guessing, because a bucket is a
-    THRESHOLD DECISION and the tag is the number it was taken on:
+    Tagged clips make that decidable, because a bucket is a THRESHOLD DECISION
+    and the tag is the number it was taken on:
 
-        bucket a  (pure "strong")        => frac_a >= T_a     -> upper bound on T_a
-        partial/a (bucket 6, only a)     => frac_a <  T_a     -> lower bound on T_a
-        bucket a, other activity's frac  => frac_o <  T_weak  -> lower bound on T_weak
+        bucket a (pure "strong")      => frac_a >= T_a   -> UPPER bound on T_a
+        partial/a (bucket 6, only a)  => frac_a <  T_a   -> LOWER bound on T_a
 
-    A bracket is exact, not statistical: one clip on each side pins the interval.
-    More clips only tighten it.
+    IMPORTANT — the lower bound is valid for stimulation and suction ONLY.
+    data_process.py's ventilation branch carries an extra clause:
+
+        elif vent_strong and not stim_weak and not suct_weak and other == 0:
+
+    so a fully-ventilated clip touched by an "Ignored label" interval is demoted
+    to partial/ventilation despite clearing the threshold. Reading those as
+    "below the cut" produced an inverted bracket like (1.00, 0.50]. Ventilation
+    therefore gets an upper bound only.
     """
     rule("11. POLICY EQUIVALENCE — is the FROZEN cut the same as the LIVE one?")
-    print("An untagged site cannot be re-thresholded, so its labels only match the")
-    print("tagged site's if the configured cut equals the one baked into its buckets.")
-    print("Tagged clips from ANY vintage of a site bracket that cut exactly.\n")
+    print("An untagged site cannot be re-thresholded, so its labels match the tagged")
+    print("site's only if the configured cut equals the one baked into its buckets.\n")
+    print("Bounds come from tagged clips. For ventilation only an UPPER bound is")
+    print("sound: data_process.py demotes vent-strong clips to partial/ventilation")
+    print("when an 'Ignored label' interval touches them (`and other == 0`), so")
+    print("partial/ventilation is NOT 'below the cut'.\n")
 
     brackets = {}
     for name, s_ in sites.items():
-        tagged = _tagged_from_any_vintage(s_)
-        h(f"{name}")
-        if not tagged:
+        vname, n_tag, ev = _policy_evidence(s_)
+        h(name)
+        if ev is None:
             print("   no tagged clip in ANY vintage — this site's cut is UNKNOWABLE from")
-            print("   the clips alone. Equivalence with the other site cannot be shown.")
+            print("   the clips alone.")
             finding(f"{name}: no tagged clip in any vintage — its labelling cut cannot "
-                    f"be verified against the other site's at all")
+                    f"be verified against the other site's")
             continue
-        vints = sorted({t["vintage"] for t in tagged})
-        print(f"   {len(tagged):,} tagged clips, from: {', '.join(vints)}")
-        if s_.get("clips") and all(v != s_["clips"].parent.name for v in vints):
-            print("   NOTE: none are from the audited tree "
-                  f"({s_['clips'].parent.name}); the vintage diff (section 10) is what")
-            print("   justifies carrying these thresholds over to it.")
+        print(f"   {n_tag:,} tagged clips from {vname}")
+        if s_.get("clips") and vname != s_["clips"].parent.name:
+            print(f"   NOTE: not the audited tree ({s_['clips'].parent.name}); section 10's")
+            print("   vintage diff is what justifies carrying the cut across.")
 
         site_b = {}
-        print(f"\n   {'activity':<13}{'strong n':>9}{'min frac':>10}"
-              f"{'partial n':>11}{'max frac':>10}   bracket for T")
+        print(f"\n   {'activity':<13}{'strong n':>9}{'min own':>9}"
+              f"{'partial n':>11}{'max own':>9}   inferred bound on T")
         for code in (1, 2, 3):
-            strong = [t["tags"][code] for t in tagged
-                      if t["bucket"] == code and code in t["tags"]]
-            partial = [t["tags"][code] for t in tagged
-                       if t["bucket"] == 6 and _dir_activities(t["rel_dir"]) == {code}
-                       and code in t["tags"]]
-            if not strong and not partial:
-                print(f"   {CODE_NAME[code]:<13}{'-':>9}{'-':>10}{'-':>11}{'-':>10}   "
-                      f"no evidence")
+            e = ev[code]
+            up = e["strong_min"]
+            lo = e["partial_max"] if code != 2 else None      # see docstring
+            if up is None and lo is None:
+                print(f"   {CODE_NAME[code]:<13}{'-':>9}{'-':>9}{'-':>11}{'-':>9}   "
+                      f"no tagged evidence")
                 continue
-            up = min(strong) if strong else None       # T <= up
-            lo = max(partial) if partial else None     # T >  lo
+            if lo is not None and up is not None and lo >= up:
+                print(f"   {CODE_NAME[code]:<13}{e['strong_n']:>9,}{up:>9.2f}"
+                      f"{e['partial_n']:>11,}{lo:>9.2f}   ** CONTRADICTORY **")
+                finding(f"{name}: {CODE_NAME[code]} bounds are contradictory "
+                        f"(partial max {lo:.2f} >= strong min {up:.2f}) — the bucket "
+                        f"rule for this activity is not a plain threshold")
+                continue
             site_b[code] = (lo, up)
             desc = (f"({lo:.2f}, {up:.2f}]" if lo is not None and up is not None
                     else f"<= {up:.2f}" if up is not None else f"> {lo:.2f}")
-            print(f"   {CODE_NAME[code]:<13}{len(strong):>9,}"
-                  f"{(up if up is not None else float('nan')):>10.2f}{len(partial):>11,}"
-                  f"{(lo if lo is not None else float('nan')):>10.2f}   {desc}")
-
-        # weak_threshold: inside a pure bucket the OTHER activities stayed under it
-        others = [v for t in tagged if t["bucket"] in (1, 2, 3)
-                  for k, v in t["tags"].items() if k != t["bucket"]]
-        if others:
-            site_b["weak"] = (max(others), None)
-            print(f"   {'weak_thresh':<13}{len(others):>9,}{float('nan'):>10.2f}"
-                  f"{'-':>11}{max(others):>10.2f}   > {max(others):.2f}")
+            pn = f"{e['partial_n']:,}" if code != 2 else "n/a"
+            pm = f"{lo:.2f}" if lo is not None else "n/a"
+            print(f"   {CODE_NAME[code]:<13}{e['strong_n']:>9,}{up:>9.2f}"
+                  f"{pn:>11}{pm:>9}   {desc}")
+        if ev.get("weak_max") is not None:
+            print(f"   {'weak_thresh':<13}{'':>9}{'':>9}{'':>11}{ev['weak_max']:>9.2f}"
+                  f"   > {ev['weak_max']:.2f}")
+            if ev["weak_max"] >= PROCESSOR_WEAK + 0.011:
+                finding(f"{name}: an activity reached {ev['weak_max']:.2f} inside a pure "
+                        f"bucket, above weak_threshold {PROCESSOR_WEAK:.2f}")
         brackets[name] = site_b
 
-        print("\n   against the processor constants "
-              f"(stim {PROCESSOR_CUT[1]:.2f}, vent {PROCESSOR_CUT[2]:.2f}, "
-              f"suct {PROCESSOR_CUT[3]:.2f}, weak {PROCESSOR_WEAK:.2f}):")
+        print(f"\n   against the processor constants (stim {PROCESSOR_CUT[1]:.2f}, "
+              f"vent {PROCESSOR_CUT[2]:.2f}, suct {PROCESSOR_CUT[3]:.2f}):")
         for code in (1, 2, 3):
             if code not in site_b:
+                print(f"       {CODE_NAME[code]:<13} no verdict (insufficient evidence)")
                 continue
             lo, up = site_b[code]
             cut = PROCESSOR_CUT[code]
             inside = ((lo is None or cut > lo - 1e-9) and (up is None or cut <= up + 1e-9))
-            print(f"       {CODE_NAME[code]:<13} {'CONSISTENT' if inside else '** OUTSIDE THE BRACKET **'}")
+            print(f"       {CODE_NAME[code]:<13} "
+                  f"{'CONSISTENT' if inside else '** OUTSIDE THE BOUND **'}")
             if not inside:
-                finding(f"{name}: the cut actually used for {CODE_NAME[code]} is in "
-                        f"({lo}, {up}] which EXCLUDES the configured "
-                        f"{cut:.2f} — this site is labelled by a different rule")
+                finding(f"{name}: the cut used for {CODE_NAME[code]} is bounded by "
+                        f"lo={lo} up={up}, which EXCLUDES the configured {cut:.2f}")
 
-    # ---- the cross-site verdict -------------------------------------------
-    names = [n for n in brackets if brackets[n]]
     h("VERDICT")
+    names = [n for n in brackets if brackets[n]]
     if len(names) < 2:
-        print("   only one site has measurable thresholds, so equivalence cannot be")
-        print("   demonstrated. Treat the two sites' labels as NOT known to agree.")
+        print("   fewer than two sites have measurable thresholds — equivalence cannot")
+        print("   be demonstrated. Treat the labels as NOT known to agree.")
         return
     a, b = names[0], names[1]
     for code in (1, 2, 3):
@@ -1057,17 +1498,20 @@ def section_policy(sites):
                     f"hospitals cannot be shown to use the same rule")
             continue
         (la, ua), (lb, ub) = brackets[a][code], brackets[b][code]
-        lo = max(x for x in (la, lb) if x is not None) if (la or lb) else None
-        up = min(x for x in (ua, ub) if x is not None) if (ua or ub) else None
-        overlap = (lo is None or up is None or lo < up + 1e-9)
-        print(f"   {CODE_NAME[code]:<13} {a} ({la}, {ua}]   {b} ({lb}, {ub}]   "
-              f"-> {'brackets OVERLAP (compatible)' if overlap else '** DISJOINT — different cuts **'}")
+        los = [x for x in (la, lb) if x is not None]
+        ups = [x for x in (ua, ub) if x is not None]
+        lo, up = (max(los) if los else None), (min(ups) if ups else None)
+        overlap = lo is None or up is None or lo < up + 1e-9
+        fa = f"({la}, {ua}]" if la is not None else f"<= {ua}"
+        fb = f"({lb}, {ub}]" if lb is not None else f"<= {ub}"
+        print(f"   {CODE_NAME[code]:<13} {a} {fa}   {b} {fb}   "
+              f"-> {'COMPATIBLE' if overlap else '** DISJOINT — different cuts **'}")
         if not overlap:
             finding(f"{CODE_NAME[code]}: {a} and {b} were cut with DIFFERENT thresholds "
-                    f"— their brackets ({la}, {ua}] and ({lb}, {ub}] do not overlap")
-    print("\n   Overlapping brackets mean the two sites are COMPATIBLE with a single")
-    print("   cut, not that they are identical — a bracket is only as tight as the")
-    print("   clips that pin it. Disjoint brackets are proof of a difference.")
+                    f"— {fa} and {fb} do not overlap")
+    print("\n   COMPATIBLE means the evidence admits a single shared cut, not that one")
+    print("   is proven. A one-sided bound (<= x) is weak evidence; a two-sided")
+    print("   bracket is strong. DISJOINT is proof of a difference.")
 
 
 def section_findings():
@@ -1110,9 +1554,10 @@ def main():
                         "(0 = all; default 4000, which is plenty).")
     p.add_argument("--skip", default="", help="Comma-separated section numbers to skip.")
     p.add_argument("--find-annotations", action="append", default=None, metavar="DIR",
-                   help="Search DIR recursively for .txt files named after the clip "
-                        "case ids. Use when a site's anot_files/ is missing. "
-                        "Repeatable.")
+                   help="Search DIR recursively for annotation .txt files. Matching "
+                        "is by case KEY (exact stem, or any >= 5-digit run in it), so "
+                        "files not named after the case id are still found. Use when "
+                        "a site's anot_files/ is missing. Repeatable.")
     args = p.parse_args()
 
     raw_sites = dict(args.site) if args.site else {k: Path(v) for k, v in DEFAULT_SITES.items()}
@@ -1145,6 +1590,15 @@ def main():
                 clips, picked_by = vintages[0] / "videos", "FIRST ALPHABETICALLY"
         sites[name] = {"base": base, "present": present, "vintages": vintages,
                        "clips": clips, "picked_by": picked_by}
+        # Index every reachable annotation directory ONCE, by case key. Sections
+        # 2, 6, 8, 8b and 8c all read this, so they can no longer disagree about
+        # which annotations exist.
+        sites[name]["annot_dirs"] = locate_annotations(
+            sites[name], args.find_annotations or [])
+        ndirs = len(sites[name]["annot_dirs"])
+        nkeys = len({k for e in sites[name]["annot_dirs"] for k in e["index"]})
+        print(f"[info] {name}: {ndirs} annotation director{'y' if ndirs == 1 else 'ies'} "
+              f"indexed, {nkeys:,} case key(s)")
 
     def _hunt(sites_, a):
         global HUNT_RESULT

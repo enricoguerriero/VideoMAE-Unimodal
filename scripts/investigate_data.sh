@@ -7,6 +7,7 @@
 #   1  environment + repo state
 #   2  path probe        — which of the notebooks' paths actually exist
 #   3  annotation hunt   — where the annotation .txt files really live
+#                          (incl. Ronald's Haydom-only ProcessedData/Ronald tree)
 #   4  clip vintages     — which Processed_* trees exist, and which you train on
 #   5  full audit        — scripts/audit_source_data.py against the right trees
 #
@@ -25,7 +26,8 @@
 #   HAYDOM_BASE=/some/other/path bash scripts/investigate_data.sh
 #   DEEP=1 bash scripts/investigate_data.sh      # slower, wider filesystem search
 #
-# Env overrides: PYTHON, HAYDOM_BASE, DRC_BASE, OUT_DIR, DEEP, FIND_TIMEOUT
+# Env overrides: PYTHON, HAYDOM_BASE, DRC_BASE, RONALD_BASE, OUT_DIR, DEEP,
+#                FIND_TIMEOUT
 # =============================================================================
 set -uo pipefail          # not -e: a missing path must not abort the report
 
@@ -48,12 +50,24 @@ if [[ -z "$DRC_BASE" ]]; then
 fi
 
 # Every root the two notebooks mention, per site. Searched for annotations.
+#
+# The Ronald/ entries are NOT from the Athavan & Frida notebooks. They are the
+# Haydom-only master project (Ronald Paleczny), whose data_preprocessing.py
+# stage produces exactly what Haydom is missing here: annotations renamed to a
+# canonical numeric id and converted to integer milliseconds. It is the best
+# candidate source for a Haydom fraction backfill, and the earlier runs of this
+# script never looked at it.
+RONALD_BASE="${RONALD_BASE:-/spo/LS-Haydom/ProcessedData/Ronald}"
 HAYDOM_ROOTS=(
     "$HAYDOM_BASE"
     /spo/LS-Haydom/ProcessedData/Athavan_Frida/FullDataset_Combined
     /spo/LS-Haydom/ProcessedData/Athavan_Frida/Models
     /spo/LS-Haydom/Data/FullDataset/2023-2025
     /spo/LS-Haydom/Data/FullDataset/2025-2026/March2026Sync
+    "$RONALD_BASE/data/Tanzania/annotations_corrected"
+    "$RONALD_BASE/data/Tanzania/annotations_temp"
+    "$RONALD_BASE/data/Tanzania/annotations"
+    "$RONALD_BASE/data/Tanzania"
 )
 DRC_ROOTS=(
     "$DRC_BASE"
@@ -141,8 +155,10 @@ for site in Haydom DRC; do
 done
 
 echo
-echo "   A directory holding hundreds of .txt named like case ids (digits for"
-echo "   Haydom, 2-xxxxx-1 for DRC) is the annotation store you want."
+echo "   A directory holding hundreds of .txt is a candidate annotation store."
+echo "   The filenames do NOT have to be case ids: the audit matches on the exact"
+echo "   stem OR any run of 5+ digits inside it (Ronald's canonical-id rule), so"
+echo "   'LS_11848523_reviewed.txt' still resolves to case 11848523."
 
 # ---------------------------------------------------------------- 4. clip vintages
 banner "4. CLIP VINTAGES — which Processed_* trees exist per site"
