@@ -70,6 +70,19 @@ CODE_NAME = {0: "Non-target", 1: "Stimulation", 2: "Ventilation", 3: "Suction",
              4: "Ignored label"}
 #: rows with this in the last column are dropped before anything else
 DROP_ORIGINAL = "Newborn visible in video frame"
+#: `relevant_patterns` from the thesis notebooks — the ORIGINAL annotator string
+#: -> category map applied to raw exports before anything else. Identical in the
+#: Haydom and DRC notebooks in the final snapshot. Anything absent maps to
+#: "Ignored label", which is how "Suction using tube" gets discarded.
+RELEVANT_PATTERNS = {
+    "Bag-mask ventilation": "Ventilation",
+    "Bag-mask squeezed - sound": "Ventilation",
+    "Stimulation of trunk": "Stimulation",
+    "Suction using penguin device": "Suction",
+    "Suction using bulb device": "Suction",
+    "Crying": "Non-target",
+    "Chest/abdomen movement": "Non-target",
+}
 #: filename tag abbreviation -> category code
 TAG_CODE = {"stim": 1, "vent": 2, "suct": 3}
 SEGMENT_MS = 3000          # segment_size 3 s
@@ -114,11 +127,20 @@ STAGES = {
 _TAG_RE = re.compile(r"_(stim|vent|suct)(\d+\.\d+)")
 _WINDOW_RE = re.compile(r"_start_([\d.]+)_end_([\d.]+)")
 
-FINDINGS: list[str] = []
+FINDINGS: list[str] = []      # things that are WRONG or inconsistent
+NOTES: list[str] = []         # things that are USEFUL — capabilities, not faults
+HUNT_RESULT: dict = {}
 
 
 def finding(msg: str) -> None:
+    """A problem: something inconsistent, missing, or unsafe to rely on."""
     FINDINGS.append(msg)
+
+
+def note(msg: str) -> None:
+    """Good news: a capability the data turns out to have. Kept out of FINDINGS
+    so a clean corpus reports zero problems rather than a pile of positives."""
+    NOTES.append(msg)
 
 
 def rule(title: str) -> None:
@@ -172,13 +194,32 @@ def merge_intervals(intervals):
     return out
 
 
-def intervals_by_code(rows):
-    """Apply the DROP_ORIGINAL filter + MAP_LABELS, then merge per category."""
+def annotation_kind(rows):
+    """'cleaned' if column 1 already holds categories, else 'raw'.
+
+    A cleaned anot_files row reads  Suction \t start \t end \t dur \t Suction using bulb device
+    A raw export reads              Suction using bulb device \t start \t end \t dur
+    Telling them apart decides whether RELEVANT_PATTERNS still has to be applied.
+    """
+    if not rows:
+        return "empty"
+    known = sum(1 for e, _, _, _ in rows if e in MAP_LABELS)
+    return "cleaned" if known >= 0.5 * len(rows) else "raw"
+
+
+def intervals_by_code(rows, kind=None):
+    """DROP_ORIGINAL filter -> category -> merge, for either annotation stage.
+
+    For a raw export the category comes from RELEVANT_PATTERNS (what the
+    notebook applies); for a cleaned file column 1 is already the category.
+    """
+    kind = kind or annotation_kind(rows)
     buckets = defaultdict(list)
     for event, start, end, original in rows:
-        if original == DROP_ORIGINAL:
+        if original == DROP_ORIGINAL or event == DROP_ORIGINAL:
             continue
-        code = MAP_LABELS.get(event)
+        cat = event if kind == "cleaned" else RELEVANT_PATTERNS.get(event, "Ignored label")
+        code = MAP_LABELS.get(cat)
         if code is None:
             continue
         buckets[code].append((start, end))
@@ -520,15 +561,21 @@ def section_recompute(sites, sample):
             if ivs is None:
                 missing_anot += 1
                 continue
-            for code, want in c["tags"].items():
-                # the tag is always overlap_ms / (segment_size * 1000)
+            # BOTH directions. A tag that is absent means the overlap was zero
+            # (_overlap_suffix writes nothing for 0), so `want` is 0.0 there —
+            # otherwise a source that ADDS activity the clip never recorded would
+            # pass unnoticed, which is exactly the bulb-suction question.
+            for code in (1, 2, 3):
+                want = c["tags"].get(code, 0.0)
                 got = overlap_ms(int(c["start_ms"]), int(c["end_ms"]),
                                  ivs.get(code, [])) / SEGMENT_MS
                 checked += 1
                 if abs(got - want) <= FRAC_TOL:
                     ok += 1
                 elif len(mism) < 6:
-                    mism.append((c["path"].name, CODE_NAME[code], want, got))
+                    kind = "tag absent, so expected 0" if code not in c["tags"] else ""
+                    mism.append((c["path"].name, CODE_NAME[code] + (" *" if kind else ""),
+                                 want, got))
         pct = 100 * ok / checked if checked else 0.0
         print(f"   {len(subset):,} clips sampled ({len(tagged):,} tagged total), "
               f"{checked:,} tag values checked")
@@ -651,55 +698,236 @@ def section_backfill(sites):
 
 
 def section_hunt(sites, roots):
-    """Search given roots for files named after the clip case ids.
+    """Locate, then FINGERPRINT, the annotation files a site is missing.
 
-    Runs only with --find-annotations. Useful when a site's anot_files/ is not
-    where the notebook says it should be: the clips name their cases, so the
-    annotations can be located by matching filenames anywhere on the volume.
+    Finding the files is only half of it: what matters is whether they are raw
+    or cleaned, how much of the corpus they cover, and — the whole point — which
+    original event strings they contain. That last one is what finally makes the
+    suction question answerable for a site with no anot_files/ of its own.
+
+    Returns {site: [directories that matched]} for the validation section.
     """
-    rule("8b. ANNOTATION HUNT — looking for the missing annotation files")
-    for name, s in sites.items():
-        cases = {c["case_id"] for c in s.get("clip_info", [])}
+    rule("8b. ANNOTATION SOURCES — locate and fingerprint")
+    found_dirs = {}
+    for name, s_ in sites.items():
+        cases = {c["case_id"] for c in s_.get("clip_info", [])}
+        found_dirs[name] = []
         if not cases:
             continue
-        if s["present"].get("anot_files") is not None:
-            print(f"   {name}: anot_files/ already present, skipping")
-            continue
-        h(f"{name}: {len(cases)} case ids to locate")
-        for root in roots:
+        h(f"{name}: {len(cases)} case ids to account for")
+        hits = Counter()
+        if s_["present"].get("anot_files") is not None:
+            print("   anot_files/ present; fingerprinting it too for comparison")
+            d0 = s_["present"]["anot_files"]
+            hits[d0] = sum(1 for f in d0.glob("*.txt") if f.stem in cases)
+        for root in roots or []:
             root = Path(root).expanduser()
             if not root.is_dir():
-                print(f"   {root}  [not a directory]")
                 continue
-            hits, where = 0, Counter()
             try:
                 for f in root.rglob("*.txt"):
                     if f.stem in cases:
-                        hits += 1
-                        where[f.parent] += 1
+                        hits[f.parent] += 1
             except OSError as exc:
-                print(f"   {root}  [error: {exc}]")
+                print(f"   [error walking {root}: {exc}]")
+        if not hits:
+            print("   no directory anywhere in the searched roots holds a .txt named")
+            print("   after one of this site's cases — the annotations are genuinely gone")
+            finding(f"{name}: no annotation files found for ANY of its {len(cases)} "
+                    f"cases in the searched roots")
+            continue
+
+        union = set()
+        for d, n in sorted(hits.items(), key=lambda kv: -kv[1]):
+            files = sorted(f for f in d.glob("*.txt") if f.stem in cases)
+            union |= {f.stem for f in files}
+            found_dirs[name].append(d)
+            ncols, kinds, vocab, rows_total = Counter(), Counter(), Counter(), 0
+            for f in files[:400]:                       # fingerprint a slice; enough
+                got, err = read_annotation(f)
+                if err:
+                    continue
+                rws, cols = got
+                ncols.update(cols)
+                k = annotation_kind(rws)
+                kinds[k] += 1
+                rows_total += len(rws)
+                for event, _, _, original in rws:
+                    vocab[original if (k == "cleaned" and original) else event] += 1
+            print(f"\n   {d}")
+            print(f"       {n:>5,} of this site's cases   "
+                  f"({100*n/len(cases):.0f}% coverage)   "
+                  f"stage={'/'.join(kinds) or '?'}   "
+                  f"cols={dict(ncols) or '?'}")
+            sucty = {k: v for k, v in vocab.items() if "suction" in k.lower()}
+            if vocab:
+                print("       original event strings (top 8):")
+                for ev, cnt in vocab.most_common(8):
+                    mark = "  <== SUCTION" if "suction" in ev.lower() else ""
+                    print(f"           {cnt:>6,}  {ev[:52]}{mark}")
+            if sucty:
+                print(f"       SUCTION VARIANTS HERE: {sorted(sucty)}")
+                note(f"{name}: suction vocabulary recoverable from {d.name}/ — "
+                     f"{sorted(sucty)}")
+            else:
+                print("       no suction-like string in this directory")
+        print(f"\n   UNION over all directories above: {len(union)}/{len(cases)} cases "
+              f"({100*len(union)/len(cases):.0f}%)")
+        missing = cases - union
+        if missing:
+            finding(f"{name}: {len(missing)} case(s) have clips but no annotation "
+                    f"anywhere in the searched roots, e.g. {sorted(missing)[:5]}")
+        else:
+            note(f"{name}: annotations for ALL {len(cases)} cases are locatable — "
+                 f"a full fraction backfill is possible")
+    return found_dirs
+
+
+def section_validate(sites, found_dirs):
+    """Validate a backfill against a vintage that DOES carry tags.
+
+    A site whose training tree is untagged may still have a small tagged tree
+    lying around from another processor run. Those tags are ground truth for the
+    recomputation: reproduce them from the recovered annotations and the backfill
+    is proven for this site, exactly as DRC's tags prove it for DRC.
+    """
+    rule("8c. BACKFILL VALIDATION — recompute a tagged tree from recovered annotations")
+    for name, s_ in sites.items():
+        h(name)
+        if not any(not c["tagged"] and c["bucket"] in TAG_BEARING
+                   for c in s_.get("clip_info", [])):
+            print("   the audited tree is already fully tagged — nothing to validate")
+            continue
+        # look for ANY other vintage of this site carrying tags
+        ref = None
+        for v in s_.get("vintages", []):
+            vroot = v / "videos"
+            if s_.get("clips") and vroot == s_["clips"]:
                 continue
-            print(f"   {root}")
-            if not hits:
-                print("       no .txt matching any case id")
-            for d, n in where.most_common(5):
-                print(f"       {n:>6,} matches in {d}")
-            if hits:
-                finding(f"{name}: {hits:,} case-matching .txt files found under "
-                        f"{root} — annotations may be recoverable from there")
+            try:
+                sample = [c for c in list(vroot.rglob("*.mp4"))[:4000]]
+            except OSError:
+                continue
+            tagged = [t for t in (parse_clip(c.stem) for c in sample)
+                      if t and t["tagged"] and t["start_ms"] is not None]
+            if tagged:
+                ref = (v, tagged)
+                break
+        if ref is None:
+            print("   no other vintage of this site carries fraction tags, so there is")
+            print("   no ground truth here to validate a backfill against.")
+            print("   (Validate on the OTHER site instead — same code path.)")
+            continue
+        v, tagged = ref
+        print(f"   reference tree: {v.name}  ({len(tagged):,} tagged clips sampled)")
+        dirs = found_dirs.get(name) or []
+        if not dirs:
+            print("   no annotation directory located for this site — cannot validate")
+            continue
+        for d in dirs:
+            cache, checked, ok = {}, 0, 0
+            mism = []
+            for c in tagged:
+                if c["case_id"] not in cache:
+                    f = d / f"{c['case_id']}.txt"
+                    ivs = None
+                    if f.is_file():
+                        got, err = read_annotation(f)
+                        if not err:
+                            ivs = intervals_by_code(got[0])
+                    cache[c["case_id"]] = ivs
+                ivs = cache[c["case_id"]]
+                if ivs is None:
+                    continue
+                for code in (1, 2, 3):
+                    want = c["tags"].get(code, 0.0)   # no tag == zero overlap
+                    got_f = overlap_ms(int(c["start_ms"]), int(c["end_ms"]),
+                                       ivs.get(code, [])) / SEGMENT_MS
+                    checked += 1
+                    if abs(got_f - want) <= FRAC_TOL:
+                        ok += 1
+                    elif len(mism) < 4:
+                        mism.append((CODE_NAME[code] +
+                                     ("" if code in c["tags"] else " (no tag)"),
+                                     want, got_f))
+            if not checked:
+                print(f"   {d.name:<38} no overlapping cases")
+                continue
+            pct = 100 * ok / checked
+            verdict = "MATCHES — backfill is sound from here" if pct >= 99 else \
+                      "does NOT reproduce the tags"
+            print(f"   {d.name:<38} {ok:,}/{checked:,} ({pct:.1f}%)  {verdict}")
+            for cat, w, g in mism:
+                print(f"       e.g. {cat:<22} tag={w:.2f} recomputed={g:.2f}")
+            if pct >= 99:
+                note(f"{name}: fraction backfill VALIDATED against {v.name} using "
+                     f"{d.name}/ ({ok:,}/{checked:,} tags reproduced)")
+
+
+def section_vintage_diff(sites):
+    """What changed between the clip vintages sitting side by side.
+
+    Two trees of the same corpus with different bucket distributions mean a
+    labelling-policy change, not a data change. Keying on (case, start, end)
+    ignores the tag and the bucket, so the same 3 s window can be followed from
+    one vintage to the next.
+    """
+    rule("10. VINTAGE DIFF — what a re-cut actually changed")
+    for name, s_ in sites.items():
+        vints = s_.get("vintages", [])
+        if len(vints) < 2:
+            continue
+        h(f"{name}: {len(vints)} vintages")
+        audited = s_.get("clips")
+        maps = {}
+        for v in vints:
+            m = {}
+            try:
+                for c in (v / "videos").rglob("*.mp4"):
+                    info = parse_clip(c.stem)
+                    if info and info["start_ms"] is not None:
+                        m[(info["case_id"], int(info["start_ms"]))] = info["bucket"]
+            except OSError as exc:
+                print(f"   [error reading {v.name}: {exc}]")
+                continue
+            maps[v.name] = m
+            print(f"   {v.name:<58} {len(m):>8,} windows")
+        base_name = audited.parent.name if audited else None
+        if base_name not in maps:
+            continue
+        base = maps[base_name]
+        for other, m in maps.items():
+            if other == base_name:
+                continue
+            common = base.keys() & m.keys()
+            moved = [(m[k], base[k]) for k in common if m[k] != base[k]]
+            print(f"\n   {other}  ->  {base_name}  (the audited one)")
+            print(f"       {len(common):,} shared windows, {len(moved):,} changed bucket "
+                  f"({100*len(moved)/max(len(common),1):.1f}%)")
+            for (frm, to), n in Counter(moved).most_common(6):
+                print(f"           bucket {frm} -> {to}   {n:>8,}")
+            if len(moved) > 0.05 * max(len(common), 1):
+                finding(f"{name}: '{base_name}' reclassifies "
+                        f"{100*len(moved)/len(common):.0f}% of windows vs "
+                        f"'{other}' — these vintages use different labelling policies")
 
 
 def section_findings():
     rule("9. FINDINGS")
     if not FINDINGS:
-        print("  none — the two sites look consistently processed on every check above.")
-        return
-    for i, f in enumerate(FINDINGS, 1):
-        print(f"  [{i:>2}] {f}")
-    print(f"\n  {len(FINDINGS)} finding(s). Anything labelled CONFLICT, MISMATCH or")
-    print("  ASYMMETRY means the hospitals were not processed identically, and a")
-    print("  per-site score comparison is measuring that as well as the model.")
+        print("  PROBLEMS: none — the two sites look consistently processed on every")
+        print("  check above.")
+    else:
+        print("  PROBLEMS")
+        for i, f in enumerate(FINDINGS, 1):
+            print(f"  [{i:>2}] {f}")
+        print(f"\n  {len(FINDINGS)} problem(s). Anything labelled CONFLICT, MISMATCH or")
+        print("  ASYMMETRY means the hospitals were not processed identically, and a")
+        print("  per-site score comparison is measuring that as well as the model.")
+    if NOTES:
+        print("\n  WHAT IS POSSIBLE  (capabilities the data has, not faults)")
+        for i, n in enumerate(NOTES, 1):
+            print(f"  ({i:>2}) {n}")
 
 
 # ---------------------------------------------------------------------------
@@ -760,6 +988,10 @@ def main():
         sites[name] = {"base": base, "present": present, "vintages": vintages,
                        "clips": clips, "picked_by": picked_by}
 
+    def _hunt(sites_, a):
+        global HUNT_RESULT
+        HUNT_RESULT = section_hunt(sites_, a.find_annotations or [])
+
     for num, fn in [("0", lambda: section_layout(sites)),
                     ("1", lambda: section_format(sites)),
                     ("2", lambda: section_vocabulary(sites)),
@@ -769,12 +1001,20 @@ def main():
                     ("6", lambda: section_recompute(sites, args.sample)),
                     ("7", lambda: section_implied_cut(sites)),
                     ("8", lambda: section_backfill(sites)),
-                    ("8b", lambda: section_hunt(sites, args.find_annotations)
-                     if args.find_annotations else None)]:
+                    ("8b", lambda: _hunt(sites, args)),
+                    ("8c", lambda: section_validate(sites, HUNT_RESULT)),
+                    ("10", lambda: section_vintage_diff(sites))]:
         if num in skip:
             print(f"\n[skipped section {num}]")
             continue
-        fn()
+        try:
+            fn()
+        except Exception as exc:                       # noqa: BLE001 - report, continue
+            import traceback
+            print(f"\n[section {num} FAILED: {type(exc).__name__}: {exc}]")
+            traceback.print_exc()
+            finding(f"section {num} crashed ({type(exc).__name__}: {exc}) — its checks "
+                    f"did not run")
     section_findings()
 
 
