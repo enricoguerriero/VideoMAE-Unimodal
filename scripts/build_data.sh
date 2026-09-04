@@ -14,6 +14,7 @@
 # on the VM (the `.../videos` directory that contains the per-class subfolders).
 #
 # Usage: bash scripts/build_data.sh [DATA_CONFIG] [TEST_RATIO] [TRAIN_RATIO]
+#        BACKFILL=0 bash scripts/build_data.sh     # skip the Haydom fraction backfill
 #   DATA_CONFIG only affects the reported label distribution (and `tag_keys`) —
 #   the split itself is deliberately independent of it.
 #
@@ -30,10 +31,43 @@ TRAIN_RATIO="${3:-0.80}"   # share of the remainder used for training
 HAYDOM_VIDEOS="/spo/LS-Haydom/ProcessedData/Athavan_Frida/Data_processing/Processed_data_stratified_BIG_update_strict_label/videos"
 DRC_VIDEOS="/spo/LS-DRC/ProcessedData/Athavan_Frida/Data_processing/Processed_data_new_dataset_no_suction_merge_bulp_new_anot_chestmov/videos"
 
+# ---------------------------------------------------------------- backfill
+# The Haydom tree was cut before data_process.py wrote `_stim0.67` fraction
+# tags, so its labels were frozen at the cut the processor used and moving a
+# threshold in configs/data.yaml changed DRC only — the two sites silently
+# stopped meaning the same thing. --annotations rebuilds those fractions from
+# the annotation files (see src/data/annotations.py) and unfreezes them.
+#
+# It refuses to run unless it first reproduces tags that already exist, which is
+# what HAYDOM_VERIFY is for: a small tagged vintage of the same site, used as
+# ground truth and never indexed into the manifest. scripts/audit_source_data.py
+# section 8c is the same check, run standalone.
+#
+# Set BACKFILL=0 to build the manifest the old way (Haydom stays untagged and
+# keeps its bucket+directory labels).
+BACKFILL="${BACKFILL:-1}"
+HAYDOM_ANNOTATIONS="/spo/LS-Haydom/Data/FullDataset/2023-2025/Annotations"
+HAYDOM_ANNOTATIONS_ALT="/spo/LS-Haydom/ProcessedData/Ronald/data/Tanzania/annotations_corrected"
+HAYDOM_VERIFY="/spo/LS-Haydom/ProcessedData/Athavan_Frida/Data_processing/Processed_data_stratified_BIG_update_strict_label_test/videos"
+DRC_ANNOTATIONS="/spo/LS-DRC/ProcessedData/Athavan_Frida/Data_processing/Unprocessed_data/anot_files"
+
+BACKFILL_ARGS=()
+if [[ "$BACKFILL" == "1" ]]; then
+    for d in "$HAYDOM_ANNOTATIONS" "$HAYDOM_ANNOTATIONS_ALT"; do
+        [[ -d "$d" ]] && BACKFILL_ARGS+=(--annotations "Haydom=$d")
+    done
+    [[ -d "$HAYDOM_VERIFY" ]] && BACKFILL_ARGS+=(--verify-root "Haydom=$HAYDOM_VERIFY")
+    [[ -d "$DRC_ANNOTATIONS" ]] && BACKFILL_ARGS+=(--annotations "DRC=$DRC_ANNOTATIONS")
+    if [[ ${#BACKFILL_ARGS[@]} -eq 0 ]]; then
+        echo "[WARN] BACKFILL=1 but no annotation directory exists — building untagged."
+    fi
+fi
+
 python -m src.data.build_manifest \
     --root "Haydom=${HAYDOM_VIDEOS}" \
     --root "DRC=${DRC_VIDEOS}" \
     --data-config "${DATA_CONFIG}" \
+    ${BACKFILL_ARGS[@]+"${BACKFILL_ARGS[@]}"} \
     --out data/clips_all.csv
 
 python -m src.data.split_cases \

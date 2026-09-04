@@ -190,142 +190,43 @@ _WINDOW_RE = re.compile(r"_start_([\d.]+)_end_([\d.]+)")
 #     Applying RELEVANT_PATTERNS alone to a raw export maps every Haydom
 #     suction interval to "Ignored label" and yields a site with zero suction.
 #     EVENT_CATEGORY below folds both notebook passes into one lookup.
-_DIGITS_RE = re.compile(r"(\d+)")
-_HHMMSS_RE = re.compile(r"^\d{1,2}:\d{2}:\d{2}(?:\.\d+)?$")
-_INT_RE = re.compile(r"^[+-]?\d+$")
-_DEC_RE = re.compile(r"^[+-]?\d+\.\d+$")
-_SPLIT_RE = re.compile(r"\t+| {2,}")
-
-#: minimum length of a digit run that may stand in for a case id. Haydom ids
-#: run 5-8 digits ("30097" .. "11848523"); a 4-digit floor would let a leading
-#: year collide every file in a directory onto one key.
-_CASE_KEY_MIN_DIGITS = 5
-
-#: how timestamps were read, so a wrong unit assumption shows up in section 1
-#: instead of silently shrinking every interval.
-UNIT_STATS = Counter()
-
-
-def normalize_tokens(line: str) -> list:
-    """One raw annotation line -> tokens, timestamps normalised to milliseconds.
-
-    Ronald's `process_annotation_line` / `to_milliseconds` policy: split on tabs
-    or runs of 2+ spaces, DROP any HH:MM:SS(.mmm) token, keep a bare integer as
-    milliseconds, multiply a decimal (seconds) by 1000. Non-numeric tokens pass
-    through unchanged, so a multi-word event name survives intact.
-    """
-    out = []
-    for part in _SPLIT_RE.split(line.rstrip("\n")):
-        token = part.strip()
-        if not token:
-            continue
-        if _HHMMSS_RE.match(token):
-            UNIT_STATS["hhmmss_dropped"] += 1
-            continue
-        if _INT_RE.match(token):
-            UNIT_STATS["integer_ms"] += 1
-            out.append(str(int(token)))
-        elif _DEC_RE.match(token):
-            UNIT_STATS["decimal_seconds_scaled"] += 1
-            out.append(str(int(Decimal(token) * 1000)))
-        else:
-            out.append(token)
-    return out
+# ---------------------------------------------------------------------------
+# Annotation reading — SHARED with the pipeline, not a second copy
+# ---------------------------------------------------------------------------
+# The vocabulary, the millisecond normalisation and the case-key rule all live
+# in src/data/annotations.py, so this audit and build_manifest.py's
+# --annotations backfill can never disagree about what a Haydom file says. An
+# audit that validates a backfill it does not share code with proves nothing.
+#
+# Loaded BY PATH rather than as `src.data.annotations` because that package's
+# __init__ pulls DataSpec, which needs PyYAML — and this script's whole point is
+# running in an environment where nothing is installed. The module is
+# stdlib-only, so the promise at the top of this file still holds.
+def _load_annotations_module():
+    import importlib.util
+    path = Path(__file__).resolve().parents[1] / "src" / "data" / "annotations.py"
+    if not path.is_file():
+        raise SystemExit(f"cannot find {path} — this script reads the repo's "
+                         f"src/data/annotations.py")
+    spec_ = importlib.util.spec_from_file_location("_audit_annotations", path)
+    mod = importlib.util.module_from_spec(spec_)
+    spec_.loader.exec_module(mod)
+    return mod
 
 
-def case_keys(stem: str) -> set:
-    """Every id a file or clip may be addressed by: the exact stem, plus each
-    run of >= 5 digits in it (Ronald's canonical-id rule, widened from "first
-    run" to "any run" because we only need to LOOK UP a file, not rename it)."""
-    keys = {stem}
-    keys.update(d for d in _DIGITS_RE.findall(stem)
-                if len(d) >= _CASE_KEY_MIN_DIGITS)
-    return keys
+_ann = _load_annotations_module()
 
+normalize_tokens = _ann.normalize_tokens
+case_keys = _ann.case_keys
+_norm_event = _ann.normalize_event
+EVENT_CATEGORY = _ann.EVENT_CATEGORY
+VISIBILITY_VARIANTS = _ann.VISIBILITY_VARIANTS
+classify_event = _ann.classify_event
+is_visibility = _ann.is_visibility
+UNIT_STATS = _ann.UNIT_STATS
+_INT_RE = _ann._INT_RE
+_CASE_KEY_MIN_DIGITS = _ann.CASE_KEY_MIN_DIGITS
 
-def _norm_event(text) -> str:
-    """Ronald's `normalize_label`: lowercase, punctuation -> space, collapse."""
-    text = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
-    return re.sub(r"\s+", " ", text).strip()
-
-
-#: The thesis notebooks map an annotator string to a category in TWO passes: a
-#: `corrections` dict of typo fixes, then `relevant_patterns`. Merged here into
-#: one table keyed on the NORMALISED string, so both passes happen at once.
-#:
-#: The spellings come from the notebooks' `corrections` dict; Ronald's variant
-#: sets were cross-checked against it and agree exactly on suction (the same
-#: five "penguine" misspellings) and on stimulation. They deliberately DIVERGE
-#: on ventilation and that divergence is NOT copied: Ronald tracks `T-piece
-#: ventilation` and ignores `Bag-mask squeezed - sound`, whereas the thesis does
-#: the reverse. The thesis reading is authoritative here, because these are the
-#: rules the clip trees on disk were cut with.
-_EVENT_VARIANTS = {
-    "Ventilation": [
-        "Bag-mask ventilation", "Bag mask ventilation", "Bag-mask ventilatio",
-        "Bagmask ventilation", "BMV", "Bag-mask ventiltation",
-        "Badmask ventilation", "Bag-mask ventiation", "Bag-mask ventilatioon",
-        "Bag-mask vintilation",
-        "Bag-mask squeezed - sound", "Bag mask squeezed-sound",
-        "Bagmask squeezed -sound", "BagMask squeezed sound",
-        "BagMask Squeezed sound", "Bagmask squeezed-sound",
-        "Bag-mask squeezed sound", "Bag-mask squeezed- -sound",
-        "Bag-mask squeezed- sound", "BagMask squeeed sound",
-        "Bagmask Squeezed sound", "Bagmask squeezed sound",
-        "Bag mask squeezed -sound", "Bagmak squeezed - sound",
-        "Bagmask squeezed- sound", "Bagmask squezeed-sound",
-        "Bagmsk squeezed-sound", "Bag-mask squeezed-sound",
-    ],
-    "Stimulation": [
-        "Stimulation of trunk", "Stimulation of Trunk", "Stimulation of tunk",
-        "Stiomulation of trunk", "Stumulation of trunk",
-        "Stimulation of the Trunk", "Stimualtion of trunk",
-        "Stimuklation of trunk", "Stimulation of  trunk",
-        "Stimulationof trunk", "Stiomulation of Trunk",
-        "Stimulation of the trunk",
-    ],
-    "Suction": [
-        "Suction using penguin device", "Suction using penguine device",
-        "Suction using Penguine Device", "Suction using Penguine device",
-        "Suction using penguine devece", "Sunction using penguine device",
-        "Suction using bulb device",
-    ],
-    "Non-target": [
-        "Crying",
-        "Chest/abdomen movement", "Chest/Abdomen movement",
-        "Chest/adomen movement", "Chest/abdomen device",
-        "Chest/abdomen ventilation",
-    ],
-}
-EVENT_CATEGORY = {_norm_event(v): cat
-                  for cat, variants in _EVENT_VARIANTS.items() for v in variants}
-
-#: `Newborn visible in video frame` and its 18 known misspellings. These rows
-#: are dropped before anything else (data_process.py line 92). Matching only the
-#: canonical spelling leaves a typo'd one to become an "Ignored label" interval
-#: spanning most of the episode, which suppresses the ventilation and non-target
-#: branches for the whole case (both require `other == 0`).
-VISIBILITY_VARIANTS = {_norm_event(v) for v in [
-    "Newborn visible in video frame", "New born visible in video frame",
-    "Newborn in video frame", "Newborn visible in vedeo frame",
-    "Newborn visible in video fgrame", "Newborn visible in video Frame",
-    "Newborn visible on video frame", "Newboen visible in video frame",
-    "Newborn Visible in video Frame", "Newborn Visible in vodeo frame",
-    "Newborn visible in visible frame", "Newborn visisble in video frame",
-    "Neborn visible in video frame", "New-born visible in video frame",
-    "Newborn visible in frame", "Newborn visible in the video frame",
-    "Newborn visible in video  frame", "Newborn visible in videon frame",
-    "Newborn visivle in video frame", "Newborn Visible in video frame",
-]}
-
-
-def classify_event(text):
-    """Original annotator string -> thesis category, or None if untracked."""
-    return EVENT_CATEGORY.get(_norm_event(text))
-
-
-def is_visibility(text) -> bool:
-    return _norm_event(text) in VISIBILITY_VARIANTS
 
 FINDINGS: list[str] = []      # things that are WRONG or inconsistent
 NOTES: list[str] = []         # things that are USEFUL — capabilities, not faults
@@ -357,113 +258,25 @@ def h(title: str) -> None:
 def read_annotation(path: Path):
     """-> (rows, ncols_seen) where each row is (event, start, end, original).
 
-    Tolerant on purpose: a short or unparseable row is reported, not fatal, so a
-    single bad file cannot hide the rest of the audit.
-
-    Timestamps go through `normalize_tokens`, so a Haydom row written as
-    HH:MM:SS plus decimal seconds yields the same milliseconds a DRC row states
-    outright. `ncols_seen` still counts RAW tab-separated fields, so section 1's
-    "4-col = older vintage" reading is unchanged.
+    Delegates to the shared module; see src/data/annotations.py for why the
+    timestamp handling is not a plain positional parse.
     """
-    rows, ncols = [], Counter()
-    try:
-        text = path.read_text(errors="replace")
-    except OSError as exc:
-        return None, f"unreadable: {exc}"
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        ncols[len(line.rstrip("\n").split("\t"))] += 1
-        parts = normalize_tokens(line)
-        if len(parts) == 1 and " " in parts[0]:
-            # Single-space-separated export. Ronald's `parse_annotation_line`
-            # rule: the last three tokens are start/end/duration, everything
-            # before them is the event name (which may contain spaces).
-            toks = parts[0].split()
-            if len(toks) >= 4:
-                tail = normalize_tokens("\t".join(toks[-3:]))
-                if len(tail) == 3 and all(_INT_RE.match(t) for t in tail):
-                    parts = [" ".join(toks[:-3])] + tail
-        if len(parts) < 3:
-            continue
-        # Column layout varies by export generation (4, 5 and 6 columns all
-        # occur) and so does the position of the timestamps, so nothing is
-        # assumed from the index. Prefer the first ADJACENT TRIPLE that is
-        # self-consistent (end - start == duration): that identifies the real
-        # start/end pair even in a 6-column row that also carries a redundant
-        # copy of the times. Fall back to the first ascending adjacent pair.
-        nums = [(i, int(t)) for i, t in enumerate(parts) if _INT_RE.match(t)]
-        start = end = None
-        for j in range(len(nums) - 2):
-            (i0, a), (i1, b), (i2, d) = nums[j], nums[j + 1], nums[j + 2]
-            if i1 == i0 + 1 and i2 == i1 + 1 and b >= a and abs((b - a) - d) <= 2:
-                start, end = a, b
-                break
-        if start is None:
-            for j in range(len(nums) - 1):
-                (i0, a), (i1, b) = nums[j], nums[j + 1]
-                if i1 == i0 + 1 and b >= a:
-                    start, end = a, b
-                    break
-        if start is None:
-            continue
-        original = parts[4] if len(parts) >= 5 else ""
-        rows.append((parts[0], start, end, original))
-    return (rows, ncols), None
+    return _ann.read_annotation(path)
 
 
-def merge_intervals(intervals):
-    """Verbatim from data_process.merge_intervals: touching intervals merge."""
-    if not intervals:
-        return []
-    out = [tuple(sorted(intervals)[0])]
-    for start, end in sorted(intervals)[1:]:
-        if start <= out[-1][1]:
-            out[-1] = (out[-1][0], max(out[-1][1], end))
-        else:
-            out.append((start, end))
-    return out
-
-
-def annotation_kind(rows):
-    """'cleaned' if column 1 already holds categories, else 'raw'.
-
-    A cleaned anot_files row reads  Suction \t start \t end \t dur \t Suction using bulb device
-    A raw export reads              Suction using bulb device \t start \t end \t dur
-    Telling them apart decides whether the event mapping still has to be applied.
-    """
-    if not rows:
-        return "empty"
-    known = sum(1 for e, _, _, _ in rows if e in MAP_LABELS)
-    return "cleaned" if known >= 0.5 * len(rows) else "raw"
+merge_intervals = _ann.merge_intervals
+annotation_kind = _ann.annotation_kind
+overlap_ms = _ann.overlap_ms
 
 
 def intervals_by_code(rows, kind=None):
-    """visibility filter -> category -> merge, for either annotation stage.
+    """{category CODE -> merged intervals}, for either annotation stage.
 
-    For a raw export the category comes from `classify_event`, which folds the
-    notebook's `corrections` and `relevant_patterns` passes into one lookup on
-    the normalised string; for a cleaned file column 1 is already the category.
-    Visibility rows are matched typo-tolerantly, because a missed one becomes an
-    "Ignored label" interval spanning the episode and suppresses the ventilation
-    and non-target branches for the whole case.
+    Thin wrapper: these sections index by data_process.py's numeric code, the
+    shared module speaks category names.
     """
-    kind = kind or annotation_kind(rows)
-    buckets = defaultdict(list)
-    for event, start, end, original in rows:
-        if is_visibility(original) or is_visibility(event):
-            continue
-        cat = event if kind == "cleaned" else (classify_event(event) or "Ignored label")
-        code = MAP_LABELS.get(cat)
-        if code is None:
-            continue
-        buckets[code].append((start, end))
-    return {c: merge_intervals(v) for c, v in buckets.items()}
-
-
-def overlap_ms(a0, a1, intervals):
-    """Verbatim from data_process.overlap_ms."""
-    return sum(min(a1, e) - max(a0, s) for s, e in intervals if a0 < e and a1 > s)
+    return {MAP_LABELS[cat]: ivs
+            for cat, ivs in _ann.intervals_by_category(rows, kind).items()}
 
 
 # ---------------------------------------------------------------------------
