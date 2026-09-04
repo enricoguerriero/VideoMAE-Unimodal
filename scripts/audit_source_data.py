@@ -645,6 +645,8 @@ def section_intervals(sites):
         files, raw_src = annotation_files_for(s)
         if raw_src is not None:
             print(f"{name:<10}(from raw export {raw_src})")
+            print(f"{'':<10} all {len(files):,} files in that directory — NOT restricted "
+                  f"to the cases that have clips, so `cases` here is not the clip census")
         for f in files:
             got, err = read_annotation(f)
             if err:
@@ -1384,8 +1386,11 @@ def section_policy(sites):
         ups = [x for x in (ua, ub) if x is not None]
         lo, up = (max(los) if los else None), (min(ups) if ups else None)
         overlap = lo is None or up is None or lo < up + 1e-9
-        fa = f"({la}, {ua}]" if la is not None else f"<= {ua}"
-        fb = f"({lb}, {ub}]" if lb is not None else f"<= {ub}"
+        # Format, don't repr: the lower bound carries a FRAC_TOL subtraction and
+        # printed as 0.39490000000000003.
+        def _fmt(lo_, up_):
+            return f"({lo_:.2f}, {up_:.2f}]" if lo_ is not None else f"<= {up_:.2f}"
+        fa, fb = _fmt(la, ua), _fmt(lb, ub)
         print(f"   {CODE_NAME[code]:<13} {a} {fa}   {b} {fb}   "
               f"-> {'COMPATIBLE' if overlap else '** DISJOINT — different cuts **'}")
         if not overlap:

@@ -91,7 +91,8 @@ import csv
 from collections import Counter
 from pathlib import Path
 
-from .annotations import FRAC_TOL, SEGMENT_MS, AnnotationIndex, FractionSource
+from .annotations import (FRAC_TOL, SEGMENT_MS, AnnotationIndex, FractionSource,
+                          window_from_stem)
 from .spec import BUCKET_NAMES, DataSpec, TAG_BEARING_BUCKETS
 
 
@@ -168,11 +169,20 @@ def verify_recompute(rows, source: FractionSource, spec: DataSpec, limit=4000):
 
     -> (checked, ok, mismatches)
     """
+    # Filter to tag-bearing tagged clips BEFORE sampling, and stride across the
+    # whole set rather than taking a prefix: rows arrive in sorted path order, so
+    # `rows[:4000]` is the alphabetically first case or two, and a verification
+    # that only ever sees two cases is not a verification. Bucket 0/4/5 clips are
+    # excluded because their all-zero fractions verify trivially and would pad
+    # the agreement with easy cases.
+    pool = [r for r in rows
+            if int(r["tagged"]) and int(r["bucket"]) in TAG_BEARING_BUCKETS]
+    if limit and len(pool) > limit:
+        step = len(pool) / limit
+        pool = [pool[int(i * step)] for i in range(limit)]
     checked = ok = 0
     mism = []
-    for r in rows[:limit] if limit else rows:
-        if not int(r["tagged"]):
-            continue
+    for r in pool:
         stem = Path(r["video_path"]).stem
         got = source.fractions(r["case_id"], stem)
         if got is None:
@@ -201,8 +211,8 @@ def backfill_fractions(rows, site, ann_roots, spec: DataSpec, verify_rows,
     per row, which is what `tagged` has always meant.
     """
     rep = {"site": site, "index": None, "checked": 0, "ok": 0, "mism": [],
-           "verified": False, "filled": 0, "candidates": 0, "misses": Counter(),
-           "skipped": None}
+           "verified": False, "filled": 0, "candidates": 0,
+           "unfilled": Counter(), "unfilled_cases": {}, "skipped": None}
     index = AnnotationIndex.from_roots(ann_roots)
     rep["index"] = index
     if not len(index):
@@ -236,14 +246,25 @@ def backfill_fractions(rows, site, ann_roots, spec: DataSpec, verify_rows,
         if int(r["bucket"]) not in TAG_BEARING_BUCKETS:
             continue
         rep["candidates"] += 1
-        got = source.fractions(r["case_id"], Path(r["video_path"]).stem)
+        stem = Path(r["video_path"]).stem
+        got = source.fractions(r["case_id"], stem)
         if got is None:
+            # Per CLIP, with the case behind it. FractionSource.misses counts
+            # per CASE (it caches), so reporting that number as a clip count
+            # understated the shortfall by two orders of magnitude.
+            if window_from_stem(stem) is None:
+                why = "no time window in the filename"
+            elif index.is_ambiguous(r["case_id"]):
+                why = "case annotated but AMBIGUOUS (two files disagree)"
+            else:
+                why = "no annotation file for this case"
+            rep["unfilled"][why] += 1
+            rep["unfilled_cases"].setdefault(why, set()).add(r["case_id"])
             continue
         for a in spec.activities:
             r[f"frac_{a}"] = f"{got[a]:.2f}"
         r["tagged"] = 1
         rep["filled"] += 1
-    rep["misses"] = source.misses
     return rep
 
 
@@ -275,8 +296,11 @@ def report_backfill(reports, spec: DataSpec):
         print(f"    filled  : {rep['filled']:,} / {rep['candidates']:,} untagged "
               f"tag-bearing clips"
               + ("" if rep["verified"] else "   [UNVERIFIED]"))
-        for reason, n in sorted(rep["misses"].items(), key=lambda kv: -kv[1]):
-            print(f"              {n:,} not recovered: {reason}")
+        for why, n in sorted(rep["unfilled"].items(), key=lambda kv: -kv[1]):
+            cases = sorted(rep["unfilled_cases"].get(why, ()))
+            print(f"              {n:,} clip(s) across {len(cases)} case(s) NOT "
+                  f"recovered: {why}")
+            print(f"              {cases[:6]}{' ...' if len(cases) > 6 else ''}")
     if any(r["filled"] for r in reports):
         print("\n  A backfilled clip is indistinguishable from one the processor tagged:"
               "\n  its fractions are the same function of the same annotations, rounded"

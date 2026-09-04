@@ -46,14 +46,24 @@ DRC_VIDEOS="/spo/LS-DRC/ProcessedData/Athavan_Frida/Data_processing/Processed_da
 # Set BACKFILL=0 to build the manifest the old way (Haydom stays untagged and
 # keeps its bucket+directory labels).
 BACKFILL="${BACKFILL:-1}"
-HAYDOM_ANNOTATIONS="/spo/LS-Haydom/Data/FullDataset/2023-2025/Annotations"
-HAYDOM_ANNOTATIONS_ALT="/spo/LS-Haydom/ProcessedData/Ronald/data/Tanzania/annotations_corrected"
+# All five directories the audit locates Haydom cases in. Two of them is not
+# enough: a case ambiguous in one export (two files, different content) can be
+# clean in another, and passing only 2 left 4 cases unresolved instead of 3 —
+# 1,222 clips rather than 595. Order does not matter, AnnotationIndex ranks by
+# size and prefers an exact filename match over a digit-run one.
+HAYDOM_ANNOTATION_DIRS=(
+    "/spo/LS-Haydom/Data/FullDataset/2023-2025/Annotations"
+    "/spo/LS-Haydom/Data/FullDataset/2025-2026/March2026Sync/annotations"
+    "/spo/LS-Haydom/ProcessedData/Athavan_Frida/FullDataset_Combined/Annotations"
+    "/spo/LS-Haydom/ProcessedData/Ronald/data/Tanzania/annotations_corrected"
+    "/spo/LS-Haydom/ProcessedData/Athavan_Frida/Data_processing/Unprocessed_data/temp_folder/unique_data/videos/annotations"
+)
 HAYDOM_VERIFY="/spo/LS-Haydom/ProcessedData/Athavan_Frida/Data_processing/Processed_data_stratified_BIG_update_strict_label_test/videos"
 DRC_ANNOTATIONS="/spo/LS-DRC/ProcessedData/Athavan_Frida/Data_processing/Unprocessed_data/anot_files"
 
 BACKFILL_ARGS=()
 if [[ "$BACKFILL" == "1" ]]; then
-    for d in "$HAYDOM_ANNOTATIONS" "$HAYDOM_ANNOTATIONS_ALT"; do
+    for d in "${HAYDOM_ANNOTATION_DIRS[@]}"; do
         [[ -d "$d" ]] && BACKFILL_ARGS+=(--annotations "Haydom=$d")
     done
     [[ -d "$HAYDOM_VERIFY" ]] && BACKFILL_ARGS+=(--verify-root "Haydom=$HAYDOM_VERIFY")
