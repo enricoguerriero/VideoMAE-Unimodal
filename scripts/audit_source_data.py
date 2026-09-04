@@ -96,6 +96,14 @@ ALT_BASES = {
     "Haydom": [],
 }
 
+#: the clip trees scripts/build_data.sh points at. When several vintages sit
+#: side by side, auditing the alphabetically-first one describes a tree the
+#: pipeline never reads — so prefer these, and say so.
+PIPELINE_VINTAGE = {
+    "Haydom": "Processed_data_stratified_BIG_update_strict_label",
+    "DRC": "Processed_data_new_dataset_no_suction_merge_bulp_new_anot_chestmov",
+}
+
 STAGES = {
     "raw_annotations": "Unprocessed_data/temp_folder/raw_annotations",
     "temp_corrected": "Unprocessed_data/temp_folder/temp_corrected_annotations",
@@ -244,11 +252,20 @@ def section_layout(sites):
                 print(f"   {stage:<16} {n:>7,} entries   {p}")
         print(f"   clip vintages found under BasePath ({len(s['vintages'])}):")
         for v in s["vintages"]:
-            mark = "  <- SELECTED" if s.get("clips") and v / "videos" == s["clips"] else ""
+            mark = ""
+            if s.get("clips") and v / "videos" == s["clips"]:
+                mark = f"  <- AUDITED (chosen by {s.get('picked_by')})"
+            elif v.name == PIPELINE_VINTAGE.get(name):
+                mark = "  <- build_data.sh trains on THIS one"
             print(f"       {v.name}{mark}")
-        if len(s["vintages"]) > 1:
-            finding(f"{name}: {len(s['vintages'])} clip vintages on disk — make sure "
-                    f"build_data.sh points at the intended one")
+        if s.get("picked_by") == "FIRST ALPHABETICALLY":
+            finding(f"{name}: build_data.sh's vintage "
+                    f"'{PIPELINE_VINTAGE.get(name)}' was NOT found; audited "
+                    f"'{s['clips'].parent.name}' instead — sections 5-8 may not "
+                    f"describe the tree you train on. Pass --clips {name}=<path>.")
+        elif len(s["vintages"]) > 1:
+            print(f"   ({len(s['vintages'])} vintages present; audited the one "
+                  f"build_data.sh uses)")
 
 
 def section_format(sites):
@@ -308,6 +325,15 @@ def section_vocabulary(sites):
         return
     a, b = names[0], names[1]
     h(f"CROSS-SITE DIFF  ({a} vs {b})")
+    empty = [n for n in (a, b) if not per_site[n]]
+    if empty:
+        print(f"   NOT COMPARABLE — no annotations were read for {', '.join(empty)}.")
+        print("   Everything below would just re-list the other site's vocabulary,")
+        print("   which says nothing about whether the two agree.")
+        for n in empty:
+            finding(f"{n}: no annotations readable, so the event vocabulary CANNOT be "
+                    f"compared against the other site — the suction question stays open")
+        return
     map_a = defaultdict(set)
     map_b = defaultdict(set)
     for (o, m) in per_site[a]:
@@ -624,6 +650,46 @@ def section_backfill(sites):
                     f"clips can have their fractions recovered")
 
 
+def section_hunt(sites, roots):
+    """Search given roots for files named after the clip case ids.
+
+    Runs only with --find-annotations. Useful when a site's anot_files/ is not
+    where the notebook says it should be: the clips name their cases, so the
+    annotations can be located by matching filenames anywhere on the volume.
+    """
+    rule("8b. ANNOTATION HUNT — looking for the missing annotation files")
+    for name, s in sites.items():
+        cases = {c["case_id"] for c in s.get("clip_info", [])}
+        if not cases:
+            continue
+        if s["present"].get("anot_files") is not None:
+            print(f"   {name}: anot_files/ already present, skipping")
+            continue
+        h(f"{name}: {len(cases)} case ids to locate")
+        for root in roots:
+            root = Path(root).expanduser()
+            if not root.is_dir():
+                print(f"   {root}  [not a directory]")
+                continue
+            hits, where = 0, Counter()
+            try:
+                for f in root.rglob("*.txt"):
+                    if f.stem in cases:
+                        hits += 1
+                        where[f.parent] += 1
+            except OSError as exc:
+                print(f"   {root}  [error: {exc}]")
+                continue
+            print(f"   {root}")
+            if not hits:
+                print("       no .txt matching any case id")
+            for d, n in where.most_common(5):
+                print(f"       {n:>6,} matches in {d}")
+            if hits:
+                finding(f"{name}: {hits:,} case-matching .txt files found under "
+                        f"{root} — annotations may be recoverable from there")
+
+
 def section_findings():
     rule("9. FINDINGS")
     if not FINDINGS:
@@ -657,6 +723,10 @@ def main():
                    help="Clips per site to use for the section-6 recomputation "
                         "(0 = all; default 4000, which is plenty).")
     p.add_argument("--skip", default="", help="Comma-separated section numbers to skip.")
+    p.add_argument("--find-annotations", action="append", default=None, metavar="DIR",
+                   help="Search DIR recursively for .txt files named after the clip "
+                        "case ids. Use when a site's anot_files/ is missing. "
+                        "Repeatable.")
     args = p.parse_args()
 
     raw_sites = dict(args.site) if args.site else {k: Path(v) for k, v in DEFAULT_SITES.items()}
@@ -676,10 +746,19 @@ def main():
                     break
         present, vintages = discover(base) if base.is_dir() else ({}, [])
         clips = clip_over.get(name)
+        picked_by = "--clips"
         if clips is None and vintages:
-            clips = vintages[0] / "videos"
+            want = PIPELINE_VINTAGE.get(name)
+            match = next((v for v in vintages if v.name == want), None)
+            if match is not None:
+                clips, picked_by = match / "videos", "build_data.sh"
+            elif len(vintages) == 1:
+                # only one tree here, so there is nothing to get wrong
+                clips, picked_by = vintages[0] / "videos", "the only vintage present"
+            else:
+                clips, picked_by = vintages[0] / "videos", "FIRST ALPHABETICALLY"
         sites[name] = {"base": base, "present": present, "vintages": vintages,
-                       "clips": clips}
+                       "clips": clips, "picked_by": picked_by}
 
     for num, fn in [("0", lambda: section_layout(sites)),
                     ("1", lambda: section_format(sites)),
@@ -689,7 +768,9 @@ def main():
                     ("5", lambda: section_clips(sites)),
                     ("6", lambda: section_recompute(sites, args.sample)),
                     ("7", lambda: section_implied_cut(sites)),
-                    ("8", lambda: section_backfill(sites))]:
+                    ("8", lambda: section_backfill(sites)),
+                    ("8b", lambda: section_hunt(sites, args.find_annotations)
+                     if args.find_annotations else None)]:
         if num in skip:
             print(f"\n[skipped section {num}]")
             continue
