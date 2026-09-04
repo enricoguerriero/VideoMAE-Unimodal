@@ -548,7 +548,8 @@ def locate_annotations(site, roots):
     """Every annotation directory reachable for a site, best source first.
 
     The site's own `anot_files/` leads (it is the CLEANED stage the clips were
-    actually cut from); the `--find-annotations` roots follow in the order given.
+    actually cut from); every other directory follows in descending size, which
+    is the only quality signal available before the clip inventory is read.
     Each directory keeps its own index so section 8b can still report coverage
     per directory, and the merged view resolves a case to its best source.
     """
@@ -567,7 +568,31 @@ def locate_annotations(site, roots):
             seen.add(d)
             idx, conf = index_annotation_dir(d)
             if idx:
-                out.append({"dir": d, "index": idx, "conflicts": conf})
+                out.append({"dir": d, "index": idx, "conflicts": conf,
+                            "own": root is own})
+    # Biggest store wins after the site's own cleaned stage. Argument order is
+    # not a quality ranking: rglob over the first root happened to surface
+    # `unique_data/acceleration/annotations` (2 files, 2 cases), and sections
+    # 1-3 then described a 246-case site from two of its cases.
+    out.sort(key=lambda e: (not e["own"], -len(e["index"])))
+    return out
+
+
+def ambiguous_cases(site, cases):
+    """Of `cases`, the ones that HAVE annotation files but cannot be used.
+
+    Two files with different content claim the same case key, so Ronald's
+    conflict rule refuses both. That is a very different problem from "this
+    case was never annotated": the data exists and someone has to decide which
+    copy is authoritative. Reporting them as absent hides a fixable conflict.
+    """
+    out = set()
+    for c in cases:
+        keys = [c] + sorted(case_keys(c) - {c})
+        for entry in site.get("annot_dirs", []):
+            if any(k in entry["conflicts"] for k in keys):
+                out.add(c)
+                break
     return out
 
 
@@ -590,11 +615,17 @@ def annotation_files_for(site):
 
 
 def lookup_annotation(site, case_id):
-    """Best annotation file for one case id, or None. Tries the exact id first,
-    then every digit run in it, over the located directories in priority order."""
-    keys = [case_id] + sorted(case_keys(case_id) - {case_id})
-    for entry in site.get("annot_dirs", []):
-        for k in keys:
+    """Best annotation file for one case id, or None.
+
+    KEY-MAJOR, not directory-major: every directory is tried on the EXACT case
+    id before any of them is tried on a digit run. A digit key is a fallback for
+    oddly-named files, and it must never outrank a file actually named after the
+    case — DRC's `2-33998-1` reduces to the digit key `33998`, which a Haydom
+    filename could also carry, and a directory-major search would let that
+    Haydom file win purely by being listed first.
+    """
+    for k in [case_id] + sorted(case_keys(case_id) - {case_id}):
+        for entry in site.get("annot_dirs", []):
             f = entry["index"].get(k)
             if f is not None:
                 return f
@@ -745,7 +776,12 @@ def section_vocabulary(sites):
     for (o, m) in per_site[b]:
         map_b[o].add(m)
 
-    conflicts = [o for o in set(map_a) & set(map_b) if map_a[o] != map_b[o]]
+    # A visibility row is dropped at both sites (data_process.py line 92). It
+    # only LOOKS different because a cleaned file stores it as the literal
+    # "Ignored label" while a raw one still carries the original string, so
+    # comparing the two spellings reports a conflict that does not exist.
+    conflicts = [o for o in set(map_a) & set(map_b)
+                 if map_a[o] != map_b[o] and not is_visibility(o)]
     only_a = sorted(set(map_a) - set(map_b))
     only_b = sorted(set(map_b) - set(map_a))
 
@@ -1080,15 +1116,28 @@ def section_backfill(sites):
                       if c["start_ms"] is not None and c["case_id"] in found)
         print(f"   => RECOVERABLE fractions: {covered:,}/{len(untagged):,} clips "
               f"({100*covered/max(len(untagged),1):.1f}%)")
-        if cases - found:
-            miss = sorted(cases - found)
-            print(f"   cases with NO annotation file ({len(miss)}): {miss[:8]}"
-                  f"{' ...' if len(miss) > 8 else ''}")
-            finding(f"{name}: {len(miss)} case(s) have clips but no annotation file "
-                    f"in any located directory")
-        if covered < len(untagged):
-            finding(f"{name}: only {100*covered/max(len(untagged),1):.1f}% of untagged "
-                    f"clips can have their fractions recovered")
+        miss = cases - found
+        if miss:
+            amb = ambiguous_cases(s, miss)
+            absent = sorted(miss - amb)
+            if amb:
+                print(f"   AMBIGUOUS ({len(amb)}): {sorted(amb)[:8]}"
+                      f"{' ...' if len(amb) > 8 else ''}")
+                print("      — annotated, but two files disagree; pick the authoritative")
+                print("        copy and these become recoverable too")
+                finding(f"{name}: {len(amb)} case(s) are annotated but UNUSABLE — two "
+                        f"files with different content claim the same case; choosing "
+                        f"one would recover them")
+            if absent:
+                print(f"   ABSENT ({len(absent)}): {absent[:8]}"
+                      f"{' ...' if len(absent) > 8 else ''}")
+                finding(f"{name}: {len(absent)} case(s) have clips but no annotation "
+                        f"file in any located directory")
+        lost = len(untagged) - covered
+        if lost:
+            finding(f"{name}: {lost:,} of {len(untagged):,} untagged clips "
+                    f"({100*lost/len(untagged):.1f}%) cannot have their fractions "
+                    f"recovered — the other {covered:,} can")
 
 
 def section_hunt(sites, roots):
@@ -1135,7 +1184,7 @@ def section_hunt(sites, roots):
                     f"cases in the searched roots")
             continue
 
-        union = set()
+        union, conflict_keys, suction_noted = set(), set(), False
         for d, n in sorted(hits.items(), key=lambda kv: -kv[1]):
             matched, entry = by_dir[d]
             files = sorted({entry["index"][k] for c in matched
@@ -1143,13 +1192,6 @@ def section_hunt(sites, roots):
                             if k in entry["index"]})
             union |= matched
             found_dirs[name].append(d)
-            if entry["conflicts"]:
-                bad = sorted(entry["conflicts"])[:4]
-                print(f"\n   [{len(entry['conflicts'])} ambiguous case key(s) in "
-                      f"{d.name}/ — two files, different content, e.g. {bad}]")
-                finding(f"{name}: {len(entry['conflicts'])} case key(s) in {d.name}/ "
-                        f"map to two annotation files with DIFFERENT content — "
-                        f"neither is used (Ronald's conflict rule)")
             ncols, kinds, vocab, rows_total = Counter(), Counter(), Counter(), 0
             for f in files[:400]:                       # fingerprint a slice; enough
                 got, err = read_annotation(f)
@@ -1167,6 +1209,11 @@ def section_hunt(sites, roots):
                   f"({100*n/len(cases):.0f}% coverage)   "
                   f"stage={'/'.join(kinds) or '?'}   "
                   f"cols={dict(ncols) or '?'}")
+            if entry["conflicts"]:
+                bad = sorted(entry["conflicts"])[:4]
+                print(f"       {len(entry['conflicts'])} ambiguous case key(s) — two "
+                      f"files, different content, e.g. {bad}")
+                conflict_keys.update(entry["conflicts"])
             sucty = {k: v for k, v in vocab.items() if "suction" in k.lower()}
             if vocab:
                 print("       original event strings (top 8):")
@@ -1175,16 +1222,30 @@ def section_hunt(sites, roots):
                     print(f"           {cnt:>6,}  {ev[:52]}{mark}")
             if sucty:
                 print(f"       SUCTION VARIANTS HERE: {sorted(sucty)}")
-                note(f"{name}: suction vocabulary recoverable from {d.name}/ — "
-                     f"{sorted(sucty)}")
+                # One note per SITE, not per directory: four copies of the same
+                # vocabulary buried the findings list under duplicates.
+                if not suction_noted:
+                    suction_noted = True
+                    note(f"{name}: suction vocabulary recoverable from {d.name}/ — "
+                         f"{sorted(sucty)}")
             else:
                 print("       no suction-like string in this directory")
         print(f"\n   UNION over all directories above: {len(union)}/{len(cases)} cases "
               f"({100*len(union)/len(cases):.0f}%)")
+        if conflict_keys:
+            finding(f"{name}: {len(conflict_keys)} case key(s) across the located "
+                    f"directories map to two annotation files with DIFFERENT content "
+                    f"— neither is used (Ronald's conflict rule)")
         missing = cases - union
         if missing:
-            finding(f"{name}: {len(missing)} case(s) have clips but no annotation "
-                    f"anywhere in the searched roots, e.g. {sorted(missing)[:5]}")
+            amb = ambiguous_cases(s_, missing)
+            if amb:
+                print(f"   of those, {len(amb)} are ANNOTATED BUT AMBIGUOUS "
+                      f"(two files disagree): {sorted(amb)[:5]}")
+            absent = sorted(missing - amb)
+            if absent:
+                finding(f"{name}: {len(absent)} case(s) have clips but no annotation "
+                        f"anywhere in the searched roots, e.g. {absent[:5]}")
         else:
             note(f"{name}: annotations for ALL {len(cases)} cases are locatable — "
                  f"a full fraction backfill is possible")
@@ -1232,6 +1293,7 @@ def section_validate(sites, found_dirs):
         if not dirs:
             print("   no annotation directory located for this site — cannot validate")
             continue
+        validated = False
         for d in dirs:
             cache, checked, ok = {}, 0, 0
             mism = []
@@ -1271,7 +1333,8 @@ def section_validate(sites, found_dirs):
             print(f"   {d.name:<38} {ok:,}/{checked:,} ({pct:.1f}%)  {verdict}")
             for cat, w, g in mism:
                 print(f"       e.g. {cat:<22} tag={w:.2f} recomputed={g:.2f}")
-            if pct >= 99:
+            if pct >= 99 and not validated:
+                validated = True   # one note per site; the rest are the same fact
                 note(f"{name}: fraction backfill VALIDATED against {v.name} using "
                      f"{d.name}/ ({ok:,}/{checked:,} tags reproduced)")
 
@@ -1442,7 +1505,13 @@ def section_policy(sites):
         for code in (1, 2, 3):
             e = ev[code]
             up = e["strong_min"]
-            lo = e["partial_max"] if code != 2 else None      # see docstring
+            # The lower bound comes from a tag written with %.2f, so a clip that
+            # was really at 0.4995 reads as 0.50 and appears to sit ON the cut it
+            # is by construction below. Give the bound back that rounding, or
+            # every activity whose partial clips crowd the threshold is reported
+            # as "CONTRADICTORY" when the data is merely rounded.
+            lo = (e["partial_max"] - FRAC_TOL) if (code != 2 and e["partial_max"]
+                                                   is not None) else None
             if up is None and lo is None:
                 print(f"   {CODE_NAME[code]:<13}{'-':>9}{'-':>9}{'-':>11}{'-':>9}   "
                       f"no tagged evidence")
