@@ -275,8 +275,13 @@ def intervals_by_code(rows, kind=None):
     Thin wrapper: these sections index by data_process.py's numeric code, the
     shared module speaks category names.
     """
+    # `intervals_by_category` returns BOTH granularities, so the per-device keys
+    # ("Suction penguin", ...) have no numeric code and must be filtered out
+    # rather than looked up — MAP_LABELS[cat] raised KeyError on them, and every
+    # section that reads intervals died with it.
     return {MAP_LABELS[cat]: ivs
-            for cat, ivs in _ann.intervals_by_category(rows, kind).items()}
+            for cat, ivs in _ann.intervals_by_category(rows, kind).items()
+            if cat in MAP_LABELS}
 
 
 # ---------------------------------------------------------------------------

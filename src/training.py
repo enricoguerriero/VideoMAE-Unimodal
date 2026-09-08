@@ -216,6 +216,13 @@ def main():
                         help="Train the classifier head ONLY: the backbone keeps its "
                              "pretrained weights and receives no gradient. Equivalent "
                              "to `train_backbone: false` in the config.")
+    parser.add_argument("--minority-class", "--minority_class", dest="minority_class",
+                        default=None, metavar="CLASS",
+                        help="Class whose F1 drives the best-minority checkpoint. "
+                             "Overrides `minority_class` in configs/config.yaml — "
+                             "needed when the data config renames it, e.g. "
+                             "`--minority-class suction_penguin` for the per-device "
+                             "split.")
     parser.add_argument("--run-name", default=None,
                         help="Name this run. Used for the checkpoint / metrics "
                              "filenames and the W&B run name in place of the model "
@@ -275,7 +282,13 @@ def main():
                    job_type="train")
         wu.define_epoch_metrics()
 
-    minority_class = config.get("minority_class", DEFAULT_MINORITY_CLASS)
+    # CLI wins over config.yaml so two runs that must be identical except for
+    # their label regime can share one config file. The 3-activity configs want
+    # `suction`; the per-device one has no such class and wants `suction_penguin`
+    # (the rare, cross-site one), and editing config.yaml between the two runs is
+    # exactly the kind of manual step that silently desynchronises a comparison.
+    minority_class = (getattr(args, "minority_class", None)
+                      or config.get("minority_class", DEFAULT_MINORITY_CLASS))
     if minority_class not in spec.class_names:
         logger.warning(f"minority_class={minority_class!r} is not one of "
                        f"{spec.class_names} — 'minority/f1' will read 0.0 and the "

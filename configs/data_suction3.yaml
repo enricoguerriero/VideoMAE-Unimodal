@@ -1,0 +1,105 @@
+# =============================================================================
+# data_suction3.yaml — MULTILABEL with suction split by DEVICE
+# =============================================================================
+# Same clips as configs/data_multilabel.yaml. What changes is that `suction`
+# becomes three independent activities, because it was never one act:
+#
+#   device    Haydom cases   DRC cases   median span   sites
+#   penguin        108           11        1.3-2.0 s   BOTH
+#   bulb             0           74        1.4 s       DRC only
+#   tube             0           60       19.8 s       DRC only
+#
+# Pooled into one label, a DRC-trained model scores AP 0.013 on Haydom suction —
+# chance, because it has only ever seen bulb and Haydom only has penguin. Split,
+# `suction_penguin` is the one suction class present at both sites (119 cases,
+# more than either of the others) and the only one whose cross-site number means
+# anything. Measure it with scripts/suction_devices.py.
+#
+# REQUIRES a manifest built with per-device fractions:
+#     bash scripts/build_data.sh          (passes --annotations + --rebackfill-all)
+# Filenames only ever carried `_suct`, so the split cannot be read off disk —
+# every fraction here is recomputed from the annotations.
+# =============================================================================
+
+task: multilabel
+
+# Order fixes the logit order and every metric key. suction_* last so the first
+# three indices still line up with the 3-activity configs.
+activities: [stimulation, ventilation, suction_penguin, suction_bulb, suction_tube]
+negative_class: non_target
+
+# No filename ever carried a per-device tag, so these are placeholders that
+# deliberately match nothing. A clip is therefore parsed as UNTAGGED and gets
+# its fractions from the backfill — which is the only correct source here.
+tag_keys:
+  stimulation: stim
+  ventilation: vent
+  suction_penguin: suctpeng
+  suction_bulb: suctbulb
+  suction_tube: sucttube
+
+thresholds:
+  stimulation: 0.50
+  ventilation: 0.50
+  suction_penguin: 0.25    # suction is brief; same bar the processor used
+  suction_bulb: 0.25
+  suction_tube: 0.25       # tube spans ~20 s, so its windows sit near 1.0 anyway
+
+weak_threshold: 0.20
+ambiguous: mask
+overlap_resolution: drop   # ignored in multilabel; kept for round-tripping
+
+# ---------------------------------------------------------------- buckets
+# Bucket 5 is KEPT here, and that is the one substantive difference from
+# data_multilabel.yaml. Two reasons:
+#
+#  1. TUBE LIVES THERE. `Suction using tube` was absent from the thesis'
+#     relevant_patterns, so it fell through to "Ignored label"; the ventilation
+#     and non-target branches both require `other == 0`, so a tube-only window
+#     could only land in bucket 5. Dropping bucket 5 means tube's only positive
+#     examples would be windows where it co-occurs with something else — a
+#     biased subset. This recovers ~8,352 DRC clips (20.8% of that site) and
+#     5,427 Haydom clips.
+#  2. THE CONTENT IS NOW CORRECTLY ALL-NEGATIVE. Bucket 5's other occupants are
+#     Drying, Drying/Stimulation and Stimulation of extremities. Under the
+#     current guideline only TORSO stimulation counts, so "not stimulation" is
+#     the right label for an extremity-stimulation window rather than a
+#     mislabelling. That was the reason the bucket was dropped, and it no longer
+#     applies.
+#
+# KNOWN COST: bucket 5 also holds ~91 `T-piece ventilation` intervals (62
+# Haydom, 29 DRC) which the thesis excludes from ventilation. Those windows are
+# supervised as ventilation-negative, which is wrong. It is ~0.1% of the
+# ventilation evidence; if it ever matters, give T-piece its own category in
+# src/data/annotations.py the same way tube got one.
+buckets:
+  0: keep   # non_target       -> all-zero target
+  1: keep   # stimulation
+  2: keep   # ventilation
+  3: keep   # suction (bulb or penguin — the fractions say which)
+  4: keep   # no_overlap       -> all-zero target
+  5: keep   # no_label         -- tube lives here; see above
+  6: keep   # partial          -- sub-threshold, masked per activity
+  7: keep   # target_overlap   -- co-occurrence
+  8: keep   # partial_overlap  -- >=2 present but weak, masked per activity
+
+# Tune on VALIDATION with src/tune_thresholds.py, then report F1 next to AP.
+# 0.5 is a starting point, not a result — with sqrt_inv_freq the balanced
+# operating point sits near w/(1+w), not 0.5.
+decision_thresholds:
+  stimulation: 0.5
+  ventilation: 0.5
+  suction_penguin: 0.5
+  suction_bulb: 0.5
+  suction_tube: 0.5
+
+# `Event` string per activity in the annotation files. The defaults would be
+# "Suction penguin" etc. via capitalize(), which is exactly what
+# annotations.py's EVENT_CATEGORY emits — but pinned here so a rename of either
+# side cannot silently decouple them.
+annotation_events:
+  stimulation: Stimulation
+  ventilation: Ventilation
+  suction_penguin: Suction penguin
+  suction_bulb: Suction bulb
+  suction_tube: Suction tube

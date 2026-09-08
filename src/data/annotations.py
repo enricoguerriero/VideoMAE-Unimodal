@@ -156,11 +156,24 @@ _EVENT_VARIANTS = {
         "Stimulationof trunk", "Stiomulation of Trunk",
         "Stimulation of the trunk",
     ],
-    "Suction": [
+    # Suction is split BY DEVICE. The three are different physical acts: bulb and
+    # penguin run ~1.4-2.0 s, tube runs ~20 s (median 19,833 ms at DRC), and the
+    # sites do not share them — Haydom is 100% penguin (108 cases), DRC is 94%
+    # bulb (74 cases) plus 11 penguin cases. Pooling them into one label is why a
+    # DRC-trained model scores AP 0.013 on Haydom suction, i.e. chance.
+    #
+    # LEGACY_CATEGORY below collapses these back to what data_process.py did, so
+    # the clip buckets on disk and the verification gate still line up.
+    "Suction penguin": [
         "Suction using penguin device", "Suction using penguine device",
         "Suction using Penguine Device", "Suction using Penguine device",
         "Suction using penguine devece", "Sunction using penguine device",
+    ],
+    "Suction bulb": [
         "Suction using bulb device",
+    ],
+    "Suction tube": [
+        "Suction using tube",
     ],
     "Non-target": [
         "Crying",
@@ -191,9 +204,26 @@ VISIBILITY_VARIANTS = {normalize_event(v) for v in [
 ]}
 
 
+#: fine category -> the category data_process.py actually used. Tube was NOT a
+#: suction event to the processor: it is absent from `relevant_patterns`, so it
+#: fell through to "Ignored label", and its windows became bucket 5 (no_label) or
+#: were demoted out of ventilation/non-target by those branches' `other == 0`
+#: guards. Reproducing that keeps the buckets on disk meaningful.
+LEGACY_CATEGORY = {
+    "Suction penguin": "Suction",
+    "Suction bulb": "Suction",
+    "Suction tube": "Ignored label",
+}
+
+
 def classify_event(text):
-    """Original annotator string -> thesis category, or None if untracked."""
+    """Original annotator string -> fine category, or None if untracked."""
     return EVENT_CATEGORY.get(normalize_event(text))
+
+
+def legacy_category(cat):
+    """Fine category -> the category data_process.py assigned."""
+    return LEGACY_CATEGORY.get(cat, cat)
 
 
 def is_visibility(text) -> bool:
@@ -293,21 +323,40 @@ def overlap_ms(a0, a1, intervals) -> int:
 def intervals_by_category(rows, kind=None) -> dict:
     """{category name -> merged intervals}, for either annotation stage.
 
-    Visibility rows are dropped first (typo-tolerantly), then a raw export's
-    strings go through `classify_event` while a cleaned file's column 1 is
-    already the category. Merging before measuring is what data_process.py does,
-    so an event annotated twice over the same span is not counted twice.
+    Returns BOTH granularities in one dict: the processor's categories
+    ("Suction" = bulb + penguin, "Ignored label" including tube) and the
+    per-device ones ("Suction penguin", "Suction bulb", "Suction tube"). Callers
+    pick by key, so the verification gate can check the processor's own numbers
+    while the backfill fills per-device columns from the same read.
+
+    Visibility rows are dropped first (typo-tolerantly). Merging before
+    measuring is what data_process.py does, so an event annotated twice over the
+    same span is not counted twice.
     """
     kind = kind or annotation_kind(rows)
-    buckets = defaultdict(list)
+    fine, legacy = defaultdict(list), defaultdict(list)
     for event, start, end, original in rows:
         if is_visibility(original) or is_visibility(event):
             continue
-        cat = event if kind == "cleaned" else (classify_event(event) or "Ignored label")
-        if cat not in MAP_LABELS:
+        if kind == "cleaned":
+            # A cleaned file's column 1 is already the processor's category, so
+            # the DEVICE survives only in column 5 — which is exactly where the
+            # bulb/penguin/tube distinction lives for DRC.
+            cat = classify_event(original) or event
+        else:
+            cat = classify_event(event) or "Ignored label"
+        leg = legacy_category(cat)
+        if leg not in MAP_LABELS:
             continue
-        buckets[cat].append((start, end))
-    return {c: merge_intervals(v) for c, v in buckets.items()}
+        legacy[leg].append((start, end))
+        if cat != leg:
+            fine[cat].append((start, end))
+    out = {c: merge_intervals(v) for c, v in legacy.items()}
+    # Fine categories are added ALONGSIDE the legacy ones, never replacing them,
+    # so a 3-activity spec asking for "Suction" and a 5-activity spec asking for
+    # "Suction penguin" both resolve from one pass over the file.
+    out.update({c: merge_intervals(v) for c, v in fine.items()})
+    return out
 
 
 def window_from_stem(stem: str):

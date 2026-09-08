@@ -88,6 +88,7 @@ subfolders (or any tree of *.mp4 clips following the naming convention).
 
 import argparse
 import csv
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -95,8 +96,22 @@ from .annotations import (FRAC_TOL, SEGMENT_MS, AnnotationIndex, FractionSource,
                           window_from_stem)
 from .spec import BUCKET_NAMES, DataSpec, TAG_BEARING_BUCKETS
 
+#: The tags data_process.py actually wrote, and the category each one measured.
+#: Verification uses THIS, never the spec's activities: once suction is split by
+#: device there is no `_suctpeng` tag on disk to compare against, so checking the
+#: spec's columns would score a recomputed 0.30 against a manifest 0.00 and
+#: refuse every backfill. The processor's three tags are the only ground truth
+#: written to disk, and they stay valid however suction is re-sliced later.
+LEGACY_TAGS = {"stim": "Stimulation", "vent": "Ventilation", "suct": "Suction"}
+_LEGACY_TAG_RE = re.compile(r"_(stim|vent|suct)(\d+\.\d+)")
 
-def scan_root(site: str, root: Path, spec: DataSpec):
+#: Directory word the processor used for each bucket it named. Fixed at three
+#: because the processor had three activities — a 5-activity spec must not make
+#: the structural check demand that bucket 4 (`no_overlap`) name `suction_bulb`.
+BUCKET_DIR_WORD = {1: "stimulation", 2: "ventilation", 3: "suction"}
+
+
+def scan_root(site: str, root: Path, spec: DataSpec, frac_activities=None):
     """Yield one row per clip under `root`, plus counters for the report.
 
     Two things are recorded that the filename alone cannot always give:
@@ -129,12 +144,14 @@ def scan_root(site: str, root: Path, spec: DataSpec):
 
         # Structural check: a bucket that names an activity must be filed under a
         # directory that names it too, or the identity is unrecoverable for an
-        # untagged clip. Reported, never silently repaired.
-        if 1 <= bucket <= len(spec.activities):
-            expected = spec.activities[bucket - 1]
-            if expected not in dir_acts and len(structural) < 5:
-                structural.append(f"{mp4} — bucket {bucket} implies {expected}, "
-                                  f"directory says {dir_acts or '()'}")
+        # untagged clip. Reported, never silently repaired. Checked against the
+        # PROCESSOR's three directory words, not the spec's activity list, which
+        # may now slice suction three ways.
+        if bucket in BUCKET_DIR_WORD:
+            expected = BUCKET_DIR_WORD[bucket]
+            if expected not in rel_dir.lower() and len(structural) < 5:
+                structural.append(f"{mp4} — bucket {bucket} implies {expected}/, "
+                                  f"directory is {rel_dir or '<root>'!r}")
         elif bucket in (6, 7, 8) and not dir_acts:
             if len(structural) < 5:
                 structural.append(f"{mp4} — bucket {bucket} needs an activity in its "
@@ -148,7 +165,7 @@ def scan_root(site: str, root: Path, spec: DataSpec):
             "clip_dir": rel_dir,
             "tagged": int(tagged),
         }
-        for a in spec.activities:
+        for a in (frac_activities or spec.activities):
             row[f"frac_{a}"] = f"{fracs.get(a, 0.0):.2f}"
         rows.append(row)
     return rows, buckets, unparsed, dir_census, structural
@@ -157,48 +174,53 @@ def scan_root(site: str, root: Path, spec: DataSpec):
 # ---------------------------------------------------------------------------
 # Backfill: give an untagged site the fractions its filenames never recorded
 # ---------------------------------------------------------------------------
-def verify_recompute(rows, source: FractionSource, spec: DataSpec, limit=4000):
-    """Recompute the fractions of clips that ALREADY have tags, and compare.
+def verify_recompute(rows, index: AnnotationIndex, segment_ms, limit=4000):
+    """Reproduce the FILENAME tags from the annotations. This is the gate.
 
-    This is the gate, and it is not optional. The recomputation is only as
-    trustworthy as the annotations it reads, and a site can easily be paired
-    with an annotation export from a different vintage than its clips — which
-    produces plausible-looking numbers that are quietly wrong. Clips carrying a
-    tag are ground truth for exactly this check: reproduce them, or do not
-    trust the same computation on the clips that have none.
+    The recomputation is only as trustworthy as the annotations it reads, and a
+    site can easily be paired with an export from a different vintage than its
+    clips — which yields plausible, quietly wrong numbers. Clips carrying a tag
+    are the ground truth for exactly this: reproduce them, or do not trust the
+    same computation on the clips that have none.
+
+    Tags are parsed straight off the stem with the PROCESSOR's vocabulary rather
+    than read from the manifest, so this check is identical whether the caller's
+    spec has three activities or five.
 
     -> (checked, ok, mismatches)
     """
-    # Filter to tag-bearing tagged clips BEFORE sampling, and stride across the
-    # whole set rather than taking a prefix: rows arrive in sorted path order, so
-    # `rows[:4000]` is the alphabetically first case or two, and a verification
-    # that only ever sees two cases is not a verification. Bucket 0/4/5 clips are
-    # excluded because their all-zero fractions verify trivially and would pad
-    # the agreement with easy cases.
-    pool = [r for r in rows
-            if int(r["tagged"]) and int(r["bucket"]) in TAG_BEARING_BUCKETS]
+    src = FractionSource(index, LEGACY_TAGS, segment_ms=segment_ms)
+    pool = []
+    for r in rows:
+        stem = Path(r["video_path"]).stem
+        tags = {k: float(v) for k, v in _LEGACY_TAG_RE.findall(stem)}
+        if tags:                      # only a tagged clip is evidence
+            pool.append((r["case_id"], stem, tags))
+    # Stride across the whole pool rather than taking a prefix: rows arrive in
+    # sorted path order, so `pool[:4000]` is the alphabetically first case or two
+    # and a check that only ever sees two cases is not a check.
     if limit and len(pool) > limit:
         step = len(pool) / limit
         pool = [pool[int(i * step)] for i in range(limit)]
     checked = ok = 0
     mism = []
-    for r in pool:
-        stem = Path(r["video_path"]).stem
-        got = source.fractions(r["case_id"], stem)
+    for case_id, stem, tags in pool:
+        got = src.fractions(case_id, stem)
         if got is None:
             continue
-        for a in spec.activities:
-            want = float(r[f"frac_{a}"])
+        for tag, cat in LEGACY_TAGS.items():
+            want = tags.get(tag, 0.0)      # tag absent == zero overlap
             checked += 1
-            if abs(got[a] - want) <= FRAC_TOL:
+            if abs(got[tag] - want) <= FRAC_TOL:
                 ok += 1
             elif len(mism) < 6:
-                mism.append((stem, a, want, got[a]))
+                mism.append((stem, cat, want, got[tag]))
     return checked, ok, mism
 
 
 def backfill_fractions(rows, site, ann_roots, spec: DataSpec, verify_rows,
-                       min_agreement, allow_unverified, segment_ms):
+                       min_agreement, allow_unverified, segment_ms,
+                       rebackfill_all=False, frac_activities=None):
     """Fill in `frac_*` for one site's untagged clips. Returns a report dict.
 
     Only TAG-BEARING buckets are touched: a bucket 0/4/5 clip has no activity
@@ -211,17 +233,17 @@ def backfill_fractions(rows, site, ann_roots, spec: DataSpec, verify_rows,
     per row, which is what `tagged` has always meant.
     """
     rep = {"site": site, "index": None, "checked": 0, "ok": 0, "mism": [],
-           "verified": False, "filled": 0, "candidates": 0,
+           "verified": False, "filled": 0, "candidates": 0, "untagged": 0,
            "unfilled": Counter(), "unfilled_cases": {}, "skipped": None}
     index = AnnotationIndex.from_roots(ann_roots)
     rep["index"] = index
     if not len(index):
         rep["skipped"] = "no annotation file found under the given --annotations paths"
         return rep
-    source = FractionSource(index, {a: spec.event_name(a) for a in spec.activities},
-                            segment_ms=segment_ms)
+    cats = {a: spec.event_name(a) for a in (frac_activities or spec.activities)}
+    source = FractionSource(index, cats, segment_ms=segment_ms)
 
-    checked, ok, mism = verify_recompute(verify_rows, source, spec)
+    checked, ok, mism = verify_recompute(verify_rows, index, segment_ms)
     rep.update(checked=checked, ok=ok, mism=mism)
     agreement = (ok / checked) if checked else None
     if checked == 0:
@@ -241,10 +263,15 @@ def backfill_fractions(rows, site, ann_roots, spec: DataSpec, verify_rows,
         rep["verified"] = True
 
     for r in rows:
-        if r["site"] != site or int(r["tagged"]):
+        if r["site"] != site:
             continue
-        if int(r["bucket"]) not in TAG_BEARING_BUCKETS:
-            continue
+        if not rebackfill_all:
+            if int(r["tagged"]) or int(r["bucket"]) not in TAG_BEARING_BUCKETS:
+                continue
+        # --rebackfill-all takes EVERY clip, including buckets 0/4/5. It has to:
+        # a bucket-1 clip carries a real `_stim0.60` tag but nothing about tube,
+        # and a tube-only window is bucket 5 — so skipping either leaves
+        # frac_suction_tube at a false 0.00 on exactly the clips that need it.
         rep["candidates"] += 1
         stem = Path(r["video_path"]).stem
         got = source.fractions(r["case_id"], stem)
@@ -260,8 +287,16 @@ def backfill_fractions(rows, site, ann_roots, spec: DataSpec, verify_rows,
                 why = "no annotation file for this case"
             rep["unfilled"][why] += 1
             rep["unfilled_cases"].setdefault(why, set()).add(r["case_id"])
+            # Under --rebackfill-all a clip may already be marked tagged from its
+            # filename while the columns the SPLIT needs stay at a false zero.
+            # Un-tag it so DataSpec falls back to bucket+directory — which, for
+            # activities no directory names, means the clip is dropped. Dropped
+            # is recoverable; a silent zero is not.
+            if rebackfill_all and int(r["tagged"]):
+                r["tagged"] = 0
+                rep["untagged"] += 1
             continue
-        for a in spec.activities:
+        for a in (frac_activities or spec.activities):
             r[f"frac_{a}"] = f"{got[a]:.2f}"
         r["tagged"] = 1
         rep["filled"] += 1
@@ -295,9 +330,12 @@ def report_backfill(reports, spec: DataSpec):
             print("              clips stay untagged and keep their bucket+directory "
                   "label")
             continue
-        print(f"    filled  : {rep['filled']:,} / {rep['candidates']:,} untagged "
-              f"tag-bearing clips"
+        print(f"    filled  : {rep['filled']:,} / {rep['candidates']:,} clip(s)"
               + ("" if rep["verified"] else "   [UNVERIFIED]"))
+        if rep["untagged"]:
+            print(f"    un-tagged: {rep['untagged']:,} clip(s) had a filename tag but "
+                  f"could not be recomputed;\n              marked untagged so they are "
+                  f"dropped rather than given a false 0.00")
         for why, n in sorted(rep["unfilled"].items(), key=lambda kv: -kv[1]):
             cases = sorted(rep["unfilled_cases"].get(why, ()))
             print(f"              {n:,} clip(s) across {len(cases)} case(s) NOT "
@@ -432,6 +470,18 @@ def main():
     p.add_argument("--min-agreement", type=float, default=0.99,
                    help="Fraction of existing tags a backfill must reproduce before it "
                         "is applied (default 0.99).")
+    p.add_argument("--rebackfill-all", action="store_true",
+                   help="Recompute fractions for EVERY clip, not just the untagged "
+                        "ones. REQUIRED when the data config slices an activity more "
+                        "finely than the filenames do (e.g. suction split by device): "
+                        "a clip with a real `_stim0.60` tag is otherwise skipped and "
+                        "keeps a false 0.00 in the new columns.")
+    p.add_argument("--extra-frac", action="append", default=None, metavar="ACTIVITY",
+                   help="Also compute and store frac_<ACTIVITY> even though the data "
+                        "config does not list it. Use `--extra-frac suction` alongside "
+                        "the per-device config so ONE manifest serves both label "
+                        "regimes and they share a split — otherwise the aggregated and "
+                        "the split runs are not comparable. Repeatable.")
     p.add_argument("--allow-unverified-backfill", action="store_true",
                    help="Apply the backfill even when verification fails or is "
                         "impossible. Every affected clip is marked tagged, so this "
@@ -442,13 +492,26 @@ def main():
     spec = DataSpec.load(args.data_config)
     print(spec.describe())
 
+    # Column list = the spec's activities plus any --extra-frac. Storing the
+    # legacy aggregate next to the split lets one manifest (and therefore one
+    # case split) serve both configs, which is the only way the split's effect
+    # is attributable to the split.
+    frac_activities = list(spec.activities)
+    for a in (args.extra_frac or []):
+        if a not in frac_activities:
+            frac_activities.append(a)
+    if args.extra_frac:
+        print(f"[INFO] extra fraction column(s): "
+              f"{[a for a in frac_activities if a not in spec.activities]}")
+
     all_rows, per_site_buckets, per_site_n = [], {}, {}
     dir_census, structural = Counter(), []
     for site, root in args.root:
         if not root.exists():
             print(f"[WARN] root does not exist: {root} (site={site}) — skipping")
             continue
-        rows, buckets, unparsed, dirs, bad = scan_root(site, root, spec)
+        rows, buckets, unparsed, dirs, bad = scan_root(site, root, spec,
+                                                       frac_activities)
         dir_census.update(dirs)
         structural.extend(bad[:5 - len(structural)])
         per_site_buckets[site] = buckets
@@ -481,15 +544,16 @@ def main():
             if not vpath.exists():
                 print(f"[WARN] --verify-root {vsite}={vpath} does not exist — ignored")
                 continue
-            vrows, *_ = scan_root(site, vpath, spec)
+            vrows, *_ = scan_root(site, vpath, spec, frac_activities)
             verify_rows += [r for r in vrows if int(r["tagged"])]
             print(f"[INFO] {site}: verifying against {len(vrows):,} clips from {vpath}")
         backfill_reports.append(backfill_fractions(
             all_rows, site, dirs, spec, verify_rows,
-            args.min_agreement, args.allow_unverified_backfill, args.segment_ms))
+            args.min_agreement, args.allow_unverified_backfill, args.segment_ms,
+            rebackfill_all=args.rebackfill_all, frac_activities=frac_activities))
 
     fieldnames = (["video_path", "case_id", "site", "bucket", "clip_dir", "tagged"]
-                  + spec.frac_columns())
+                  + [f"frac_{a}" for a in frac_activities])
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -500,6 +564,18 @@ def main():
     print("Per site:", per_site_n)
     if backfill_reports:
         report_backfill(backfill_reports, spec)
+    # An activity no clip DIRECTORY can name has no fallback: if its fraction is
+    # not recomputed, the clip is dropped rather than mislabelled. Worth stating,
+    # because it turns "some annotations are missing" into "these clips are gone".
+    unnameable = [a for a in spec.activities
+                  if not any(a in (BUCKET_DIR_WORD.get(b) or "") for b in BUCKET_DIR_WORD)
+                  and a not in BUCKET_DIR_WORD.values()]
+    if unnameable and any(not int(r["tagged"]) for r in all_rows):
+        n = sum(1 for r in all_rows if not int(r["tagged"]))
+        print(f"\n[WARN] {n:,} clip(s) remain untagged, and {unnameable} cannot be "
+              f"recovered\n       from a directory name — those clips will be DROPPED "
+              f"by DataSpec, not\n       mislabelled. Give --annotations more "
+              f"directories to shrink this.")
     report_tag_coverage(all_rows, list(per_site_buckets), spec)
     report_directory_recovery(dir_census, spec)
     if structural:

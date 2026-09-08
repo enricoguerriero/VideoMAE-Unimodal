@@ -61,16 +61,28 @@ HAYDOM_ANNOTATION_DIRS=(
 HAYDOM_VERIFY="/spo/LS-Haydom/ProcessedData/Athavan_Frida/Data_processing/Processed_data_stratified_BIG_update_strict_label_test/videos"
 DRC_ANNOTATIONS="/spo/LS-DRC/ProcessedData/Athavan_Frida/Data_processing/Unprocessed_data/anot_files"
 
-BACKFILL_ARGS=()
+# --rebackfill-all is not optional once a data config slices an activity more
+# finely than the filenames do. Filenames only ever carried `_stim/_vent/_suct`,
+# so a bucket-1 clip looks fully tagged while knowing nothing about tube: without
+# this flag it keeps a false frac_suction_tube=0.00. --extra-frac suction stores
+# the legacy aggregate next to the per-device columns, so ONE manifest and ONE
+# case split serve both configs/data_multilabel.yaml (control) and
+# configs/data_suction3.yaml (per-device) — the only way the split's effect is
+# attributable to the split rather than to a reshuffled test set.
+BACKFILL_ARGS=(--rebackfill-all --extra-frac suction)
 if [[ "$BACKFILL" == "1" ]]; then
     for d in "${HAYDOM_ANNOTATION_DIRS[@]}"; do
         [[ -d "$d" ]] && BACKFILL_ARGS+=(--annotations "Haydom=$d")
     done
     [[ -d "$HAYDOM_VERIFY" ]] && BACKFILL_ARGS+=(--verify-root "Haydom=$HAYDOM_VERIFY")
     [[ -d "$DRC_ANNOTATIONS" ]] && BACKFILL_ARGS+=(--annotations "DRC=$DRC_ANNOTATIONS")
-    if [[ ${#BACKFILL_ARGS[@]} -eq 0 ]]; then
+    if [[ ${#BACKFILL_ARGS[@]} -eq 2 ]]; then
         echo "[WARN] BACKFILL=1 but no annotation directory exists — building untagged."
+        echo "       A per-device config CANNOT work from an untagged manifest: no"
+        echo "       directory names suction_penguin/bulb/tube, so those clips drop."
     fi
+else
+    BACKFILL_ARGS=()
 fi
 
 python -m src.data.build_manifest \

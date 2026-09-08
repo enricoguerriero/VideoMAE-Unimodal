@@ -46,7 +46,7 @@ test_data:
 
 # ---------------------------------------------------------------- runtime
 device: cuda
-batch_size: 4            # thesis MoViNet used 48; VideoMAE is heavier — tune to VRAM
+batch_size: 32            # thesis MoViNet used 48; VideoMAE is heavier — tune to VRAM
 num_workers: 8
 num_epochs: 20
 train_backbone: true     # full-backbone fine-tuning (VideoMAE has no LoRA)
