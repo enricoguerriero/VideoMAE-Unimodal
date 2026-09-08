@@ -21,3 +21,4 @@ inference_output/
 
 # audit / investigation reports
 audit_reports/
+wandb_*

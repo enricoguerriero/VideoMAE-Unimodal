@@ -279,6 +279,8 @@ def report_backfill(reports, spec: DataSpec):
                   f"director{'y' if len(idx.dirs) == 1 else 'ies'}")
             for d in idx.dirs[:4]:
                 print(f"              {d}")
+            if len(idx.dirs) > 4:
+                print(f"              ... and {len(idx.dirs) - 4} more")
         if rep["checked"]:
             pct = 100 * rep["ok"] / rep["checked"]
             print(f"    verify  : {rep['ok']:,}/{rep['checked']:,} existing tags "
