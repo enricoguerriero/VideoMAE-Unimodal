@@ -272,21 +272,32 @@ try:
     q = subprocess.run(["nvidia-smi", "--query-gpu=memory.total",
                         "--format=csv,noheader,nounits"],
                        capture_output=True, text=True, check=True)
-    total = int(q.stdout.split()[int(os.environ.get("GPU", "0"))]) / 1024
+    gpus = [g.strip() for g in os.environ.get("GPU", "0").split(",") if g.strip()]
+    mem = q.stdout.split()
+    total = min(int(mem[int(g)]) for g in gpus) / 1024
 except Exception:
     print("  vram    could not read GPU memory; skipping the estimate"); raise SystemExit(0)
 
-bs = (yaml.safe_load(open("configs/config.yaml")) or {}).get("batch_size", 8)
+cfg = yaml.safe_load(open("configs/config.yaml")) or {}
+bs = cfg.get("batch_size", 8)
+# batch_size is the TOTAL; DataParallel gives each device bs/n_gpus, so the
+# per-device peak — the number that decides whether it OOMs — is that share.
+# Estimating from the total on a multi-GPU run understates the usable batch by
+# exactly the GPU count, which is how a run that would fit gets talked down.
+n_gpu = len(gpus) if cfg.get("data_parallel", "auto") not in (False, "false", "off", None) else 1
+per_dev = bs / max(n_gpu, 1)
 full_state, head_state = params * 16 / 1e9, params * 4 / 1e9
-full_peak = full_state + act_per_clip * bs + OVERHEAD
-head_peak = head_state + 0.15 * bs + OVERHEAD
+full_peak = full_state + act_per_clip * per_dev + OVERHEAD
+head_peak = head_state + 0.15 * per_dev + OVERHEAD
 
-print(f"  vram    {total:.0f} GB total | at batch_size={bs}: "
+where = (f"batch_size={bs} over {n_gpu} GPUs = {per_dev:.0f}/device"
+         if n_gpu > 1 else f"batch_size={bs}")
+print(f"  vram    {total:.0f} GB/device | at {where}: "
       f"full ~{full_peak:.0f} GB, head-only ~{head_peak:.0f} GB")
 if head_peak > total:
     print(f"  WARN    even the HEAD-ONLY runs may not fit. Lower batch_size.")
 if full_peak > total:
-    fits = int((total - full_state - OVERHEAD) // act_per_clip)
+    fits = int((total - full_state - OVERHEAD) // act_per_clip) * max(n_gpu, 1)
     print(f"  WARN    the 6 FULL fine-tuning runs will very likely OOM.")
     print(f"          {full_state:.1f} GB of optimiser state + "
           f"{act_per_clip * bs:.1f} GB of activations at batch_size={bs} "

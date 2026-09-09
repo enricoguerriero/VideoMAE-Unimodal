@@ -5,6 +5,7 @@
 # Usage: bash scripts/train.sh [MODEL] [GPU] [DATA_CONFIG] [EXTRA...]
 #
 #   bash scripts/train.sh VideoMAE 0                                 # multilabel (config default)
+#   bash scripts/train.sh VideoMAE 0,1                               # both GPUs (DataParallel)
 #   bash scripts/train.sh VideoMAE 0 configs/data.yaml               # 4-class, thesis-comparable
 #   bash scripts/train.sh VideoMAE 0 configs/data.yaml --sites Haydom  # one hospital only
 #
@@ -32,6 +33,8 @@ if [[ ${#POS[@]} -gt 3 ]]; then
 fi
 
 MODEL="${POS[0]:-VideoMAE}"          # VideoMAE | VideoMAEGiant
+# Comma-separated for multi-GPU, e.g. 0,1 — it becomes CUDA_VISIBLE_DEVICES, and
+# src/training.py spreads `batch_size` (the TOTAL) across everything it sees.
 GPU="${POS[1]:-0}"
 DATA_CONFIG="${POS[2]:-}"
 

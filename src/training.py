@@ -34,6 +34,7 @@ import os
 from datetime import datetime
 
 import torch
+import torch.nn as nn
 import yaml
 from torch.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_
@@ -158,6 +159,66 @@ def alloc_targets(n, spec):
     return torch.empty((n,), dtype=torch.long), None
 
 
+class _AutocastForward(nn.Module):
+    """Run the wrapped module's forward INSIDE autocast.
+
+    Needed only for nn.DataParallel. `torch.autocast` state is THREAD-LOCAL and
+    DataParallel runs each replica in its own thread, so an autocast context
+    entered in the training loop never reaches them: the replicas would silently
+    execute in fp32, roughly doubling activation memory and erasing the point of
+    the second GPU. Entering autocast inside forward puts it on the replica's own
+    thread, which is what the PyTorch AMP docs prescribe for DataParallel.
+    """
+
+    def __init__(self, module: nn.Module, dtype):
+        super().__init__()
+        self.module = module
+        self.dtype = dtype
+
+    def forward(self, *args, **kwargs):
+        with autocast(device_type="cuda", dtype=self.dtype):
+            return self.module(*args, **kwargs)
+
+
+def unwrap(model: nn.Module) -> nn.Module:
+    """The real model behind any DataParallel / autocast wrappers.
+
+    Checkpoints store `backbone` / `classifier` / `attention_pooling`
+    component-wise, so going through this keeps the saved format byte-identical
+    whether or not the run used two GPUs — test.py loads either without knowing.
+    Saving a wrapped model instead would prefix every key with `module.` and the
+    checkpoint would only load back into a DataParallel model.
+    """
+    while isinstance(model, (nn.DataParallel, _AutocastForward)):
+        model = model.module
+    return model
+
+
+def resolve_data_parallel(config, logger) -> list:
+    """Which CUDA devices to spread each batch over. [] = single device.
+
+    `batch_size` in the config is the TOTAL batch; DataParallel splits it across
+    the devices, so 256 over two GPUs is 128 each. Sizing memory from the config
+    number rather than the per-device one is the easy way to OOM.
+    """
+    want = config.get("data_parallel", "auto")
+    n = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if want in (False, "false", "off", None) or n < 2:
+        if want not in (False, "false", "off", None) and n < 2:
+            logger.info(f"data_parallel={want!r} but {n} CUDA device(s) visible — "
+                        f"single-device. Pass GPU=\"0,1\" to expose both.")
+        return []
+    ids = list(range(n))
+    bs = int(config.get("batch_size", 8))
+    if bs % len(ids):
+        logger.warning(f"batch_size={bs} is not divisible by {len(ids)} GPUs — "
+                       f"DataParallel will send an uneven last shard, which is "
+                       f"valid but wastes memory on device 0.")
+    logger.info(f"DataParallel over CUDA devices {ids}: batch_size={bs} total, "
+                f"~{bs // len(ids)} per device.")
+    return ids
+
+
 def run_validation(model, val_loader, criterion, device, amp_dtype, n_val, spec,
                    minority_class):
     """Full pass over the validation loader.
@@ -270,6 +331,8 @@ def main():
                   select_sites(config["validation_data"], args.sites, "validation", logger))
 
     device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    # Needed before the model is wrapped, because _AutocastForward takes it.
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     model = load_model(args.model, spec=spec, **config.get("model_params", {}))
     model = model.to(device)
 
@@ -344,15 +407,27 @@ def main():
     model.to(device)
     logger.info(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
+    # Wrap LAST: build_classifier, the freeze/unfreeze pass and .to(device) all
+    # reach for model.backbone / .classifier / .attn_pool, and every one of those
+    # would have to become model.module.* if the wrapper went on earlier.
+    core = model
+    dp_ids = resolve_data_parallel(config, logger)
+    if dp_ids:
+        model = nn.DataParallel(_AutocastForward(model, amp_dtype), device_ids=dp_ids)
+
     # ------------------------------------------------------------- optimizer
     if config.get("learning_rate", None) is not None:
         optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
                                       lr=config["learning_rate"], weight_decay=config.get("weight_decay", 1e-3))
     else:
-        backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
-        head_params = list(model.classifier.parameters())
+        # `core`, not `model`: DataParallel proxies forward() and nothing else, so
+        # model.backbone raises AttributeError once wrapped. The parameter objects
+        # are shared with the wrapper, so the optimiser still updates the master
+        # copy that DataParallel replicates each step.
+        backbone_params = [p for p in core.backbone.parameters() if p.requires_grad]
+        head_params = list(core.classifier.parameters())
         if config.get("attention_pooling", False):
-            head_params += list(model.attn_pool.parameters())
+            head_params += list(core.attn_pool.parameters())
         optimizer = torch.optim.AdamW(
             [{"params": backbone_params, "lr": config.get("backbone_lr", 1e-5)},
              {"params": head_params, "lr": config.get("classifier_lr", 5e-5)}],
@@ -382,7 +457,6 @@ def main():
         scheduler_type = "cosine"
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     scaler = GradScaler(enabled=(amp_dtype == torch.float16))
 
     N = len(train_dataset)
@@ -399,10 +473,10 @@ def main():
     def save_ckpt(tag, epoch, metrics, val_loss):
         path = os.path.join(ckpt_dir, f"{run_label}_{tag}_{run_ts}.pt")
         torch.save({
-            "backbone": model.backbone.state_dict(),
-            "classifier": model.classifier.state_dict(),
-            "attention_pooling": model.attn_pool.state_dict() if model.attn_pool is not None else None,
-            "processor": model.processor,
+            "backbone": core.backbone.state_dict(),
+            "classifier": core.classifier.state_dict(),
+            "attention_pooling": core.attn_pool.state_dict() if core.attn_pool is not None else None,
+            "processor": core.processor,
             "epoch": epoch, "val_loss": val_loss,
             "metrics": {k: v for k, v in metrics.items() if not k.startswith("cm/")},
             "classifier_config": config.get("classifier_config", {}),
@@ -510,10 +584,10 @@ def main():
     final_path = os.path.join(config.get("save_path", "models/"), f"{run_label}_final_{run_ts}.pt")
     os.makedirs(os.path.dirname(final_path) or ".", exist_ok=True)
     torch.save({
-        "backbone": model.backbone.state_dict(),
-        "classifier": model.classifier.state_dict(),
-        "attention_pooling": model.attn_pool.state_dict() if model.attn_pool is not None else None,
-        "processor": model.processor,
+        "backbone": core.backbone.state_dict(),
+        "classifier": core.classifier.state_dict(),
+        "attention_pooling": core.attn_pool.state_dict() if core.attn_pool is not None else None,
+        "processor": core.processor,
         "classifier_config": config.get("classifier_config", {}),
         "config": config,
         "data_spec": spec.to_dict(),

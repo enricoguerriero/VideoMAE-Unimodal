@@ -58,6 +58,44 @@ def log(payload: dict) -> None:
         wandb.log(payload)
 
 
+def log_results_table(all_metrics: dict, spec, name: str = "test/summary") -> None:
+    """One sortable table: a row per (test set, class), plus a MACRO row each.
+
+    Per-site per-class results are ~40 separate scalars, and no panel
+    arrangement makes 40 scalars scan well — you cannot see "suction_penguin is
+    fine at DRC and broken at Haydom" in a wall of single-value tiles. As a
+    table it is one glance, and it sorts and pivots in the UI.
+
+    `support` and `n_supervised` travel in the same row on purpose. A class F1
+    means something quite different at support 173 than at 820, and in
+    multilabel `n_supervised` says how many clips were even eligible to speak to
+    that class after masking — read either number without the other and a
+    threshold artefact looks like a model result.
+    """
+    if not available():
+        return
+    columns = ["test_set", "class", "precision", "recall", "f1", "ap",
+               "support", "n_supervised"]
+    table = wandb.Table(columns=columns)
+    classes = list(spec.activities) if spec.is_multilabel else list(spec.class_names)
+
+    def _get(m, key):
+        v = m.get(key)
+        return None if v is None else float(v)
+
+    for tname, m in all_metrics.items():
+        for c in classes:
+            table.add_data(tname, c,
+                           _get(m, f"{c}/precision"), _get(m, f"{c}/recall"),
+                           _get(m, f"{c}/f1"), _get(m, f"{c}/ap"),
+                           _get(m, f"{c}/support"), _get(m, f"{c}/n_supervised"))
+        table.add_data(tname, "MACRO",
+                       _get(m, "macro/precision"), _get(m, "macro/recall"),
+                       _get(m, "macro/f1"), _get(m, "macro/ap"),
+                       None, _get(m, "n_fully_supervised"))
+    wandb.log({name: table})
+
+
 def log_metrics(metrics: dict, prefix: str, extra: dict | None = None) -> None:
     """Log the scalar part of a metrics dict under `prefix` (e.g. 'val/')."""
     if not available():

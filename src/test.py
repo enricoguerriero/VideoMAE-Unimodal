@@ -218,6 +218,9 @@ def main():
         raise SystemExit("no test set produced any metrics — check the paths above.")
 
     report_comparison(all_metrics, spec, minority_class, logger)
+    # The same numbers as one sortable grid instead of ~40 scalar panels. This is
+    # what scripts/wandb_report.py points its table panel at.
+    wu.log_results_table(all_metrics, spec)
 
     # Store every test set's outputs in wandb so they persist with the run.
     wu.log_artifact(
