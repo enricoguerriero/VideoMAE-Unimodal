@@ -181,7 +181,10 @@ done
 
 # ---------------------------------------------------------------- 5. the audit
 banner "5. FULL AUDIT — scripts/audit_source_data.py"
-AUDIT_ARGS=(--site "Haydom=$HAYDOM_BASE" --site "DRC=$DRC_BASE")
+# `--out -` keeps the audit printing to stdout: this script already tees
+# EVERYTHING into $REPORT, so letting the audit open a second report file would
+# split one investigation across two files and drop its body from ours.
+AUDIT_ARGS=(--site "Haydom=$HAYDOM_BASE" --site "DRC=$DRC_BASE" --out -)
 for r in "${HAYDOM_ROOTS[@]}" "${DRC_ROOTS[@]}"; do
     [[ -d "$r" ]] && AUDIT_ARGS+=(--find-annotations "$r")
 done

@@ -12,8 +12,16 @@ are, and the folder names on the VM suggest they may not be:
 Those describe different pipeline configurations. This script checks the data
 itself rather than the names.
 
-WRITES NOTHING. Opens every file read-only and prints to stdout. Redirect if you
-want to keep the report:  python scripts/audit_source_data.py > audit.txt
+WRITES NOTHING it reads. Opens every source file read-only; the only file it
+creates is its own report. The full report is ~1,500 lines, so it goes to a
+timestamped TXT and only section 9 (FINDINGS) is echoed to the terminal:
+
+    python scripts/audit_source_data.py
+    #   -> audit_reports/audit_source_data_<timestamp>.txt   (everything)
+    #   -> terminal: the site discovery lines, per-section progress, FINDINGS
+
+    python scripts/audit_source_data.py --out my_report.txt   # name it
+    python scripts/audit_source_data.py --out -               # all to stdout
 
 STDLIB ONLY — no numpy, pandas, torch or av. It runs in a broken environment,
 which is when you most want it.
@@ -89,6 +97,7 @@ import argparse
 import re
 import sys
 from collections import Counter, defaultdict
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -242,6 +251,35 @@ def note(msg: str) -> None:
     """Good news: a capability the data turns out to have. Kept out of FINDINGS
     so a clean corpus reports zero problems rather than a pile of positives."""
     NOTES.append(msg)
+
+
+class Tee:
+    """Write to several streams at once.
+
+    Used so the short, orienting parts of the run (which site paths and clip
+    vintages were picked, the per-section progress, and section 9) reach the
+    terminal AND the report, while the ~1,500 lines of section bodies go only
+    to the report. Redirecting the whole thing with `>` would have hidden the
+    findings too, which are the part you read first.
+    """
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for st in self.streams:
+            st.write(text)
+        return len(text)
+
+    def flush(self):
+        for st in self.streams:
+            try:
+                st.flush()
+            except (ValueError, OSError):
+                pass
+
+    def isatty(self):
+        return False
 
 
 def rule(title: str) -> None:
@@ -1445,6 +1483,13 @@ def main():
                    help="Clips per site to use for the section-6 recomputation "
                         "(0 = all; default 4000, which is plenty).")
     p.add_argument("--skip", default="", help="Comma-separated section numbers to skip.")
+    p.add_argument("--out", default=None, metavar="PATH",
+                   help="Where to write the full report. Default: "
+                        "audit_reports/audit_source_data_<timestamp>.txt. The "
+                        "terminal then shows only the site discovery lines, "
+                        "per-section progress and section 9 (FINDINGS). Pass "
+                        "`--out -` to print everything to stdout instead, which "
+                        "is what this script used to do.")
     p.add_argument("--find-annotations", action="append", default=None, metavar="DIR",
                    help="Search DIR recursively for annotation .txt files. Matching "
                         "is by case KEY (exact stem, or any >= 5-digit run in it), so "
@@ -1456,8 +1501,24 @@ def main():
     clip_over = dict(args.clips) if args.clips else {}
     skip = {s.strip() for s in args.skip.split(",") if s.strip()}
 
+    # `term` stays the real terminal for the whole run, so progress lines can be
+    # written even while sys.stdout points at the report.
+    term, term_err = sys.stdout, sys.stderr
+    report = report_path = None
+    if args.out != "-":
+        report_path = (Path(args.out) if args.out else Path("audit_reports")
+                       / f"audit_source_data_{datetime.now():%Y%m%d_%H%M%S}.txt")
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report = report_path.open("w")
+        # Header and site discovery are short and say WHICH paths were picked —
+        # the first thing to check when a section reads oddly — so tee them.
+        sys.stdout = Tee(report, term)
+        sys.stderr = Tee(report, term_err)
+
     print("audit_source_data.py — READ-ONLY. Nothing on disk is modified.")
     print(f"python {sys.version.split()[0]}   (stdlib only)")
+    if report_path is not None:
+        print(f"full report -> {report_path}")
 
     sites = {}
     for name, base in raw_sites.items():
@@ -1496,6 +1557,10 @@ def main():
         global HUNT_RESULT
         HUNT_RESULT = section_hunt(sites_, a.find_annotations or [])
 
+    if report is not None:
+        sys.stdout = report          # section bodies: report only
+        sys.stderr = report
+
     for num, fn in [("0", lambda: section_layout(sites)),
                     ("1", lambda: section_format(sites)),
                     ("2", lambda: section_vocabulary(sites)),
@@ -1511,7 +1576,11 @@ def main():
                     ("11", lambda: section_policy(sites))]:
         if num in skip:
             print(f"\n[skipped section {num}]")
+            if report is not None:
+                print(f"  [skip] section {num}", file=term, flush=True)
             continue
+        if report is not None:
+            print(f"  [run ] section {num} ...", file=term, flush=True)
         try:
             fn()
         except Exception as exc:                       # noqa: BLE001 - report, continue
@@ -1520,7 +1589,20 @@ def main():
             traceback.print_exc()
             finding(f"section {num} crashed ({type(exc).__name__}: {exc}) — its checks "
                     f"did not run")
+            if report is not None:
+                print(f"  [FAIL] section {num}: {type(exc).__name__}: {exc}",
+                      file=term, flush=True)
+
+    # FINDINGS goes to both: it is the section you read first, and it is short.
+    if report is not None:
+        sys.stdout = Tee(report, term)
+        sys.stderr = Tee(report, term_err)
     section_findings()
+    if report is not None:
+        sys.stdout, sys.stderr = term, term_err
+        report.close()
+        print(f"\nfull report ({report_path.stat().st_size / 1024:.0f} KB) "
+              f"-> {report_path}")
 
 
 if __name__ == "__main__":
