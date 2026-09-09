@@ -30,8 +30,127 @@ Expected input layout (per site):
 
 import os
 
-import cv2
-import pandas as pd
+# cv2 and pandas are imported INSIDE the methods that need them, not here.
+# `label_window` / `bucket_for_label` below are pure and stdlib-only, and
+# src/data/recut_site.py --dry-run imports them to project a bucket census in an
+# environment that may have neither installed — the same reason annotations.py
+# and scripts/audit_source_data.py are stdlib-only. Cutting clips still needs
+# both; that import just happens at the point of use.
+
+
+#: The thesis' constants, as module-level defaults so the pure `label_window`
+#: below carries them and the class no longer owns the only copy.
+STRONG_THRESHOLD = 0.5       # stimulation / ventilation
+SUCTION_THRESHOLD = 0.25     # suction is brief; the thesis used a lower bar
+NON_TARGET_THRESHOLD = 0.20  # explicit non-target
+WEAK_THRESHOLD = 0.20        # purity guard for "other" target leakage
+
+
+def label_window(stim, vent, suct, nt, other, length_clip,
+                 strong=STRONG_THRESHOLD, suction=SUCTION_THRESHOLD,
+                 non_target=NON_TARGET_THRESHOLD, weak=WEAK_THRESHOLD,
+                 for_predict=False) -> str:
+    """Per-activity overlap (ms) within one window -> the thesis' label string.
+
+    Extracted VERBATIM from `label_all_clips`, which now delegates to it. It is
+    a pure function of the five overlap totals, so anything that already knows
+    the annotation intervals can predict the label WITHOUT decoding video —
+    which is what lets `src/data/recut_site.py --dry-run` project an exact
+    bucket census before spending hours in ffmpeg. A second copy of this
+    cascade would be free to drift from the one that cuts the clips; there is
+    deliberately only one.
+    """
+    if for_predict:
+        max_overlap = max(stim, vent, suct)
+        if max_overlap >= length_clip * strong:
+            return ("Stimulation" if max_overlap == stim else
+                    "Ventilation" if max_overlap == vent else "Suction")
+        return "Non-target"
+
+    stim_strong = stim >= length_clip * strong
+    vent_strong = vent >= length_clip * strong
+    suct_strong = suct >= length_clip * suction
+    strong_count = int(stim_strong) + int(vent_strong) + int(suct_strong)
+    stim_weak = stim >= length_clip * weak
+    vent_weak = vent >= length_clip * weak
+    suct_weak = suct >= length_clip * weak
+    stim_any, vent_any, suct_any = stim > 0, vent > 0, suct > 0
+
+    if strong_count >= 2:
+        combo = "+".join(sorted(
+            [n for n, f in (("stimulation", stim_strong), ("ventilation", vent_strong),
+                            ("suction", suct_strong)) if f]))
+        return f"Target overlap:{combo}"
+    if stim_strong and not vent_weak and not suct_weak:
+        return "Stimulation"
+    if vent_strong and not stim_weak and not suct_weak and other == 0:
+        return "Ventilation"
+    if suct_strong and not stim_weak and not vent_weak:
+        return "Suction"
+    if (nt >= length_clip * non_target and not stim_any and not vent_any
+            and not suct_any and other == 0):
+        return "Non-target"
+
+    any_count = int(stim_any) + int(vent_any) + int(suct_any)
+    if not stim_any and not vent_any and not suct_any and nt == 0 and other == 0:
+        return "No overlap"
+    if any_count == 1:
+        which = "Stimulation" if stim_any else ("Ventilation" if vent_any else "Suction")
+        return f"Partial:{which}"
+    if any_count >= 2:
+        combo = "+".join(sorted(
+            [n for n, f in (("stimulation", stim_any), ("ventilation", vent_any),
+                            ("suction", suct_any)) if f]))
+        return f"Target overlap partial:{combo}"
+    return "No label"
+
+
+def windows(video_duration_ms, effective_duration_ms, segment_ms=3000, shift_ms=1000):
+    """The (start, end) window pairs `split_video` emits, as a pure function.
+
+    Extracted for the same reason as `label_window`: the clip COUNT is decided
+    here and the LABEL there, so a dry run needs both to project a census that
+    matches what the cut will write. Note the asymmetric stop condition, which
+    is the thesis' and is kept exactly: a window must START before the last
+    annotation ends, but must END within the video — so the unannotated tail of
+    an episode is never cut, while its unannotated head is.
+    """
+    out = []
+    start, end = 0, segment_ms
+    while start < effective_duration_ms and end <= video_duration_ms:
+        out.append((start, end))
+        start += shift_ms
+        end += shift_ms
+    return out
+
+
+def bucket_for_label(label: str):
+    """Label string -> (bucket number, output subdirectory).
+
+    The trailing `_N` of every clip filename and the directory it is filed
+    under, both of which `build_manifest.py` reads back. Extracted from
+    `save_clips` for the same reason as `label_window`: the dry run must
+    project the SAME buckets the cut will write.
+    """
+    if label == "Stimulation":
+        return 1, "videos/stimulation/"
+    if label == "Ventilation":
+        return 2, "videos/ventilation/"
+    if label == "Suction":
+        return 3, "videos/suction/"
+    if label == "Non-target":
+        return 0, "videos/non_target/"
+    if label == "No overlap":
+        return 4, "videos/no_overlap/"
+    if label == "No label":
+        return 5, "videos/no_label/"
+    if label.startswith("Partial:"):
+        return 6, f"videos/partial/{label.split(':')[1].lower()}/"
+    if label.startswith("Target overlap:"):
+        return 7, f"videos/target_overlap/{label.split(':')[1]}/"
+    if label.startswith("Target overlap partial:"):
+        return 8, f"videos/partial/{label.split(':')[1]}/"
+    return 5, "videos/no_label/"
 
 
 class VideoDataProcessor:
@@ -83,6 +202,7 @@ class VideoDataProcessor:
         return merged
 
     def load_annotation_data(self):
+        import pandas as pd
         path = os.path.join(self.BasePath, "Unprocessed_data", "anot_files", self.annotation_file)
         with open(path, "r") as file:
             lines = file.readlines()
@@ -127,6 +247,7 @@ class VideoDataProcessor:
 
     # ------------------------------------------------------------------ video
     def load_video_data(self):
+        import cv2
         path = os.path.join(self.BasePath, "Unprocessed_data", "videos", self.video_file)
         cap = cv2.VideoCapture(path)
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -138,9 +259,7 @@ class VideoDataProcessor:
         return video_duration_ms, cap, fps, frame_width, frame_height
 
     def split_video(self):
-        clips = []
-        start_time, segment_duration = 0, self.segment_size * 1000
-        end_time = start_time + segment_duration
+        import pandas as pd
         video_duration, _, _, _, _ = self.load_video_data()
 
         path = os.path.join(self.BasePath, "Unprocessed_data", "anot_files", self.annotation_file)
@@ -152,11 +271,8 @@ class VideoDataProcessor:
         df_an["End"] = df_an["End"].astype(int)
         effective_duration = min(video_duration, df_an["End"].max()) if len(df_an) else video_duration
 
-        while start_time < effective_duration and end_time <= video_duration:
-            clips.append((start_time, end_time))
-            start_time += self.shift * 1000
-            end_time += self.shift * 1000
-        return clips
+        return windows(video_duration, effective_duration,
+                       self.segment_size * 1000, self.shift * 1000)
 
     # ------------------------------------------------------------------ labeling
     @staticmethod
@@ -189,50 +305,11 @@ class VideoDataProcessor:
             nt = self.overlap_ms(clip_start, clip_end, nt_iv)
             other = self.overlap_ms(clip_start, clip_end, other_iv)
 
-            if not self.for_predict:
-                stim_strong = stim >= length_clip * self.STRONG_THRESHOLD
-                vent_strong = vent >= length_clip * self.STRONG_THRESHOLD
-                suct_strong = suct >= length_clip * self.suction_threshold
-                strong_count = int(stim_strong) + int(vent_strong) + int(suct_strong)
-                stim_weak = stim >= length_clip * self.weak_threshold
-                vent_weak = vent >= length_clip * self.weak_threshold
-                suct_weak = suct >= length_clip * self.weak_threshold
-                stim_any, vent_any, suct_any = stim > 0, vent > 0, suct > 0
-
-                if strong_count >= 2:
-                    combo = "+".join(sorted(
-                        [n for n, f in (("stimulation", stim_strong), ("ventilation", vent_strong),
-                                        ("suction", suct_strong)) if f]))
-                    label = f"Target overlap:{combo}"
-                elif stim_strong and not vent_weak and not suct_weak:
-                    label = "Stimulation"
-                elif vent_strong and not stim_weak and not suct_weak and other == 0:
-                    label = "Ventilation"
-                elif suct_strong and not stim_weak and not vent_weak:
-                    label = "Suction"
-                elif nt >= length_clip * self.non_target_threshold and not stim_any and not vent_any and not suct_any and other == 0:
-                    label = "Non-target"
-                else:
-                    any_count = int(stim_any) + int(vent_any) + int(suct_any)
-                    if not stim_any and not vent_any and not suct_any and nt == 0 and other == 0:
-                        label = "No overlap"
-                    elif any_count == 1:
-                        which = "Stimulation" if stim_any else ("Ventilation" if vent_any else "Suction")
-                        label = f"Partial:{which}"
-                    elif any_count >= 2:
-                        combo = "+".join(sorted(
-                            [n for n, f in (("stimulation", stim_any), ("ventilation", vent_any),
-                                            ("suction", suct_any)) if f]))
-                        label = f"Target overlap partial:{combo}"
-                    else:
-                        label = "No label"
-            else:
-                max_overlap = max(stim, vent, suct)
-                if max_overlap >= length_clip * self.STRONG_THRESHOLD:
-                    label = ("Stimulation" if max_overlap == stim else
-                             "Ventilation" if max_overlap == vent else "Suction")
-                else:
-                    label = "Non-target"
+            label = label_window(
+                stim, vent, suct, nt, other, length_clip,
+                strong=self.STRONG_THRESHOLD, suction=self.suction_threshold,
+                non_target=self.non_target_threshold, weak=self.weak_threshold,
+                for_predict=self.for_predict)
 
             tag = self._overlap_suffix(stim, vent, suct, length_clip)
             labeled.append((clip_start, clip_end, label, tag))
@@ -240,6 +317,7 @@ class VideoDataProcessor:
 
     # ------------------------------------------------------------------ saving
     def save_clips(self):
+        import cv2
         labeled = self.label_all_clips()
         _, cap, fps, _, _ = self.load_video_data()
         for index, (clip_start, clip_end, label, tag) in enumerate(labeled):
@@ -255,26 +333,7 @@ class VideoDataProcessor:
                 # because SHIFT == 1; any other stride truncated the clip.
                 current += 1000.0 / fps if fps else 0
 
-            if label == "Stimulation":
-                label_num, out_dir = 1, "videos/stimulation/"
-            elif label == "Ventilation":
-                label_num, out_dir = 2, "videos/ventilation/"
-            elif label == "Suction":
-                label_num, out_dir = 3, "videos/suction/"
-            elif label == "Non-target":
-                label_num, out_dir = 0, "videos/non_target/"
-            elif label == "No overlap":
-                label_num, out_dir = 4, "videos/no_overlap/"
-            elif label == "No label":
-                label_num, out_dir = 5, "videos/no_label/"
-            elif label.startswith("Partial:"):
-                label_num, out_dir = 6, f"videos/partial/{label.split(':')[1].lower()}/"
-            elif label.startswith("Target overlap:"):
-                label_num, out_dir = 7, f"videos/target_overlap/{label.split(':')[1]}/"
-            elif label.startswith("Target overlap partial:"):
-                label_num, out_dir = 8, f"videos/partial/{label.split(':')[1]}/"
-            else:
-                label_num, out_dir = 5, "videos/no_label/"
+            label_num, out_dir = bucket_for_label(label)
 
             out_dir = os.path.join(self.folder_name, out_dir)
             os.makedirs(out_dir, exist_ok=True)
