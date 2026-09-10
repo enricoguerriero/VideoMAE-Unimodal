@@ -99,6 +99,35 @@ class VideoModel(nn.Module):
         return torch.sigmoid(logits) if self.is_multilabel else torch.softmax(logits, dim=-1)
 
     # ------------------------------------------------------------------
+    # Device resolution
+    # ------------------------------------------------------------------
+    def forward_device(self, x: torch.Tensor) -> torch.device:
+        """The device THIS forward pass must run on.
+
+        `next(self.backbone.parameters()).device` is the obvious way to ask, and
+        it breaks under nn.DataParallel. `replicate()` re-attaches each replica's
+        tensors as plain attributes (they are no longer leaves, so they cannot be
+        Parameters) and leaves the replica's `_parameters` empty — `named_parameters()`
+        still works via `_former_parameters`, but plain `parameters()` yields
+        nothing. `next()` on an empty generator raises StopIteration, which
+        DataParallel re-raises as
+
+            StopIteration: Caught StopIteration in replica 0 on device 0
+
+        one step into the first epoch. So the parameters cannot be the answer
+        inside a replica.
+
+        The input tensor can. DataParallel scatters each shard to its replica's
+        device BEFORE calling forward, so under DataParallel `x.device` is already
+        the right device and the `.to()` that follows is a no-op. On a single
+        device the parameters are still the right answer, because the training
+        loop hands `pixel_values` over on the CPU (it only moves labels and the
+        mask) and relies on forward to move it.
+        """
+        p = next(self.backbone.parameters(), None)
+        return p.device if p is not None else x.device
+
+    # ------------------------------------------------------------------
     # Head / pooling factories
     # ------------------------------------------------------------------
     def build_classifier(self, classifier_config: dict, bias=None):
@@ -179,6 +208,9 @@ class VideoModel(nn.Module):
                 f"anyway would silently change what the logits mean; this used to "
                 f"be swallowed by strict=False. Check `classifier_config` "
                 f"(dims/use_bias) against the one stored in the checkpoint.")
+        # Bare next() is safe HERE: checkpoint restore runs before training.py
+        # wraps the model in DataParallel, so `self` is never a replica. Inside
+        # forward() it is not safe — use forward_device().
         device = next(self.backbone.parameters()).device
         self.classifier = self.classifier.to(device)
 
@@ -190,5 +222,5 @@ class VideoModel(nn.Module):
         if missing or unexpected:
             logger.warning(f"attention pooling restore skipped keys — missing "
                            f"{list(missing)}, unexpected {list(unexpected)}")
-        device = next(self.backbone.parameters()).device
+        device = next(self.backbone.parameters()).device  # safe: see load_classifier
         self.attn_pool = self.attn_pool.to(device)

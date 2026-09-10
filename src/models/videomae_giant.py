@@ -61,7 +61,7 @@ class VideoMAEGiant(VideoModel):
         Returns:
             Tensor: (B, num_classes) RAW logits — no output activation applied.
         """
-        device = next(self.backbone.parameters()).device
+        device = self.forward_device(pixel_values)
         # VideoMAEv2 expects (B, C, T, H, W).
         pixel_values = pixel_values.to(device).permute(0, 2, 1, 3, 4)
 

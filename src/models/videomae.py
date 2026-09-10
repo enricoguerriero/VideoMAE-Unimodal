@@ -68,7 +68,7 @@ class VideoMAE(VideoModel):
                     Feed to the task's loss, or call `self.probs()` for
                     softmax/sigmoid probabilities.
         """
-        device = next(self.backbone.parameters()).device
+        device = self.forward_device(pixel_values)
         outputs = self.backbone(pixel_values=pixel_values.to(device), return_dict=True)
         seq = outputs.last_hidden_state  # (B, 1568, hidden_size) — all patch tokens
 
