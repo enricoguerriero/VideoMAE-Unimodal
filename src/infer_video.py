@@ -69,6 +69,7 @@ from torch.amp import autocast
 
 from src.utils import load_model
 from src.data import DataSpec, spec_from_checkpoint
+from src.data.annotations import intervals_by_category, read_annotation
 
 # Distinct, colour-blind-friendly-ish palette. The negative/"no activity" state
 # is always grey; each activity takes the next palette colour in spec order, so
@@ -296,29 +297,45 @@ def windows_to_per_second(results, duration_s, spec):
 # Optional ground truth (5-column annotation TSV)
 # ---------------------------------------------------------------------------
 def load_gt_intervals(annotation_path, spec):
-    """Parse the 5-col TSV into {activity_index: [(start_ms, end_ms), ...]}.
+    """Annotation file -> {activity_index: [(start_ms, end_ms), ...]}.
 
-    Which `Event` string maps to which activity comes from the data config
-    (`annotation_events`, defaulting to the title-cased activity name), so a site
-    that spells an event differently is a config change, not a code change.
+    Delegates to src/data/annotations.py rather than parsing the TSV here, so
+    the overlay and the training targets read a file the same way. The hand
+    written parser this replaced matched `spec.event_name(a)` against COLUMN 1
+    and got three things wrong:
+
+      * PER-DEVICE CLASSES. A cleaned anot_files row holds the processor's
+        category in column 1 ("Suction") and the device in column 5 ("Suction
+        using bulb device"). Under configs/data_suction3.yaml it therefore
+        looked up "Suction penguin" / "Suction bulb" / "Suction tube" in a
+        column that never contains them, and every suction class got an EMPTY
+        ground truth — silently, so the overlay showed a correct prediction
+        against a flat "never happened". `intervals_by_category` returns the
+        fine categories alongside the legacy ones, which is the whole reason it
+        does.
+      * TIME UNITS. `int(start)` raised on Haydom's HH:MM:SS and decimal-second
+        rows and the ValueError was swallowed per row, emptying the whole file.
+      * SPELLING. The visibility filter compared one exact string, so a typo'd
+        "Newborn visible in vedeo frame" row was kept as an interval.
+
+    Activities with no interval at all are reported: an empty GT track is
+    normal (that episode may not contain the activity) but a class that is
+    empty in EVERY episode is the bug above coming back.
     """
-    event_to_idx = spec.event_to_activity_index()
-    intervals = {i: [] for i in range(len(spec.activities))}
-    with open(annotation_path) as f:
-        for line in f:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) < 3:
-                continue
-            event, start, end = parts[0], parts[1], parts[2]
-            if len(parts) >= 5 and parts[4] == "Newborn visible in video frame":
-                continue
-            idx = event_to_idx.get(event)
-            if idx is None:
-                continue
-            try:
-                intervals[idx].append((int(start), int(end)))
-            except ValueError:
-                continue
+    got, err = read_annotation(Path(annotation_path))
+    if err:
+        logger.warning(f"could not read {annotation_path}: {err} — no ground truth")
+        return {i: [] for i in range(len(spec.activities))}
+    by_category = intervals_by_category(got[0])
+    intervals, empty = {}, []
+    for i, activity in enumerate(spec.activities):
+        event = spec.event_name(activity)
+        intervals[i] = list(by_category.get(event, []))
+        if not intervals[i]:
+            empty.append(f"{activity} (looked for Event {event!r})")
+    if empty:
+        logger.info(f"  no ground-truth interval in this episode for: "
+                    f"{', '.join(empty)}")
     return intervals
 
 

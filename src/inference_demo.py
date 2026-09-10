@@ -48,15 +48,22 @@ import cv2
 import numpy as np
 import torch
 
-from .infer_video import (build_model, list_test_cases, resolve_media,
-                          run_inference, windows_to_per_second)
+from .infer_video import (build_model, gt_per_second, list_test_cases,
+                          load_gt_intervals, resolve_media, run_inference,
+                          windows_to_per_second)
+from .data.annotations import AnnotationIndex
 
 logger = logging.getLogger(__name__)
 
-# Categorical slots 1-3 of the validated reference palette (light surface), in
-# fixed order — stimulation, ventilation, suction. Never cycled, never reordered:
-# a colour belongs to an activity, not to a position in some list.
-SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a"]
+# Categorical slots of the validated reference palette (light surface), in
+# fixed order. A colour belongs to an activity, not to a position in some list,
+# so this is indexed directly and NOT cycled: with `%` the 5-activity per-device
+# config drew suction_bulb in stimulation's blue and suction_tube in
+# ventilation's orange. Beyond this many activities the panels fall back to a
+# neutral ink rather than aliasing onto a colour that already means something.
+SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#8c5cd6", "#c2405a"]
+GT_INK = "#0b0b0b"          # ground truth is drawn in ink, never in a series colour
+GT_BAND = (-0.17, -0.07)    # y range of the truth ribbon, below the 0 gridline
 SURFACE = "#fcfcfb"
 TEXT_PRIMARY = "#0b0b0b"
 TEXT_SECONDARY = "#52514e"
@@ -67,12 +74,22 @@ PLOT_PAD = 66               # px for the shared x axis + label
 TARGET_W = 960              # output width; video and plot are both scaled to it
 
 
-def build_plot_image(per_second, spec, width, height, title):
+def build_plot_image(per_second, spec, width, height, title, gt_second=None):
     """Render the static probability panels once, as an RGB array.
 
     Drawn ONCE and reused for every frame — only the playhead moves, and that is
     a cheap line drawn per frame with cv2. Rendering matplotlib per frame would
     take longer than the inference.
+
+    `gt_second` (optional, from infer_video.gt_per_second) adds the annotated
+    truth as a solid ink ribbon under each panel. It is deliberately NOT a
+    second translucent span like the prediction: where the two agree the ribbon
+    sits inside the shaded span and you see one block, and where they disagree
+    the ribbon sticks out past the shading or the shading floats with no ribbon
+    beneath it. Overlaying two translucent bands would make agreement — the
+    common case — the hardest thing to read. The ribbon is binary and derived
+    with the SAME threshold rule as the training targets, so it is the label the
+    model was asked to reproduce, not the raw annotation span.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -81,6 +98,20 @@ def build_plot_image(per_second, spec, width, height, title):
     acts = list(spec.activities)
     secs = np.array([e["t"] for e in per_second], dtype=float)
     probs = np.array([e["probs"] for e in per_second], dtype=float)
+
+    # Truth as a boolean per (second, activity). The two tracks are generated
+    # from the same duration so they are the same length, but they are aligned
+    # by index and truncated rather than trusted to match.
+    gt = None
+    if gt_second:
+        n = min(len(per_second), len(gt_second))
+        gt = np.zeros((len(secs), len(acts)), dtype=bool)
+        for row, e in enumerate(gt_second[:n]):
+            if "active" in e:                      # multilabel
+                for i in e["active"]:
+                    gt[row, i] = True
+            elif e.get("label"):                   # multiclass: 0 = negative
+                gt[row, e["label"] - 1] = True
     thresholds = (spec.sigmoid_thresholds() if spec.is_multilabel
                   else [0.5] * len(acts))
     # multiclass logits include the negative class at index 0; the activities we
@@ -95,7 +126,7 @@ def build_plot_image(per_second, spec, width, height, title):
     fig.patch.set_facecolor(SURFACE)
 
     for i, (ax, act) in enumerate(zip(axes, acts)):
-        color = SERIES_COLORS[i % len(SERIES_COLORS)]
+        color = SERIES_COLORS[i] if i < len(SERIES_COLORS) else TEXT_SECONDARY
         p = probs[:, i + offset]
         thr = thresholds[i]
 
@@ -113,8 +144,13 @@ def build_plot_image(per_second, spec, width, height, title):
         ax.axhline(thr, color=TEXT_SECONDARY, lw=1.0, ls=(0, (4, 3)), alpha=0.7)
         ax.plot(secs, p, color=color, lw=2.0, solid_capstyle="round")
 
+        if gt is not None:
+            ax.fill_between(secs, GT_BAND[0], GT_BAND[1], where=gt[:, i],
+                            step="post", color=GT_INK, alpha=0.82, linewidth=0)
+            ax.axhline(GT_BAND[1] + 0.015, color=GRID, lw=0.8)
+
         ax.set_facecolor(SURFACE)
-        ax.set_ylim(-0.04, 1.04)
+        ax.set_ylim(GT_BAND[0] - 0.03 if gt is not None else -0.04, 1.04)
         ax.set_xlim(secs[0], secs[-1] if len(secs) > 1 else secs[0] + 1)
         ax.set_yticks([0, thr, 1])
         ax.set_yticklabels(["0", f"{thr:g}", "1"], fontsize=8, color=TEXT_SECONDARY)
@@ -137,6 +173,8 @@ def build_plot_image(per_second, spec, width, height, title):
 
     axes[-1].set_xlabel("time in episode (s)", fontsize=9, color=TEXT_SECONDARY)
     axes[-1].tick_params(axis="x", labelsize=8, colors=TEXT_SECONDARY, length=0)
+    if gt is not None:
+        title = f"{title}   ·   ink bar under each panel = annotated ground truth"
     fig.suptitle(title, fontsize=10, color=TEXT_SECONDARY, x=0.006, ha="left", y=0.992)
 
     fig.tight_layout(pad=0.9, rect=(0, 0, 1, 0.965))
@@ -151,7 +189,7 @@ def build_plot_image(per_second, spec, width, height, title):
     return img, float(x0), float(x1), float(secs[0]), float(secs[-1] if len(secs) > 1 else secs[0] + 1)
 
 
-def render(video_path, per_second, spec, out_path, fps, title):
+def render(video_path, per_second, spec, out_path, fps, title, gt_second=None):
     """Write <video on top, probability panels underneath> with a moving playhead."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -161,7 +199,8 @@ def render(video_path, per_second, spec, out_path, fps, title):
     vid_h = max(1, int(round(src_h * TARGET_W / src_w)))
     plot_h = PLOT_H_PER_PANEL * len(spec.activities) + PLOT_PAD
 
-    plot, px0, px1, t0, t1 = build_plot_image(per_second, spec, TARGET_W, plot_h, title)
+    plot, px0, px1, t0, t1 = build_plot_image(per_second, spec, TARGET_W, plot_h,
+                                             title, gt_second)
     plot_h = plot.shape[0]
     writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"),
                              fps, (TARGET_W, vid_h + plot_h))
@@ -189,34 +228,60 @@ def render(video_path, per_second, spec, out_path, fps, title):
     return n
 
 
-def write_csv(per_second, spec, path):
+def gt_row(entry, n_act):
+    """One ground-truth second -> a 0/1 list per activity, either task."""
+    row = [0] * n_act
+    if entry is None:
+        return row
+    if "active" in entry:                       # multilabel
+        for i in entry["active"]:
+            row[i] = 1
+    elif entry.get("label"):                    # multiclass: 0 = negative class
+        row[entry["label"] - 1] = 1
+    return row
+
+
+def write_csv(per_second, spec, path, gt_second=None):
     offset = 0 if spec.is_multilabel else 1
+    n_act = len(spec.activities)
     thresholds = (spec.sigmoid_thresholds() if spec.is_multilabel
-                  else [0.5] * len(spec.activities))
+                  else [0.5] * n_act)
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["second"] + [f"p_{a}" for a in spec.activities]
-                   + [f"active_{a}" for a in spec.activities])
-        for e in per_second:
-            p = [float(e["probs"][i + offset]) for i in range(len(spec.activities))]
-            w.writerow([e["t"]] + [round(v, 4) for v in p]
-                       + [int(v >= t) for v, t in zip(p, thresholds)])
+        header = (["second"] + [f"p_{a}" for a in spec.activities]
+                  + [f"active_{a}" for a in spec.activities])
+        if gt_second:
+            header += [f"gt_{a}" for a in spec.activities]
+        w.writerow(header)
+        for k, e in enumerate(per_second):
+            p = [float(e["probs"][i + offset]) for i in range(n_act)]
+            row = ([e["t"]] + [round(v, 4) for v in p]
+                   + [int(v >= t) for v, t in zip(p, thresholds)])
+            if gt_second:
+                row += gt_row(gt_second[k] if k < len(gt_second) else None, n_act)
+            w.writerow(row)
 
 
 def pick_random_case(test_csv: Path, rng: random.Random):
-    """A random case from a per-site test CSV, resolved to its episode video."""
+    """A random case from a per-site test CSV, resolved to its episode video.
+
+    -> (case_id, video, annotation). `annotation` is None when the sibling
+    Unprocessed_data/anot_files/ has no file for the case, which is the normal
+    state at Haydom — that directory does not exist there. Pass --gt-dir to
+    supply one from anywhere.
+    """
     if not test_csv.exists():
         logger.warning(f"{test_csv} not found — skipping this site.")
-        return None, None
+        return None, None, None
     cases = list_test_cases(test_csv)
     rng.shuffle(cases)
     for c in cases:
-        video, _ = resolve_media(c["anchor"], c["case_id"])
+        video, annotation = resolve_media(c["anchor"], c["case_id"])
         if video:
-            return c["case_id"], video
+            return c["case_id"], video, annotation
     logger.warning(f"no episode video resolved for any case in {test_csv} — "
                    f"is the sibling Unprocessed_data/videos tree present?")
-    return None, None
+    return None, None, None
 
 
 def main():
@@ -225,6 +290,13 @@ def main():
     ap.add_argument("--model_path", required=True)
     ap.add_argument("--haydom-video", default=None, help="Episode video (default: random from data/test_haydom.csv)")
     ap.add_argument("--drc-video", default=None, help="Episode video (default: random from data/test_drc.csv)")
+    ap.add_argument("--gt-dir", action="append", default=None, metavar="DIR",
+                    help="Extra annotation directory to draw ground truth from, "
+                         "searched recursively and matched by case KEY (exact "
+                         "stem or any run of >= 5 digits). Repeatable. Use it for "
+                         "Haydom, whose Unprocessed_data/anot_files/ does not "
+                         "exist and whose files are not named after the case — "
+                         "e.g. --gt-dir /spo/LS-Haydom/Data/FullDataset/2023-2025/Annotations")
     ap.add_argument("--splits-dir", type=Path, default=Path("data"))
     ap.add_argument("--out-dir", type=Path, default=Path("inference_output"))
     ap.add_argument("--data-config", default=None,
@@ -241,6 +313,14 @@ def main():
     model, _, spec = build_model(args.model, args.model_path, device, args.data_config)
     logger.info(spec.describe())
 
+    # One index over every --gt-dir, consulted when the sibling anot_files/ has
+    # nothing. Case-KEY matching is what makes this work at Haydom, where the
+    # annotation files are not named after the case.
+    gt_index = AnnotationIndex.from_roots(args.gt_dir) if args.gt_dir else None
+    if gt_index is not None:
+        logger.info(f"ground-truth fallback: {len(gt_index):,} case key(s) over "
+                    f"{len(gt_index.dirs)} director(y/ies)")
+
     targets = []
     for site, given, csv_name in [("haydom", args.haydom_video, "test_haydom.csv"),
                                   ("drc", args.drc_video, "test_drc.csv")]:
@@ -248,20 +328,29 @@ def main():
             video = Path(given).expanduser()
             if not video.exists():
                 raise SystemExit(f"{site}: video not found: {video}")
-            targets.append((site, video.stem, video))
+            _, annotation = resolve_media(str(video), video.stem)
+            targets.append((site, video.stem, video, annotation))
         else:
-            case_id, video = pick_random_case(args.splits_dir / csv_name, rng)
+            case_id, video, annotation = pick_random_case(
+                args.splits_dir / csv_name, rng)
             if video:
-                targets.append((site, case_id, video))
+                targets.append((site, case_id, video, annotation))
     if not targets:
         raise SystemExit("no episodes to run — pass --haydom-video/--drc-video, or "
                          "check that the test CSVs and Unprocessed_data tree exist.")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    for site, case_id, video in targets:
+    for site, case_id, video, annotation in targets:
         dest = args.out_dir / f"{site}_{case_id}"
         dest.mkdir(parents=True, exist_ok=True)
         logger.info(f"\n=== {site}: {case_id} ===\n  source: {video}")
+        if annotation is None and gt_index is not None:
+            annotation = gt_index.lookup(case_id)
+        if annotation:
+            logger.info(f"  ground truth: {annotation}")
+        else:
+            logger.warning("  no annotation found — the plot will show predictions "
+                           "only. Pass --gt-dir to point at an annotation store.")
 
         source_copy = dest / f"source{video.suffix.lower() if video.suffix else '.mp4'}"
         if not source_copy.exists():
@@ -275,10 +364,15 @@ def main():
             logger.warning(f"  no predictions for {case_id} — skipped")
             continue
 
-        write_csv(per_second, spec, dest / "probabilities.csv")
+        gt_second = None
+        if annotation:
+            gt_second = gt_per_second(load_gt_intervals(annotation, spec),
+                                      duration_s, spec)
+
+        write_csv(per_second, spec, dest / "probabilities.csv", gt_second)
         out_mp4 = dest / "annotated.mp4"
         title = f"{site.upper()} · case {case_id} · per-second activity probability"
-        n = render(source_copy, per_second, spec, out_mp4, fps, title)
+        n = render(source_copy, per_second, spec, out_mp4, fps, title, gt_second)
         logger.info(f"  {n} frames -> {out_mp4}")
         logger.info(f"  per-second probabilities -> {dest / 'probabilities.csv'}")
 
