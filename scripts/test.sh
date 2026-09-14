@@ -20,6 +20,11 @@
 #   --test_data data/test.csv     one pooled score over both sites instead
 #   --test_data val=data/validation.csv   score validation, to tune thresholds on
 #                                 (see src/tune_thresholds.py)
+#   --legacy-pooling on|off|auto  pooling for checkpoints trained before the
+#                                 2026-08-31 fix (head fitted on one patch token
+#                                 instead of the mean over all of them). `auto`,
+#                                 the default, detects them and does the right
+#                                 thing; you should not need to pass this.
 #
 # GPU and DATA_CONFIG may be omitted even when passing EXTRA flags:
 #   bash scripts/test.sh VideoMAE <ckpt>.pt --test_data val=data/validation.csv

@@ -62,8 +62,7 @@ logger = logging.getLogger(__name__)
 # ventilation's orange. Beyond this many activities the panels fall back to a
 # neutral ink rather than aliasing onto a colour that already means something.
 SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#8c5cd6", "#c2405a"]
-GT_INK = "#0b0b0b"          # ground truth is drawn in ink, never in a series colour
-GT_BAND = (-0.17, -0.07)    # y range of the truth ribbon, below the 0 gridline
+YLIM = (-0.04, 1.04)        # panel y range; the truth shading spans exactly this
 SURFACE = "#fcfcfb"
 TEXT_PRIMARY = "#0b0b0b"
 TEXT_SECONDARY = "#52514e"
@@ -81,15 +80,10 @@ def build_plot_image(per_second, spec, width, height, title, gt_second=None):
     a cheap line drawn per frame with cv2. Rendering matplotlib per frame would
     take longer than the inference.
 
-    `gt_second` (optional, from infer_video.gt_per_second) adds the annotated
-    truth as a solid ink ribbon under each panel. It is deliberately NOT a
-    second translucent span like the prediction: where the two agree the ribbon
-    sits inside the shaded span and you see one block, and where they disagree
-    the ribbon sticks out past the shading or the shading floats with no ribbon
-    beneath it. Overlaying two translucent bands would make agreement — the
-    common case — the hardest thing to read. The ribbon is binary and derived
-    with the SAME threshold rule as the training targets, so it is the label the
-    model was asked to reproduce, not the raw annotation span.
+    `gt_second` (optional, from infer_video.gt_per_second) is drawn as the
+    shaded span behind each curve — the panel's only shading. It is binary and
+    derived with the SAME threshold rule as the training targets, so it is the
+    label the model was asked to reproduce rather than the raw annotation span.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -130,27 +124,25 @@ def build_plot_image(per_second, spec, width, height, title, gt_second=None):
         p = probs[:, i + offset]
         thr = thresholds[i]
 
-        # Spans the model calls "performed" — the binary decision, shown as
-        # context behind the continuous probability rather than as a second line.
-        active = p >= thr
-        if active.any():
-            edges = np.diff(active.astype(int))
-            starts = list(np.where(edges == 1)[0] + 1) + ([0] if active[0] else [])
-            ends = list(np.where(edges == -1)[0] + 1) + ([len(active)] if active[-1] else [])
-            for a, b in zip(sorted(starts), sorted(ends)):
-                ax.axvspan(secs[a], secs[min(b, len(secs) - 1)],
-                           color=color, alpha=0.16, linewidth=0)
+        # The shaded spans are the ANNOTATED GROUND TRUTH, and only ever that.
+        # They used to mark where the prediction cleared its threshold, which is
+        # something the panel already says twice: the curve is drawn against a
+        # dashed line at exactly that threshold, so "is the model calling this?"
+        # is answered by looking at it. Spending the shading on the truth instead
+        # makes the panel answer the question you cannot otherwise see — is the
+        # model RIGHT? Curve above the dashed line inside a band is a hit,
+        # above it outside a band is a false positive, below it inside a band is
+        # a miss. With no annotation available nothing is shaded at all, so a
+        # shaded region never has to be interpreted twice.
+        if gt is not None:
+            ax.fill_between(secs, YLIM[0], YLIM[1], where=gt[:, i], step="post",
+                            color=color, alpha=0.16, linewidth=0)
 
         ax.axhline(thr, color=TEXT_SECONDARY, lw=1.0, ls=(0, (4, 3)), alpha=0.7)
         ax.plot(secs, p, color=color, lw=2.0, solid_capstyle="round")
 
-        if gt is not None:
-            ax.fill_between(secs, GT_BAND[0], GT_BAND[1], where=gt[:, i],
-                            step="post", color=GT_INK, alpha=0.82, linewidth=0)
-            ax.axhline(GT_BAND[1] + 0.015, color=GRID, lw=0.8)
-
         ax.set_facecolor(SURFACE)
-        ax.set_ylim(GT_BAND[0] - 0.03 if gt is not None else -0.04, 1.04)
+        ax.set_ylim(*YLIM)
         ax.set_xlim(secs[0], secs[-1] if len(secs) > 1 else secs[0] + 1)
         ax.set_yticks([0, thr, 1])
         ax.set_yticklabels(["0", f"{thr:g}", "1"], fontsize=8, color=TEXT_SECONDARY)
@@ -173,8 +165,8 @@ def build_plot_image(per_second, spec, width, height, title, gt_second=None):
 
     axes[-1].set_xlabel("time in episode (s)", fontsize=9, color=TEXT_SECONDARY)
     axes[-1].tick_params(axis="x", labelsize=8, colors=TEXT_SECONDARY, length=0)
-    if gt is not None:
-        title = f"{title}   ·   ink bar under each panel = annotated ground truth"
+    title = (f"{title}   ·   shaded = annotated ground truth" if gt is not None
+             else f"{title}   ·   no annotation found: prediction only")
     fig.suptitle(title, fontsize=10, color=TEXT_SECONDARY, x=0.006, ha="left", y=0.992)
 
     fig.tight_layout(pad=0.9, rect=(0, 0, 1, 0.965))

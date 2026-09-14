@@ -152,6 +152,14 @@ def main():
     parser.add_argument("--data-config", type=str, default=None,
                         help="Override the DataSpec stored in the checkpoint. Only do this "
                              "on purpose — a mismatched spec changes what every logit means.")
+    parser.add_argument("--legacy-pooling", choices=["auto", "on", "off"], default="auto",
+                        help="How to pool patch tokens for VideoMAE checkpoints trained "
+                             "before the 2026-08-31 pooling fix, whose head was fitted on "
+                             "last_hidden_state[:, 0] instead of the mean over all tokens. "
+                             "auto (default): detect them by the missing `fc_norm` and use "
+                             "the old path, so they stay evaluable. on: force it. off: "
+                             "always mean-pool — the pre-fix head then sees a feature space "
+                             "it was never trained on and its predictions are meaningless.")
     parser.add_argument("--results_dir", type=str, default="results/")
     parser.add_argument("--minority_class", type=str, default=None)
     parser.add_argument("--debug", action="store_true", default=False)
@@ -179,7 +187,13 @@ def main():
                            "it matches how the checkpoint was trained.")
     logger.info(spec.describe())
 
-    model = load_model(args.model, spec=spec)
+    # Only VideoMAE has the two pooling paths; the giant pools inside its own
+    # trunk, so passing the kwarg to it would be a TypeError.
+    pooling_kwargs = {}
+    if args.model == "VideoMAE":
+        pooling_kwargs["pooling"] = {"auto": "auto", "on": "patch0_legacy",
+                                     "off": "mean"}[args.legacy_pooling]
+    model = load_model(args.model, spec=spec, **pooling_kwargs)
     model = model.to(device)
 
     test_sets = resolve_test_sets(args.test_data, config)
@@ -196,6 +210,7 @@ def main():
                    name=f"test_{model.model_name}_{spec.task}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
                    config={**config, "test_data": dict(test_sets),
                            "thesis_only": args.thesis_only,
+                           "pooling": getattr(model, "pooling", "n/a"),
                            "data_spec": spec.to_dict()},
                    mode=config.get("wandb_mode", "online"), job_type="eval")
 

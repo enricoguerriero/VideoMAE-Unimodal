@@ -431,6 +431,34 @@ bash scripts/test.sh VideoMAE <ckpt>.pt 0 "" --thesis-only          # just the 1
 bash scripts/test.sh VideoMAE <ckpt>.pt 0 "" --test_data data/test.csv   # one pooled score
 ```
 
+#### Checkpoints trained before 2026-08-31: `--legacy-pooling`
+
+VideoMAE has **no CLS token**. Until commit `88eb92f` this repo nevertheless
+pooled a clip as `last_hidden_state[:, 0]` — one arbitrary patch token — and
+every head trained before that date was fitted on that feature. The current code
+uses the pretraining pooling instead (mean over all 1568 patch tokens, then
+`fc_norm`), which is correct, but it means an old head is handed a feature space
+it has never seen. The symptom is unmistakable and is **not** a data problem:
+
+```
+non_target       0.9741  0.6977  0.8130
+stimulation      0.0000  0.0000  0.0000     <- the head has collapsed onto
+ventilation      0.7497  0.9993  0.8567     <- the two most frequent classes
+suction          0.0000  0.0000  0.0000
+```
+
+`test.py` detects these checkpoints by the **absence of `fc_norm` in the saved
+backbone** and switches itself back to the old path, with a warning saying so —
+that is `--legacy-pooling auto`, the default, so an old checkpoint scores the way
+it was trained with no extra flags. Override with `on` to force it or `off` to
+reproduce the broken reading.
+
+Those scores are comparable with **that run's own** training history and with
+other pre-fix runs, never with a post-fix checkpoint: the two are different
+models. Treat the shim as a way to read old results, and retrain anything you
+intend to carry forward — mean pooling uses all 1568 tokens instead of one, so
+a retrained model should be *better*, not merely different.
+
 #### Which clips get scored: `--full-coverage`
 
 `ambiguous: mask` is right for training — an activity whose window coverage falls

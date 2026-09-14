@@ -26,30 +26,26 @@
 # so --limit 3 / --only 11848523 / --skip-existing all work.
 set -euo pipefail
 
-HAYDOM_BASE="${HAYDOM_BASE:-/spo/LS-Haydom/ProcessedData/Athavan_Frida/Data_processing}"
+# shellcheck source=scripts/site_paths.sh
+source "$(dirname "${BASH_SOURCE[0]}")/site_paths.sh"
 VIDEOS="${VIDEOS:-$HAYDOM_BASE/Unprocessed_data/videos}"
 
 # ---------------------------------------------------------------- annotations
-# ONE primary source by default, deliberately. The audit found the four Haydom
-# annotation directories cover 240-242 of 246 cases EACH, so a second directory
-# buys ~2 cases while mixing two export vintages into one label set — the exact
-# confound findings [7]-[9] are about. 2023-2025/Annotations is the primary
-# because it has the highest coverage (242/246) and its suction vocabulary is
-# intact ('Suction using Penguine Device' and friends).
+# ONE primary source by default, deliberately. The four Haydom annotation
+# directories each cover 240-242 of the 246 cases, so a second one buys ~2 cases
+# while mixing two export vintages into one LABEL set — the confound audit
+# findings [7]-[9] are about. HAYDOM_ANNOTATION_DIRS (site_paths.sh) is ordered
+# by the coverage the audit measured, so element 0 is the primary: 2023-2025/
+# Annotations, 242/246, suction vocabulary intact.
 #
-# Set EXTRA_ANNOTATIONS=1 to add the rest. AnnotationIndex ranks directories by
-# size and tries the exact case id everywhere before any digit-run match, so a
-# case that is CONFLICTED inside one directory can still resolve from another —
-# which is the only reason to want them. Ronald's annotations_corrected is
-# listed first among the fallbacks because the audit found it has zero
-# conflicting keys (his conflict rule already resolved them).
-ANNOTATIONS=("/spo/LS-Haydom/Data/FullDataset/2023-2025/Annotations")
+# EXTRA_ANNOTATIONS=1 admits the rest. The one reason to want them is that
+# AnnotationIndex tries the exact case id across every directory before any
+# digit-run match, so a case CONFLICTED inside the primary can still resolve
+# from another — Ronald's annotations_corrected has no conflicting keys at all.
 if [[ "${EXTRA_ANNOTATIONS:-0}" == "1" ]]; then
-    ANNOTATIONS+=(
-        "/spo/LS-Haydom/ProcessedData/Ronald/data/Tanzania/annotations_corrected"
-        "/spo/LS-Haydom/Data/FullDataset/2025-2026/March2026Sync/annotations"
-        "/spo/LS-Haydom/ProcessedData/Athavan_Frida/FullDataset_Combined/Annotations"
-    )
+    ANNOTATIONS=("${HAYDOM_ANNOTATION_DIRS[@]}")
+else
+    ANNOTATIONS=("${HAYDOM_ANNOTATION_DIRS[0]}")
 fi
 
 # ---------------------------------------------------------------- outputs
