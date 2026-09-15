@@ -1,0 +1,132 @@
+# =============================================================================
+# data_multilabel_thesis_overlap.yaml — STEP 2: step 1 + the co-occurrence clips.
+#                                       EXACTLY ONE key differs from step 1.
+# =============================================================================
+# Step 1 (configs/data_multilabel_thesis.yaml) established that the multilabel
+# REPRESENTATION works on the multiclass run's exact clip set. This file changes
+# the DATA and nothing else:
+#
+#   buckets[7]: drop -> keep
+#
+# Bucket 7 is `target_overlap`: clips where >= 2 activities are BOTH above their
+# threshold. Multiclass had to drop them — a single label cannot say "stimulation
+# AND ventilation" — and step 1 kept them dropped so the comparison stayed clean.
+# Multilabel can represent them, so here they come in as genuine multi-hot
+# targets. These are the first multi-hot labels in the sequence; steps 1 and the
+# multiclass run saw only one-hot and all-zero.
+#
+#   bash scripts/train.sh VideoMAE 0 configs/data_multilabel_thesis_overlap.yaml \
+#        --config configs/config_thesis.yaml
+#
+# Same training config as both earlier runs — the same file, not a copy. No
+# rebuild and no re-split: the bucket-7 clips are already in data/train.csv and
+# data/test.csv, they were simply refused at load time.
+#
+# RUN THIS ONLY AFTER STEP 1. Its whole value is that step 1 has already priced
+# in the representation change, so whatever moves here is attributable to the
+# co-occurrence clips alone. Run it first and you are back to two variables.
+#
+# -----------------------------------------------------------------------------
+# ONE THING TO CHECK BEFORE TRUSTING THE RESULT
+# -----------------------------------------------------------------------------
+# `ambiguous: drop` is inherited from step 1 for consistency, and it bites
+# hardest on exactly the clips this file adds. Bucket 7 guarantees >= 2
+# activities above threshold and says NOTHING about the third. The ambiguous
+# bands are:
+#
+#     stimulation  [0.20, 0.50)   width 0.30
+#     ventilation  [0.20, 0.50)   width 0.30
+#     suction      [0.20, 0.25)   width 0.05   (narrow — its threshold is 0.25)
+#
+# so a third activity landing in its band discards the whole clip. Verified
+# against DataSpec.resolve:
+#
+#     stim .35 (amb) + vent .60 + suct .30   drop -> DROPPED
+#                                            mask -> targets=(0,1,1) mask=(0,1,1)
+#     stim .60 + vent .55 + suct .10 (neg)   drop -> targets=(1,1,0) mask=(1,1,1)
+#                                            mask -> identical
+#
+# `mask` keeps the clip, supervises the confident activities and excludes the
+# ambiguous one from the loss — no invented negative, no discarded clip. It is
+# arguably the better answer here, but it is a SECOND variable, so treat it as
+# step 3 rather than folding it in.
+#
+# !! UNTAGGED CLIPS: an untagged bucket-7 clip has no fractions at all, so its
+# non-combo activities are ambiguous by construction and `drop` discards 100 % of
+# them (verified). Harmless if the manifest was built with BACKFILL=1, which
+# scripts/build_data.sh does by default — Haydom is then tagged. Confirm it.
+#
+# Census first, so you know how many bucket-7 clips actually survive:
+#     python -m src.data.explore_data --manifest data/clips_all.csv \
+#         --splits-dir data --data-config configs/data_multilabel_thesis_overlap.yaml
+# Compare its bucket-7 count against the same command pointed at step 1's config.
+# If most of bucket 7 is being dropped, this run is not testing what you think it
+# is — switch `ambiguous` to `mask` and say so when you report the number.
+# =============================================================================
+
+# ---------------------------------------------------------------- task
+task: multilabel
+
+# ---------------------------------------------------------------- classes
+activities: [stimulation, ventilation, suction]
+negative_class: non_target
+
+tag_keys:
+  stimulation: stim
+  ventilation: vent
+  suction: suct
+
+# ---------------------------------------------------------------- labeling
+# Identical to step 1 and to configs/data.yaml — the thesis' values.
+thresholds:
+  stimulation: 0.50
+  ventilation: 0.50
+  suction: 0.25
+
+weak_threshold: 0.20
+
+# Inherited from step 1 unchanged, so this run differs from it in ONE key only.
+# See "ONE THING TO CHECK" above before leaving it alone.
+ambiguous: drop
+
+overlap_resolution: drop
+
+# ---------------------------------------------------------------- buckets
+buckets:
+  0: keep   # non_target            — nt >= 0.20, zero activity  -> all-zero target
+  1: keep   # stimulation           — stim >= 0.50, pure
+  2: keep   # ventilation           — vent >= 0.50, pure, no ignored-label
+  3: keep   # suction               — suct >= 0.25, pure
+  4: keep   # no_overlap            — nothing annotated at all    -> all-zero target
+  5: drop   # no_label              — zero activity, but nt < 0.20 or ignored-label present
+  6: drop   # partial               — one activity, sub-threshold
+  7: keep   # target_overlap        — >= 2 activities ALL above threshold.
+            #                         <<< THE ONLY CHANGE FROM STEP 1. The
+            #                         co-occurrence clips, as multi-hot targets.
+  8: drop   # partial_overlap       — >= 2 present, none above threshold
+
+# ---------------------------------------------------------------- inference
+# Read `macro/ap` first — it is threshold-free. Then tune on VALIDATION:
+#     python -m src.tune_thresholds --model VideoMAE --model_path <ckpt>.pt
+decision_thresholds:
+  stimulation: 0.5
+  ventilation: 0.5
+  suction: 0.5
+
+# ---------------------------------------------------------------- annotations
+annotation_events: {}
+
+# =============================================================================
+# Comparing the three runs
+# =============================================================================
+# `macro/f1` is comparable between STEP 1 and STEP 2 (same 3 activities, same
+# denominator) but NOT against the multiclass run, which averages over 4 classes
+# including the easy dominant non_target. For the cross-task comparison use
+# `proj/macro_f1` and `proj/accuracy`, or read the per-activity F1s against the
+# multiclass per-class numbers — those are like-for-like.
+#
+# Note that step 2's test set is LARGER than step 1's: admitting bucket 7 adds
+# clips to train AND test. The added clips are the hard multi-activity ones, so a
+# small drop in step 2 is not automatically a regression — check the per-activity
+# numbers and `n_fully_supervised` before concluding anything.
+# =============================================================================

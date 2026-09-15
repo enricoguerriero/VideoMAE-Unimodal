@@ -1,0 +1,162 @@
+# =============================================================================
+# data_multilabel_thesis.yaml — STEP 1: configs/data.yaml, made multilabel.
+#                               EXACTLY ONE key differs: task.
+# =============================================================================
+# The multiclass thesis setup works (config_thesis.yaml + data.yaml). This file
+# changes the TARGET REPRESENTATION and nothing else — not the clips, not the
+# thresholds, not the buckets:
+#
+#   4 logits, softmax, CrossEntropy, non_target as class 0
+#        ->  3 logits, independent sigmoids, masked BCE, non_target implicit as
+#            the all-zero vector.
+#
+# THE CLIP POPULATION IS UNCHANGED. Bucket 7 stays dropped here, so every clip
+# that reaches the model is one the multiclass run also saw, and every target is
+# still one-hot or all-zero — there is not a single multi-hot label in this
+# config. Co-occurrence arrives in STEP 2 (data_multilabel_thesis_overlap.yaml).
+#
+# Run it with the SAME training config as the multiclass run — literally the same
+# file, not a copy, so the hyperparameters cannot drift apart:
+#
+#   bash scripts/train.sh VideoMAE 0 configs/data_multilabel_thesis.yaml \
+#        --config configs/config_thesis.yaml
+#
+# NO REBUILD AND NO RE-SPLIT. build_manifest.py does no bucket filtering and
+# split_cases.py writes every clip with its `bucket` and `frac_*` columns intact,
+# so this is a load-time relabelling of the CSVs you already have. Same cases,
+# same split, same 14-case test set, same `thesis_test` flags.
+#
+# -----------------------------------------------------------------------------
+# WHY THIS IS ITS OWN RUN
+# -----------------------------------------------------------------------------
+# Two things were going to change at once: the representation (softmax -> per-
+# activity sigmoids) and the data (admitting the co-occurrence clips). Changing
+# both in one run makes a bad result uninterpretable — you cannot tell whether
+# the sigmoid/BCE setup is at fault or the new clips are. So:
+#
+#   STEP 1  this file        task flip only, identical clips
+#                            -> isolates the REPRESENTATION
+#   STEP 2  ..._overlap.yaml this file + bucket 7
+#                            -> isolates the CO-OCCURRENCE DATA
+#
+# If step 1 matches the multiclass run, the representation is sound and step 2's
+# delta is attributable to the overlap clips alone. If step 1 drops, the problem
+# is the head/loss/thresholds and there is no point adding data on top of it.
+#
+# -----------------------------------------------------------------------------
+# WHAT STILL GENUINELY CHANGES, even with identical clips
+# -----------------------------------------------------------------------------
+# "Same data" is not "same learning problem". Three real differences remain, and
+# they are the point of the experiment rather than flaws in it:
+#
+#   * non_target stops being a TRAINED class. It was class 0 with its own logit
+#     and its own gradient; it is now the absence of positives. Nothing pushes
+#     the model toward it directly.
+#   * The imbalance correction changes shape: weighted CrossEntropy over 4
+#     classes -> per-activity pos_weight = sqrt(neg/pos) in a masked BCE. Both
+#     come from `class_weighting: sqrt_inv_freq` in the training config, but they
+#     are not the same reweighting.
+#   * Prediction stops being argmax. Three independent cuts at 0.5 mean a clip
+#     can come out all-zero or multi-hot even though no training target ever was.
+#     Expect the default 0.5 to be wrong — see `decision_thresholds` below.
+# =============================================================================
+
+# ---------------------------------------------------------------- task
+# >>> THE ONLY KEY THAT DIFFERS FROM configs/data.yaml <<<
+#
+# multilabel: one independent binary label per activity. Classes = activities
+# only (3). "No activity" is the all-zero vector, NOT a class. Sigmoid head +
+# masked BCEWithLogitsLoss(pos_weight=sqrt(neg/pos)) + per-activity thresholds.
+task: multilabel
+
+# ---------------------------------------------------------------- classes
+# Order fixes the logit order and every reported metric key. Unchanged, so
+# `minority_class: suction` in the training config still resolves — `minority/f1`
+# and `minority/ap` keep meaning suction.
+activities: [stimulation, ventilation, suction]
+
+# Multilabel has no index-0 class. This name is used only for reporting the
+# PROJECTED multiclass view (metrics.project_to_single), which is what lets the
+# 4-class confusion table still be printed under `proj/` — and `proj/macro_f1` is
+# how this run is compared against the multiclass one. See the note at the bottom.
+negative_class: non_target
+
+tag_keys:
+  stimulation: stim
+  ventilation: vent
+  suction: suct
+
+# ---------------------------------------------------------------- labeling
+# Identical to configs/data.yaml — the thesis' values. Do not tune these here:
+# moving a threshold changes which clips are positive AND (via the ambiguous
+# band) which clips survive at all, which would break the like-for-like
+# comparison this file exists to make.
+thresholds:
+  stimulation: 0.50
+  ventilation: 0.50
+  suction: 0.25
+
+weak_threshold: 0.20
+
+# `drop`, matching configs/data.yaml, so the clip-population rule is identical:
+# a clip with any activity in the ambiguous band (between weak_threshold and its
+# threshold) is discarded, exactly as in the multiclass run.
+#
+# `mask` is available in multilabel and is NOT used here on purpose — it would
+# keep clips the multiclass run discarded, which is precisely the kind of
+# population change this step is designed to avoid. It becomes worth considering
+# in step 2, where the ambiguous band actually bites on bucket-7 clips.
+ambiguous: drop
+
+# Ignored in multilabel. Kept so the file round-trips against configs/data.yaml.
+overlap_resolution: drop
+
+# ---------------------------------------------------------------- buckets
+# BYTE-IDENTICAL to configs/data.yaml. Bucket 7 stays dropped — that is what
+# makes this step a pure representation change. Step 2 flips it to `keep`.
+buckets:
+  0: keep   # non_target            — nt >= 0.20, zero activity  -> all-zero target
+  1: keep   # stimulation           — stim >= 0.50, pure
+  2: keep   # ventilation           — vent >= 0.50, pure, no ignored-label
+  3: keep   # suction               — suct >= 0.25, pure
+  4: keep   # no_overlap            — nothing annotated at all    -> all-zero target
+  5: drop   # no_label              — zero activity, but nt < 0.20 or ignored-label present
+  6: drop   # partial               — one activity, sub-threshold
+  7: drop   # target_overlap        — >= 2 activities ALL above threshold.
+            #                         STEP 2 keeps these. Dropped here so the
+            #                         clip set matches the multiclass run exactly.
+  8: drop   # partial_overlap       — >= 2 present, none above threshold
+
+# ---------------------------------------------------------------- inference
+# Per-activity sigmoid cut used for prediction and for every F1/precision/recall
+# figure. 0.5 is a STARTING POINT, not a result — the classes are imbalanced and
+# the loss is pos_weighted, so the optimal cut is rarely 0.5. This is the most
+# likely reason a healthy multilabel run still reports a poor F1 on first sight.
+#
+# Threshold-free average precision is reported alongside (`macro/ap`,
+# `<activity>/ap`) and cannot be threshold-shopped, so read macro/ap FIRST when
+# judging this run. Tune on VALIDATION only:
+#     python -m src.tune_thresholds --model VideoMAE --model_path <ckpt>.pt
+# then write the result back here and report both numbers.
+decision_thresholds:
+  stimulation: 0.5
+  ventilation: 0.5
+  suction: 0.5
+
+# ---------------------------------------------------------------- annotations
+# Used only by src/infer_video.py for ground-truth overlays. Unchanged.
+annotation_events: {}
+
+# =============================================================================
+# Comparing this run against the multiclass one
+# =============================================================================
+# `macro/f1` is NOT comparable across the two. Multiclass averages over 4 classes
+# including the easy dominant non_target; this run averages over 3 activities
+# with no free term. That is the same denominator trap that made the 2026-07-14
+# run look incomparable in the first place.
+#
+# Compare on `proj/macro_f1` and `proj/accuracy`, which project the multilabel
+# predictions back onto the 4-class view, and read the per-activity F1s
+# (stimulation/f1, ventilation/f1, suction/f1) against the multiclass per-class
+# numbers directly — those ARE like-for-like.
+# =============================================================================
