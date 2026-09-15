@@ -92,13 +92,21 @@ python -m src.data.build_manifest \
     ${BACKFILL_ARGS[@]+"${BACKFILL_ARGS[@]}"} \
     --out data/clips_all.csv
 
+# Extra flags for the case selector, e.g. reproducing the pre-2026-08-28 split:
+#   SPLIT_ARGS="--freeze-test --no-balanced-val --train-ratio 0.7" bash scripts/build_data.sh
+# Appended last, so they win over the ratios above (argparse keeps the final
+# occurrence). See configs/config_thesis.yaml.
+SPLIT_EXTRA=()
+[[ -n "${SPLIT_ARGS:-}" ]] && read -r -a SPLIT_EXTRA <<< "$SPLIT_ARGS"
+
 python -m src.data.split_cases \
     --manifest data/clips_all.csv \
     --out-dir data \
     --data-config "${DATA_CONFIG}" \
     --test-ratio "${TEST_RATIO}" \
     --train-ratio "${TRAIN_RATIO}" \
-    --seed 2025
+    --seed 2025 \
+    ${SPLIT_EXTRA[@]+"${SPLIT_EXTRA[@]}"}
 
 python -m src.data.explore_data \
     --manifest data/clips_all.csv \

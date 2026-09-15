@@ -22,8 +22,10 @@ Model selection is unchanged: it keeps the best macro-F1 checkpoint AND the best
 minority-class F1 checkpoint, as the thesis did. In multilabel runs macro-F1 is
 the mean over activities and `macro/accuracy` is exact-match accuracy.
 
-Config: configs/config.yaml (+ configs/data.yaml, or --data-config).
-CLI flags: --model (required), --data-config, --debug, --only_train,
+Config: configs/config.yaml (or --config) + configs/data.yaml (or --data-config).
+The two are orthogonal on purpose: --config says HOW to train (LR, batch, epochs),
+--data-config says WHAT the targets are. Reproducing an old run means pinning both.
+CLI flags: --model (required), --config, --data-config, --debug, --only_train,
 --attention_pooling.
 """
 
@@ -255,9 +257,16 @@ def run_validation(model, val_loader, criterion, device, amp_dtype, n_val, spec,
 def main():
     parser = ArgumentParser()
     parser.add_argument("--model", type=str, required=True, choices=VIT_MODELS)
+    parser.add_argument("--config", type=str, default="configs/config.yaml",
+                        help="TRAINING config YAML (LR, batch size, epochs, scheduler, "
+                             "head). Defaults to configs/config.yaml. Keep alternative "
+                             "regimes as separate files rather than editing the default "
+                             "in place — a run is only reproducible if the exact config "
+                             "that produced it still exists (it is also copied into the "
+                             "checkpoint, which is what test.py reads back).")
     parser.add_argument("--data-config", type=str, default=None,
                         help="Data/label config YAML. Defaults to `data_config:` in "
-                             "configs/config.yaml, else configs/data.yaml.")
+                             "the training config, else configs/data.yaml.")
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--only_train", action="store_true", default=False)
     parser.add_argument("--attention_pooling", action="store_true", default=False)
@@ -269,7 +278,7 @@ def main():
                              "every site in the split CSVs. Test sets are already "
                              "per-hospital files — see `test_data:` in the config.")
     parser.add_argument("--epochs", type=int, default=None,
-                        help="Override `num_epochs` from configs/config.yaml.")
+                        help="Override `num_epochs` from the training config.")
     parser.add_argument("--patience", type=int, default=None,
                         help="Override `early_stopping_patience`. 0 disables early "
                              "stopping.")
@@ -280,7 +289,7 @@ def main():
     parser.add_argument("--minority-class", "--minority_class", dest="minority_class",
                         default=None, metavar="CLASS",
                         help="Class whose F1 drives the best-minority checkpoint. "
-                             "Overrides `minority_class` in configs/config.yaml — "
+                             "Overrides `minority_class` in the training config — "
                              "needed when the data config renames it, e.g. "
                              "`--minority-class suction_penguin` for the per-device "
                              "split.")
@@ -292,8 +301,11 @@ def main():
                              "checkpoints into one directory.")
     args = parser.parse_args()
 
-    with open("configs/config.yaml", "r") as f:
+    with open(args.config, "r") as f:
         config = yaml.safe_load(f)
+    # Recorded so a checkpoint says which training config produced it. The whole
+    # dict is saved too, but the path is what lets you re-run the thing.
+    config["config_path"] = args.config
     if args.attention_pooling:
         config["attention_pooling"] = True
     # Recorded in the run config so the checkpoint, and W&B, say which hospitals

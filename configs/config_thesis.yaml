@@ -1,0 +1,205 @@
+# =============================================================================
+# config_thesis.yaml — REPRODUCTION of the 2026-07-14 run, on corrected code
+# =============================================================================
+# The run of 2026-07-14 (commit 2996340 / 971c77a, "new scheduler") scored far
+# better than anything since. Most of that gap is NOT a regression, it is three
+# changes of measurement stacked on top of each other, plus one real training
+# regression. This file re-runs that experiment's TRAINING setup verbatim on
+# today's code, so the comparison is finally like-for-like.
+#
+# Use it with the thesis-exact label regime — both halves are needed:
+#
+#     bash scripts/train.sh VideoMAE 0 configs/data.yaml \
+#          --config configs/config_thesis.yaml
+#
+# and see "Rebuilding the July split" at the bottom before the first run.
+#
+# -----------------------------------------------------------------------------
+# WHAT WAS ACTUALLY DIFFERENT, and how each item is handled here
+# -----------------------------------------------------------------------------
+# 1. THE METRIC CHANGED DENOMINATOR.  July averaged macro/f1 over 4 classes
+#    {non_target, stimulation, ventilation, suction}; the multilabel default
+#    averages over 3 activities only, because "no activity" is the all-zero
+#    vector and not a class (src/utils/metrics.py). non_target is the easy
+#    dominant class and was contributing ~a quarter of the macro score for free.
+#    macro/accuracy moved the same way: plain accuracy -> EXACT-MATCH accuracy.
+#      -> handled by pairing this file with configs/data.yaml (task: multiclass),
+#         which restores the 4-class softmax and the 4-class macro average.
+#
+# 2. THE TEST CLIPS GOT HARDER.  July dropped buckets 5/6/7/8 outright, i.e.
+#    every `partial`, `target_overlap` and `partial_overlap` clip — it trained
+#    and scored only on unambiguously-labelled windows. data_multilabel.yaml
+#    keeps 6/7/8 on purpose.
+#      -> handled by configs/data.yaml, whose bucket table still drops 5-8.
+#
+# 3. THE POOLING FIX INVALIDATED THE OLD CHECKPOINT'S SCORE.  Until 88eb92f a
+#    clip was pooled as last_hidden_state[:, 0] — one arbitrary patch token,
+#    read as if VideoMAE had a CLS token, which it does not. Re-scoring the July
+#    checkpoint under current code therefore produces garbage unless
+#    `--legacy-pooling` is in play (see README).
+#      -> NOT reproduced. This is the "but correct" part: a fresh run under this
+#         config trains on the real mean-over-1568-tokens + fc_norm pooling. It
+#         should come out ABOVE the July numbers, not merely different.
+#
+# 4. THE ONE REAL REGRESSION: ~128x fewer optimiser steps.  batch_size went
+#    8 -> 32 -> 256 and num_epochs 80 -> 20 while backbone_lr/classifier_lr never
+#    moved. 32x fewer steps per epoch times 4x fewer epochs, all at the same
+#    per-step LR, on a backbone whose LR was already 1e-5.
+#      -> reverted below: batch 8, 80 epochs, July's LRs, single device.
+#
+# The net of 1+2+3 is that the July score and the current score were never
+# measuring the same thing. Fix the measurement first, THEN judge the model.
+# =============================================================================
+
+# ---------------------------------------------------------------- data config
+# The thesis-exact multiclass regime: 4 classes, buckets 5-8 dropped,
+# ambiguous: drop, overlap_resolution: drop. That is July's label policy exactly
+# — configs/data.yaml was written to reproduce the original build_manifest.py
+# behaviour, and its bucket table is unedited.
+#
+# Overridable at the CLI, but overriding it defeats the purpose of this file:
+# the training hyperparameters below only reproduce July if the targets do too.
+data_config: configs/data.yaml
+
+# ---------------------------------------------------------------- data paths
+train_data:      data/train.csv
+validation_data: data/validation.csv
+
+# ONE POOLED TEST SET, as in July. Built with --freeze-test (see the bottom of
+# this file) it contains exactly the thesis' 14 frozen cases and nothing else,
+# which is the set the July numbers were computed on. A plain string is still
+# accepted here; the per-hospital mapping in configs/config.yaml is the newer
+# behaviour and is deliberately NOT used.
+#
+# If you would rather keep the per-site test sets on disk, leave this as-is and
+# add `--thesis-only` at test time to filter to the same 14 cases:
+#     bash scripts/test.sh VideoMAE <ckpt>.pt 0 "" --thesis-only
+test_data: data/test.csv
+
+# ---------------------------------------------------------------- runtime
+device: cuda
+
+# 8, as in July. This is the single most important line in the file: it is the
+# denominator of the step count, and the LRs below were tuned against it.
+#
+# If 8 is too slow to be practical, DO NOT raise it here and leave the LRs alone
+# — that is precisely how the run regressed. Scale together, sqrt rule (safer
+# for fine-tuning than the linear rule at this batch range):
+#     batch  32 -> backbone_lr 2.0e-5, classifier_lr 1.0e-4
+#     batch 256 -> backbone_lr 5.7e-5, classifier_lr 2.8e-4
+# and raise num_epochs to keep the step count comparable. Any such run is a
+# different experiment; give it its own config file rather than editing this one.
+batch_size: 8
+
+# false, not `auto`. July was single-device; DataParallel did not exist in the
+# repo yet. With batch_size 8 splitting across two GPUs would give 4 per device
+# and change the gradient noise this LR was chosen for.
+data_parallel: false
+
+num_workers: 8
+num_epochs: 80           # July's budget. 20 (the current default) does not converge here.
+train_backbone: true     # full-backbone fine-tuning (VideoMAE has no LoRA)
+attention_pooling: false # false => mean over patch tokens + pretrained fc_norm.
+                         # NOTE: in July this same `false` meant last_hidden_state[:, 0].
+                         # Same config value, different and now correct behaviour — this
+                         # is the intended deviation, see item 3 in the header.
+validation_step: null    # end-of-epoch validation only, as in July
+
+# ---------------------------------------------------------------- loss / imbalance
+# multiclass -> CrossEntropyLoss(weight=class weights, label_smoothing), weights
+# from the TRAIN split at runtime, no sampler. `sqrt_inv_freq` is the July
+# behaviour: it was hardcoded then (training.py logged "Class weights (sqrt
+# inv-freq)") and is a named option now, so it has to be stated explicitly.
+class_weighting: sqrt_inv_freq
+label_smoothing: 0.1
+minority_class: suction  # class whose F1 drives the "best minority" checkpoint
+
+# ---------------------------------------------------------------- scheduler
+scheduler: warmup_cosine
+warmup_epochs: 5              # 5/80 in July. Note this is 25% of a 20-epoch budget
+                              # but only 6% of this one — another reason 20 epochs
+                              # at the same warmup was undertraining.
+warmup_start_factor: 0.01
+plateau_patience: 8
+early_stopping_patience: 20
+
+# ---------------------------------------------------------------- classifier head
+# multiclass -> 1 + len(activities) = 4 logits, softmax, bias init = log-prior.
+classifier_config:
+  dims: []               # single linear layer, as in July
+  activation: relu
+  use_bias: true
+  dropout: 0.3
+
+# ---------------------------------------------------------------- optimizer
+# Dual LR: learning_rate null, so backbone_lr and classifier_lr are used.
+# These are July's values and belong to batch_size 8 — see the batch_size note.
+learning_rate: null
+backbone_lr: 1.0e-5
+classifier_lr: 5.0e-5
+weight_decay: 1.0e-3
+
+# ---------------------------------------------------------------- model
+model_params: {}
+
+# ---------------------------------------------------------------- outputs
+checkpoint_path: checkpoints/
+save_path: models/
+results_dir: results/
+
+# ---------------------------------------------------------------- logging
+wandb_project: videomae-unimodal
+wandb_mode: online
+
+# =============================================================================
+# Rebuilding the July split
+# =============================================================================
+# The split CSVs currently on disk are the NEW per-site ones: each site's test
+# set is ~20% of its own clips, chosen by the balanced selector. July's were
+# different — the 14 frozen thesis cases as the entire test set, and a 70/30
+# stratified case split of the remainder. Training on the current CSVs with this
+# config would still leave the test set changed, so rebuild first:
+#
+#   SPLIT_ARGS="--freeze-test --no-balanced-val --train-ratio 0.7" \
+#       bash scripts/build_data.sh configs/data.yaml
+#
+#   --freeze-test        the 14 seed cases ARE the test set (July's behaviour)
+#   --no-balanced-val    stratified case sampling for val, not the balanced
+#                        selector (counts cases, ignores case size — July's)
+#   --train-ratio 0.7    July's ratio; the current default is 0.8
+#
+# This OVERWRITES data/*.csv. Keep the current ones if you still need them:
+#   mkdir -p data/split_persite && cp data/*.csv data/split_persite/
+#
+# TWO HONEST CAVEATS, neither of which the flags can remove:
+#
+#   * The test set reproduces EXACTLY (the 14 case ids are pinned in
+#     split_cases.py). The train/val division does NOT: July stratified cases by
+#     their majority resolved label, today's fallback stratifies by
+#     `site|dominant activity mass`. Same policy, different strata, so a few
+#     cases will land on the other side. Use --train-cases-file/--val-cases-file
+#     if you still have the July lists and want it bit-identical.
+#
+#   * BACKFILL=1 (the default) rebuilds Haydom's per-activity fractions from the
+#     annotation files. July did not have this, because Haydom's clips were cut
+#     before data_process.py wrote fraction tags — which meant Haydom's labels
+#     were frozen at cut time and moving a threshold in the data config changed
+#     DRC only. That is a genuine bug fix and it is left ON here, so a handful of
+#     Haydom clips may resolve to a different bucket than they did in July. Set
+#     BACKFILL=0 to suppress it and match July byte-for-byte, at the cost of
+#     re-introducing the two-sites-mean-different-things confound.
+#
+# =============================================================================
+# Reading the result
+# =============================================================================
+# Scoring the OLD July checkpoint (do this for the baseline — it needs the shim):
+#   bash scripts/test.sh VideoMAE <july_ckpt>.pt 0 "" --legacy-pooling auto
+#
+# Scoring the checkpoint this config produces (no shim — it is post-fix):
+#   bash scripts/test.sh VideoMAE <new_ckpt>.pt 0
+#
+# Both then report the same 4-class macro/f1 on the same 14 cases, which is the
+# number July was quoting. If the new one is still lower, the regression is real
+# and is in the code between 971c77a and HEAD; if it is higher, July's advantage
+# was the measurement, and the mean-pooling fix is worth what it should be worth.
+# =============================================================================

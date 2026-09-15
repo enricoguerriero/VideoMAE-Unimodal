@@ -11,9 +11,16 @@
 #
 # DATA_CONFIG decides the task, the thresholds and the bucket keep/drop list, and
 # with it the head width, the output activation and the loss. Omit it to use
-# `data_config:` from configs/config.yaml.
+# `data_config:` from the training config.
+#
+# The TRAINING config (LR, batch size, epochs, scheduler, head) is a separate
+# axis, chosen with --config; it defaults to configs/config.yaml. Reproducing an
+# old run means pinning both, e.g. the 2026-07-14 run:
+#
+#   bash scripts/train.sh VideoMAE 0 configs/data.yaml --config configs/config_thesis.yaml
 #
 # Useful EXTRA args (passed straight through to src.training):
+#   --config PATH               training config YAML (default configs/config.yaml)
 #   --sites Haydom              train + validate on one hospital only (repeatable,
 #                               case-insensitive; test sets are already per-site)
 #   --attention_pooling         learned pooling instead of the pretrained fc_norm
