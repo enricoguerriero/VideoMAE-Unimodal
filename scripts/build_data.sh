@@ -28,37 +28,41 @@ DATA_CONFIG="${1:-$(python -c "import yaml;print(yaml.safe_load(open('configs/co
 TEST_RATIO="${2:-0.20}"    # share of EACH site's clips held out as its test set
 TRAIN_RATIO="${3:-0.80}"   # share of the remainder used for training
 
-HAYDOM_VIDEOS="/spo/LS-Haydom/ProcessedData/Athavan_Frida/Data_processing/Processed_data_stratified_BIG_update_strict_label/videos"
+# RE-CUT TREE (2026-09: 461 cases / ~138.9k clips, cut from Ronald's corrected
+# annotations by scripts/recut_haydom.sh). The old tree is still on disk at
+# Processed_data_stratified_BIG_update_strict_label/videos — swap the two lines
+# back to rebuild the pre-recut manifest.
+HAYDOM_VIDEOS="/spo/LS-Haydom/ProcessedData/Athavan_Frida/Data_processing/Processed_data_recut/videos"
 DRC_VIDEOS="/spo/LS-DRC/ProcessedData/Athavan_Frida/Data_processing/Processed_data_new_dataset_no_suction_merge_bulp_new_anot_chestmov/videos"
 
 # ---------------------------------------------------------------- backfill
-# The Haydom tree was cut before data_process.py wrote `_stim0.67` fraction
-# tags, so its labels were frozen at the cut the processor used and moving a
-# threshold in configs/data.yaml changed DRC only — the two sites silently
-# stopped meaning the same thing. --annotations rebuilds those fractions from
-# the annotation files (see src/data/annotations.py) and unfreezes them.
+# Since the re-cut, Haydom's clips DO carry `_stim0.67` fraction tags, so the
+# backfill is no longer about unfreezing an untagged site. It is still required
+# for a PER-DEVICE config: filenames only ever carried `_stim/_vent/_suct`, so
+# penguin/bulb/tube can only come from the annotation files' column 5.
 #
-# It refuses to run unless it first reproduces tags that already exist, which is
-# what HAYDOM_VERIFY is for: a small tagged vintage of the same site, used as
-# ground truth and never indexed into the manifest. scripts/audit_source_data.py
-# section 8c is the same check, run standalone.
+# The backfill refuses to run unless the same computation reproduces tags that
+# already exist; the re-cut tree's own tagged rows are that reference now.
 #
 # Set BACKFILL=0 to build the manifest the old way (Haydom stays untagged and
 # keeps its bucket+directory labels).
 BACKFILL="${BACKFILL:-1}"
-# All five directories the audit locates Haydom cases in. Two of them is not
-# enough: a case ambiguous in one export (two files, different content) can be
-# clean in another, and passing only 2 left 4 cases unresolved instead of 3 —
-# 1,222 clips rather than 595. Order does not matter, AnnotationIndex ranks by
-# size and prefers an exact filename match over a digit-run one.
+# ONE directory now: the anot_files recut_haydom.sh STAGED. They are the exact
+# annotations the re-cut clips were produced from, keyed by the same case ids,
+# and they keep the original event string in column 5 — which is what lets the
+# per-device backfill resolve penguin/bulb/tube. Mixing the other exports back in
+# would reintroduce the vintage confound the re-cut exists to remove.
 HAYDOM_ANNOTATION_DIRS=(
-    "/spo/LS-Haydom/Data/FullDataset/2023-2025/Annotations"
-    "/spo/LS-Haydom/Data/FullDataset/2025-2026/March2026Sync/annotations"
-    "/spo/LS-Haydom/ProcessedData/Athavan_Frida/FullDataset_Combined/Annotations"
-    "/spo/LS-Haydom/ProcessedData/Ronald/data/Tanzania/annotations_corrected"
-    "/spo/LS-Haydom/ProcessedData/Athavan_Frida/Data_processing/Unprocessed_data/temp_folder/unique_data/videos/annotations"
+    "/spo/LS-Haydom/ProcessedData/Athavan_Frida/Data_processing/Data_processing_recut/Unprocessed_data/anot_files"
 )
-HAYDOM_VERIFY="/spo/LS-Haydom/ProcessedData/Athavan_Frida/Data_processing/Processed_data_stratified_BIG_update_strict_label_test/videos"
+# EMPTY since the re-cut. --verify-root is only needed when a site's own clips
+# carry no fraction tags; the re-cut tree is tagged (data_process.py:286), so
+# the manifest's own Haydom rows are the reference. The old vintage below was
+# cut from DIFFERENT annotations, so verifying against it would compare two
+# pipeline runs and fail the >= min-agreement gate, silently skipping the
+# backfill and leaving no per-device suction fractions.
+#   old: .../Processed_data_stratified_BIG_update_strict_label_test/videos
+HAYDOM_VERIFY=""
 DRC_ANNOTATIONS="/spo/LS-DRC/ProcessedData/Athavan_Frida/Data_processing/Unprocessed_data/anot_files"
 
 # --rebackfill-all is not optional once a data config slices an activity more
