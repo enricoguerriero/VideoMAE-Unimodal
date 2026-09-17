@@ -43,10 +43,10 @@ DRC_BASE="${DRC_BASE:-/spo/LS-DRC/ProcessedData/Athavan_Frida/Data_processing}"
 # should prefer one directory — see the note in scripts/recut_haydom.sh about
 # mixing export vintages.
 HAYDOM_ANNOTATION_DIRS=(
+    "/spo/LS-Haydom/ProcessedData/Ronald/data/Tanzania/annotations_corrected"
     "/spo/LS-Haydom/Data/FullDataset/2023-2025/Annotations"
     "/spo/LS-Haydom/Data/FullDataset/2025-2026/March2026Sync/annotations"
     "/spo/LS-Haydom/ProcessedData/Athavan_Frida/FullDataset_Combined/Annotations"
-    "/spo/LS-Haydom/ProcessedData/Ronald/data/Tanzania/annotations_corrected"
     "$HAYDOM_BASE/Unprocessed_data/temp_folder/unique_data/videos/annotations"
 )
 DRC_ANNOTATIONS="${DRC_ANNOTATIONS:-$DRC_BASE/Unprocessed_data/anot_files}"
