@@ -378,6 +378,11 @@ def main():
     p.add_argument("--compare", type=Path, default=None, metavar="CSV",
                    help="An existing manifest (data/clips_all.csv) to diff the "
                         "projection against, per bucket.")
+    p.add_argument("--dump-projection", type=Path, default=None, metavar="CSV",
+                   help="Write the per-case projected bucket census to this CSV "
+                        "(case_id, bucket_0..bucket_8, total). Works under --dry-run, "
+                        "so the effect on cases you ALREADY have can be diffed before "
+                        "anything is encoded. See scripts/diff_recut_projection.py.")
     p.add_argument("--dry-run", action="store_true",
                    help="Project and stop. Writes nothing at all.")
     p.add_argument("--yes", action="store_true",
@@ -457,7 +462,7 @@ def main():
             unusable.append((entry["case_id"], "no window fits inside the video"))
             continue
         census.update(c)
-        per_case[entry["case_id"]] = sum(c.values())
+        per_case[entry["case_id"]] = c
         prepared[entry["case_id"]] = (cleaned, visibility)
         if i % 50 == 0:
             print(f"  ...projected {i:,}/{len(paired):,} case(s)", flush=True)
@@ -467,6 +472,17 @@ def main():
         old, old_cases = read_manifest_census(args.compare, args.site)
         compare = (old, old_cases) if old is not None else None
     report_projection(census, per_case, unusable, compare, args.site)
+
+    if args.dump_projection:
+        args.dump_projection.parent.mkdir(parents=True, exist_ok=True)
+        buckets = sorted(BUCKET_NAMES)
+        with args.dump_projection.open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["case_id"] + [f"bucket_{b}" for b in buckets] + ["total"])
+            for cid, counts in sorted(per_case.items()):
+                row = [counts.get(b, 0) for b in buckets]
+                w.writerow([cid] + row + [sum(row)])
+        print(f"\n  [written] per-case projection -> {args.dump_projection}")
 
     if args.dry_run:
         print("\n--dry-run: nothing was written.")
