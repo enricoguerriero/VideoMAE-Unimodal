@@ -16,8 +16,14 @@ Kept verbatim from the thesis (video path only):
       non_target = 0.20, weak = 0.20.
     * single-label taxonomy with purity rules; ambiguous clips routed to
       no_overlap / no_label / partial / target_overlap buckets.
-    * frames resized to 256x192; filename
-      {case}_interval_{n}_start_{ms}_end_{ms}{tag}_{labelnum}.mp4.
+    * filename {case}_interval_{n}_start_{ms}_end_{ms}{tag}_{labelnum}.mp4.
+
+CHANGED from the thesis: clips are written at the SOURCE resolution, not resized
+to 256x192. That resize was an aspect squash (16:9 source -> 4:3 clip) whose
+detail VideoMAEImageProcessor then upsamples back to 224 and cannot recover, and
+it costs the classes carried by small objects — suction above all. Pass
+`clip_size=(256, 192)` to VideoDataProcessor (or --clip-size 256x192 to
+recut_site.py) to reproduce the existing trees byte-for-byte. See `save_clips`.
 
 Offsets are NOT used: the video path works in raw video/annotation milliseconds;
 `offset_video`/`offset_acc` only ever affected the (removed) accelerometer branch.
@@ -155,7 +161,8 @@ def bucket_for_label(label: str):
 
 class VideoDataProcessor:
     def __init__(self, video_file, annotation_file, segment_size, shift,
-                 date_of_recording, folder_name, for_predict=False, base_dir=None):
+                 date_of_recording, folder_name, for_predict=False, base_dir=None,
+                 clip_size=None):
         self.video_file = video_file
         self.annotation_file = annotation_file
         self.segment_size = segment_size
@@ -163,6 +170,10 @@ class VideoDataProcessor:
         self.date_of_recording = date_of_recording
         self.for_predict = for_predict
         self.folder_name = folder_name
+        #: (width, height) to write clips at, or None for the SOURCE resolution.
+        #: See `save_clips` — None is the default now, and 256x192 reproduces the
+        #: thesis' trees.
+        self.clip_size = tuple(clip_size) if clip_size else None
 
         # Label thresholds (identical to the thesis).
         self.STRONG_THRESHOLD = 0.5      # stimulation / ventilation
@@ -317,9 +328,40 @@ class VideoDataProcessor:
 
     # ------------------------------------------------------------------ saving
     def save_clips(self):
+        """Cut and write the clips.
+
+        RESOLUTION. The thesis resized every frame to 256x192 here and wrote the
+        clip at that size. That is not a neutral choice:
+
+          * it is an ASPECT SQUASH, not a downscale — the Haydom source is 16:9
+            and 256x192 is 4:3, so horizontal detail is compressed by a further
+            ~25 % relative to vertical;
+          * VideoMAEImageProcessor then resizes the short edge back UP to 224 and
+            centre-crops, so the model is fed an upsampled 192 px image. Nothing
+            downstream can recover what the squash removed;
+          * it costs the CLASSES CARRIED BY SMALL OBJECTS. A bag mask covers the
+            whole face and survives; a penguin suction device at the newborn's
+            nose is a handful of pixels at 192 px and does not. Ronald
+            Paleczny's pipeline (Master-project/src/data/
+            generate_clips_from_assignments.py) has no scale filter at all — he
+            cuts at source resolution and lets the processor do the one resize.
+
+        `clip_size=None` (the default now) writes at the SOURCE resolution and
+        leaves every resize to VideoMAEImageProcessor. Pass clip_size=(256, 192)
+        to reproduce the existing trees exactly.
+
+        Cost of the default: clips are several times larger on disk. That is the
+        trade being made deliberately — see scripts/recut_haydom.sh.
+        """
         import cv2
         labeled = self.label_all_clips()
-        _, cap, fps, _, _ = self.load_video_data()
+        _, cap, fps, src_w, src_h = self.load_video_data()
+        size = self.clip_size or (src_w, src_h)
+        if not all(size):
+            raise ValueError(
+                f"{self.video_file}: could not read a frame size from the video "
+                f"({src_w}x{src_h}) and no clip_size was given, so there is "
+                f"nothing to write clips at.")
         for index, (clip_start, clip_end, label, tag) in enumerate(labeled):
             cap.set(cv2.CAP_PROP_POS_MSEC, clip_start)
             current, frames = clip_start, []
@@ -327,7 +369,12 @@ class VideoDataProcessor:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                frames.append(cv2.resize(frame, (256, 192)))
+                # Only resize when one was actually asked for. cv2.resize to the
+                # frame's own size is a copy, not a no-op, and at source
+                # resolution that is the expensive kind.
+                frames.append(cv2.resize(frame, size)
+                              if self.clip_size and frame.shape[1::-1] != size
+                              else frame)
                 # one cap.read() advances exactly ONE frame, so the cursor moves
                 # by one frame period. Using `shift / fps` happened to agree only
                 # because SHIFT == 1; any other stride truncated the clip.
@@ -341,7 +388,17 @@ class VideoDataProcessor:
                 continue
             fname = f"{self.date_of_recording}_interval_{index + 1}_start_{clip_start}_end_{clip_end}{tag}_{label_num}.mp4"
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            out = cv2.VideoWriter(os.path.join(out_dir, fname), fourcc, fps, (256, 192))
+            path = os.path.join(out_dir, fname)
+            out = cv2.VideoWriter(path, fourcc, fps, size)
+            # A VideoWriter that cannot open the codec at this size does NOT
+            # raise: it silently accepts every write and leaves a 0-byte file,
+            # which would only surface hours later as a corpus of unreadable
+            # clips. The size is no longer a constant, so check it.
+            if not out.isOpened():
+                raise RuntimeError(
+                    f"cv2.VideoWriter could not open {path} with fourcc mp4v at "
+                    f"{size[0]}x{size[1]} @ {fps} fps. This OpenCV build may not "
+                    f"encode that size; pass clip_size to write smaller clips.")
             for f in frames:
                 out.write(f)
             out.release()

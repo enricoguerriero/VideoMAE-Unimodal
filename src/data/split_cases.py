@@ -84,7 +84,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from .manifest import evidence_masses, explain_bad_manifest, read_manifest
+from .manifest import (evidence_masses, explain_bad_manifest, label_keys,
+                       read_manifest, resolve_key)
 from .spec import DataSpec
 
 # The thesis' 14 held-out cases (DRC: 4, Haydom: 10). They are SEEDS for the
@@ -299,16 +300,9 @@ def label_distribution(df: pd.DataFrame, spec: DataSpec):
     """What the CURRENT data config resolves this split into. Report only."""
     kept, dropped = Counter(), 0
     memo: dict[tuple, object] = {}
-    frac_cols = spec.frac_columns()
-    tagged_col = (df["tagged"].astype(int) if "tagged" in df.columns
-                  else pd.Series(1, index=df.index))
-    dir_col = df["clip_dir"] if "clip_dir" in df.columns else pd.Series("", index=df.index)
-    for key in zip(df["bucket"].astype(int), tagged_col, dir_col,
-                   *(df[c].astype(float) for c in frac_cols)):
+    for key in label_keys(df, spec):
         if key not in memo:
-            fracs = dict(zip(spec.activities, key[3:]))
-            label = spec.resolve(int(key[0]), fracs, tagged=bool(key[1]),
-                                 dir_activities=spec.activities_from_path(key[2]))
+            label = resolve_key(spec, key)
             if label is None:
                 memo[key] = None
             elif spec.is_multilabel:

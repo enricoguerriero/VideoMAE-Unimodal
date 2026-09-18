@@ -1,0 +1,149 @@
+# =============================================================================
+# data_multilabel_thesis_visible.yaml — data_multilabel_thesis.yaml + the
+#                                       baby-visible gate. TWO keys differ.
+# =============================================================================
+# This is the Haydom experiment that asks one question:
+#
+#   How much of our suction FALSE-POSITIVE mass lives in windows where the
+#   newborn is not on camera at all?
+#
+# Ronald Paleczny's Haydom pipeline (Master-project/src/data/
+# clips_and_video_stats.py) keeps a 3 s window ONLY if it lies fully inside a
+# `Newborn visible in video frame` span. Everything else goes to
+# clips_baby_not_visible_unlabeled.csv and is never trained on and never
+# scored. Ours does the opposite: data_process.py:212 deletes the visibility
+# rows before labelling, so those windows are in our corpus as NEGATIVES.
+#
+# That is the largest population difference between the two corpora, and it is
+# the one that fits the symptom. His reported suction is P 0.831 / R 0.762;
+# ours is P ~0.09 / R 0.76. The RECALL matches. The whole gap is false
+# positives — which is what a negative pool full of "no baby in frame" windows
+# produces, and what removing that pool should fix.
+#
+# NO RE-CUT AND NO RE-SPLIT. `frac_visible` is recomputed from the annotation
+# files and each clip's `_start_{ms}_end_{ms}`, exactly the way the fraction
+# backfill already recomputes `frac_*`. It is a manifest column, so this is a
+# load-time filter over the CSVs you already have:
+#
+#   bash scripts/build_data.sh configs/data_multilabel_thesis_visible.yaml
+#   bash scripts/train.sh VideoMAE 0 configs/data_multilabel_thesis_visible.yaml \
+#        --config configs/config_thesis.yaml
+#
+# -----------------------------------------------------------------------------
+# READ THE BUILD REPORT BEFORE YOU TRAIN
+# -----------------------------------------------------------------------------
+# build_manifest.py prints a `visibility:` block per site. The number that
+# decides whether this experiment is worth running is `unmeasured` — clips whose
+# case has no usable visibility annotation. If that is a large share of Haydom,
+# this gate is not reproducing Ronald's filter, it is deleting episodes, and the
+# result will be uninterpretable. Check it first, then come back and set
+# `unknown_visibility` deliberately.
+# =============================================================================
+
+# ---------------------------------------------------------------- task
+task: multilabel
+activities: [stimulation, ventilation, suction]
+negative_class: non_target
+
+tag_keys:
+  stimulation: stim
+  ventilation: vent
+  suction: suct
+
+# ---------------------------------------------------------------- labeling
+# Byte-identical to data_multilabel_thesis.yaml. Nothing about the LABEL changes
+# here — only which clips are admitted — so any difference in the result is
+# attributable to the gate and to nothing else.
+thresholds:
+  stimulation: 0.50
+  ventilation: 0.50
+  suction: 0.25
+
+weak_threshold: 0.20
+ambiguous: drop
+overlap_resolution: drop
+
+# =============================================================================
+# >>> THE TWO KEYS THAT DIFFER FROM data_multilabel_thesis.yaml <<<
+# =============================================================================
+#
+# min_visible_fraction — the share of a clip's 3 s window that must fall inside
+# a `Newborn visible in video frame` span for the clip to be used at all.
+#
+#   0.0   gate OFF. The default everywhere else, and what every existing config
+#         and every checkpoint trained before this key does.
+#   1.0   Ronald's rule exactly: FULLY inside a visible span, no partial credit.
+#
+# 1.0 is the right first experiment even though it is the harshest setting,
+# because it is the one that reproduces his population. If it moves suction
+# precision, intermediate values (0.5, 0.75) tell you how much of the effect is
+# the strictness and how much is the gate existing at all — but run those second,
+# as a sweep, not instead of this.
+min_visible_fraction: 1.0
+
+# unknown_visibility — what to do with a clip whose visibility was never
+# MEASURED: no annotation file for its case, no `_start_.._end_..` in its
+# filename, or an annotation file that never uses the visibility label.
+#
+# Unknown is not the same as "not visible", and conflating the two is how a gate
+# quietly deletes whole hospitals. The two settings answer different questions:
+#
+#   keep  gate only the clips we actually measured. Our corpus minus the windows
+#         we can PROVE show no baby. This isolates the gate's effect and is the
+#         honest comparison against our own previous runs.
+#   drop  Ronald's behaviour. A case with no visibility annotation yields no
+#         clips at all, because no window can be shown to lie inside a visible
+#         span. Closer to his corpus, at the cost of losing episodes for an
+#         annotation-coverage reason rather than a content reason.
+#
+# `keep` first. It changes one thing. Switch to `drop` only after you have read
+# the `unmeasured` line in the build report and know what it costs.
+unknown_visibility: keep
+# =============================================================================
+
+# ---------------------------------------------------------------- buckets
+# BYTE-IDENTICAL to data_multilabel_thesis.yaml, deliberately. The gate must be
+# the only population change in this run.
+buckets:
+  0: keep   # non_target
+  1: keep   # stimulation
+  2: keep   # ventilation
+  3: keep   # suction
+  4: keep   # no_overlap
+  5: drop   # no_label
+  6: drop   # partial
+  7: drop   # target_overlap
+  8: drop   # partial_overlap
+
+# ---------------------------------------------------------------- inference
+# Left at 0.5, same as the control run. Tune on VALIDATION afterwards and report
+# both — but compare the two runs at the SAME cut first, or the gate's effect and
+# a threshold move get mixed into one number.
+decision_thresholds:
+  stimulation: 0.5
+  ventilation: 0.5
+  suction: 0.5
+
+annotation_events: {}
+
+# =============================================================================
+# How to read the result
+# =============================================================================
+# The gate changes the test set, so `suction/f1` is NOT directly comparable to
+# the control run — a rarer-negative test set raises precision arithmetically,
+# which is the same trap as Ronald's thinned test.csv.
+#
+# Compare on:
+#   * suction/ap        threshold-free, and far less sensitive to the negative
+#                       count than precision is. If AP moves, the gate improved the
+#                       problem. If only precision moves, it changed the
+#                       denominator.
+#   * the per-class `sup` column, which says how many clips each activity is
+#     actually scored over in each run.
+#
+# And score the gated MODEL on the UNGATED test set too — that is the deployment
+# question (a live stream has no visibility annotation to gate on):
+#
+#   bash scripts/test.sh VideoMAE <ckpt>.pt 0 "" \
+#        --data-config configs/data_multilabel_thesis.yaml
+# =============================================================================

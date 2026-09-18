@@ -111,6 +111,8 @@ configs/data.yaml
       ├─ weak_threshold ───► which count as absent  (the band between is ambiguous)
       ├─ ambiguous ────────► drop the clip / call it negative / mask that activity
       ├─ buckets ──────────► which of the nine label buckets are eligible at all
+      ├─ min_visible_fraction ► the baby-visible gate (0.0 = off)
+      ├─ unknown_visibility ► what to do with clips whose visibility is unmeasured
       └─ decision_thresholds ► the sigmoid cut at inference (multilabel)
 ```
 
@@ -247,6 +249,106 @@ and warns on any clip whose directory disagrees with its bucket.
 all:** bucket 6 (`partial`) is 25,354 clips, 20,854 of them Haydom, and with
 `ambiguous: mask` each one still supervises the activities it *can* speak to.
 
+### The baby-visible gate (`min_visible_fraction`)
+
+Haydom's annotators mark `Newborn visible in video frame`. The thesis'
+`data_process.py` **deletes those rows** before labelling (line 212), so windows
+where the newborn is off camera are in our corpus as ordinary NEGATIVES. Ronald
+Paleczny's Haydom pipeline does the opposite: a 3 s window is kept only if it
+lies **fully inside** a visible span, and everything else is set aside in
+`clips_baby_not_visible_unlabeled.csv` and never trained or tested on.
+
+That is the largest population difference between the two corpora, and it fits
+the symptom. His reported suction is P 0.831 / R 0.762; ours is P ~0.09 /
+R 0.76 — the **recall matches and the whole gap is false positives**, which is
+what a negative pool full of "no baby in frame" windows produces.
+
+`build_manifest.py` now records `frac_visible` per clip: the share of the window
+inside a visible span, recomputed from the annotation files and the clip's own
+`_start_{ms}_end_{ms}`, exactly the way `frac_*` is backfilled. It rides on
+`--annotations`, which `scripts/build_data.sh` already passes.
+
+Two data-config keys use it, both **off by default** — every existing config and
+every checkpoint trained before them behaves exactly as it did:
+
+| key | meaning |
+|---|---|
+| `min_visible_fraction` | share of the window that must be inside a visible span. `0.0` = gate off (default). `1.0` = Ronald's rule. |
+| `unknown_visibility` | what to do with a clip whose visibility was never **measured**: `keep` (default) or `drop` (his behaviour). |
+
+`configs/data_multilabel_thesis_visible.yaml` is the experiment: identical to
+`data_multilabel_thesis.yaml` in every other key, so the gate is the only change.
+
+```bash
+bash scripts/build_data.sh configs/data_multilabel_thesis_visible.yaml
+bash scripts/train.sh VideoMAE 0 configs/data_multilabel_thesis_visible.yaml \
+     --config configs/config_thesis.yaml
+```
+
+**Unknown is not "not visible", and the difference decides whole cases.** A clip
+is unmeasured when its case has no annotation file, its filename carries no time
+window, or its annotator never used the visibility label at all. Reading those as
+0.0 would silently delete every clip of every such case, so they are stored as an
+empty cell and `unknown_visibility` decides them. `build_manifest.py` prints the
+split per site — **read this before training**:
+
+```
+    visibility: 128,904 / 138,900 clip(s) measured against `Newborn visible in video frame`
+              fully inside      81,233   58.5%   <- kept by min_visible_fraction: 1.0
+              partly inside      9,110    6.6%
+              outside           38,561   27.8%
+              unmeasured         9,996    7.2%   <- unknown_visibility decides these
+              31 of 461 case(s) have no usable visibility annotation at all;
+              with `unknown_visibility: drop` those cases contribute NOTHING:
+```
+
+(Illustrative shape, not measured numbers — run it.) If `unmeasured` is a large
+share, the gate is not reproducing his filter, it is deleting episodes, and the
+result is uninterpretable. Start with `unknown_visibility: keep`, which changes
+one thing.
+
+**The split is not affected.** `split_cases.py` balances on raw fraction-mass and
+never consults the data config, so turning the gate on does *not* reshuffle cases
+between train/val/test. The comparison is on one fixed split.
+
+**Read `suction/ap`, not `suction/f1`.** The gate removes negatives, so precision
+rises arithmetically whether or not the model improved — the same trap as
+Ronald's thinned `test.csv`. AP is far less sensitive to the negative count. And
+score the gated model on the **ungated** test set too, because a live stream has
+no visibility annotation to gate on:
+
+```bash
+bash scripts/test.sh VideoMAE <ckpt>.pt 0 "" \
+     --data-config configs/data_multilabel_thesis.yaml
+```
+
+### Clip resolution
+
+The thesis wrote every clip at **256×192**. That is not a neutral downscale: the
+Haydom source is 16:9 and 256×192 is 4:3, so it is an aspect **squash**, and
+`VideoMAEImageProcessor` then resizes the 192 px short edge back *up* to 224 and
+centre-crops. The model is fed upsampled detail that no longer exists.
+
+It costs the classes carried by small objects. A bag mask covers the whole face
+and survives; a penguin suction device at the newborn's nose is a handful of
+pixels at 192 px and does not. Ronald's `generate_clips_from_assignments.py`
+applies no scale filter at all — he cuts at source resolution and lets the
+processor do the one resize it was always going to do.
+
+`data_process.py` now writes at the **source resolution** by default. Labels,
+buckets, filenames and clip boundaries are unchanged — only the pixels differ —
+so a before/after run on the same split is a clean single-variable test.
+
+```bash
+bash scripts/recut_haydom.sh --yes                      # source resolution
+CLIP_SIZE=256x192 bash scripts/recut_haydom.sh --yes    # reproduce the old tree
+```
+
+**Clips are several times larger on disk.** Check free space on the output volume
+before a full run; the existing 256×192 tree is the size reference. `--clip-size
+WxH` on `src.data.recut_site` and `clip_size=(w, h)` on `VideoDataProcessor` are
+the same switch.
+
 ### One test set per hospital
 
 Haydom and DRC differ in camera, lighting, staff and protocol, so a single pooled
@@ -324,7 +426,8 @@ python -m src.data.process_dataset \
 ```
 
 `data_process.py` reproduces the thesis' video labeling exactly (thresholds
-strong=0.50, suction=0.25, non_target=0.20; 3 s / 1 s / 256×192). The
+strong=0.50, suction=0.25, non_target=0.20; 3 s window / 1 s stride) but **no
+longer resizes clips to 256×192** — see *Clip resolution* below. The
 annotation-cleaning chain (spelling fixes, DRC breathing-label removal,
 event→category remap) is **site/data-specific and not ported** — supply
 already-cleaned annotations, or reuse the existing processed clips (Step 1).
@@ -717,6 +820,23 @@ what happens to it:
 stimulation and 60 % ventilation is a confident ventilation **positive** and a
 genuinely unknown stimulation label; masking the stimulation term keeps the
 clip's real supervision without inventing a negative.
+
+**Whether the newborn has to be on camera.** Off by default. See
+[The baby-visible gate](#the-baby-visible-gate-min_visible_fraction) for what it
+is for and how to read the result:
+
+```yaml
+min_visible_fraction: 0.0   # 0.0 = off. 1.0 = the clip must lie FULLY inside a
+                            #   `Newborn visible in video frame` span.
+unknown_visibility: keep    # clips whose visibility was never MEASURED:
+                            #   keep = gate only what we measured
+                            #   drop = a case with no visibility annotation
+                            #          contributes nothing
+```
+
+Requires a manifest carrying `frac_visible` (built with `--annotations`, which
+`scripts/build_data.sh` passes). Turning the gate on against a manifest without
+that column is a loud error, not a silent no-op.
 
 **Which buckets to keep.** `data_process.py` sorted every window into one of nine
 buckets and wrote all of them to disk. `buckets:` decides which are eligible:

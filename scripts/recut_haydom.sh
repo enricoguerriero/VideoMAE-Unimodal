@@ -57,8 +57,27 @@ OUT_DIR="${OUT_DIR:-$HAYDOM_BASE/Processed_data_recut}"
 WORKERS="${WORKERS:-1}"
 COMPARE="${COMPARE:-data/clips_all.csv}"
 
+# ---------------------------------------------------------------- resolution
+# EMPTY = write clips at the SOURCE resolution and let VideoMAEImageProcessor do
+# the one resize it was going to do anyway. This is the default since 2026-09 and
+# it is a deliberate break from the thesis, which wrote 256x192.
+#
+# Why: 256x192 is 4:3 and the Haydom source is 16:9, so it is an aspect SQUASH,
+# not a downscale — and the processor then resizes the 192 px short edge back up
+# to 224, so the model is fed upsampled detail that no longer exists. Ventilation
+# survives that (a bag mask covers the whole face); suction does not (a penguin
+# device at the nose is a handful of pixels at 192 px). Ronald Paleczny's
+# pipeline applies no scale filter at all, which is the difference this undoes.
+#
+# COST: clips are several times larger. Check free space on the OUT_DIR volume
+# before a full run — the 256x192 Haydom tree is the size reference.
+#
+#   CLIP_SIZE=256x192 bash scripts/recut_haydom.sh --yes    # reproduce the old tree
+CLIP_SIZE="${CLIP_SIZE:-}"
+
 ARGS=(--site Haydom --videos "$VIDEOS" --stage-dir "$STAGE_DIR" --out "$OUT_DIR"
       --workers "$WORKERS")
+[[ -n "$CLIP_SIZE" ]] && ARGS+=(--clip-size "$CLIP_SIZE")
 for a in "${ANNOTATIONS[@]}"; do
     if [[ -d "$a" ]]; then ARGS+=(--annotations "$a")
     else echo "[warn] annotation dir absent, skipping: $a"; fi
@@ -88,6 +107,12 @@ event string in column 5, which is what lets the per-device suction backfill
 resolve penguin/bulb/tube from them), then:
 
     bash scripts/build_data.sh configs/data_suction3.yaml
+
+Clips are now written at the SOURCE resolution (see CLIP_SIZE above), so the new
+tree is NOT byte-comparable with the old one and is much larger on disk. Labels,
+buckets, filenames and clip boundaries are unchanged — only the pixels differ —
+so a before/after comparison on the same split is still a clean single-variable
+test of the resolution.
 
 Re-splitting is unavoidable: new cases mean new train/val/test membership, so
 every number from before the re-cut is measured on a different test set. The 14

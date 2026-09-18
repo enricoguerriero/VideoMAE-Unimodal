@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .spec import DataSpec
+from .spec import DataSpec, parse_visible
 
 
 def read_manifest(path) -> pd.DataFrame:
@@ -31,6 +31,40 @@ def read_manifest(path) -> pd.DataFrame:
     """
     return pd.read_csv(path, dtype={"case_id": str, "clip_dir": str},
                        keep_default_na=False)
+
+
+def label_keys(df: pd.DataFrame, spec: DataSpec) -> list:
+    """Memo keys for `spec.resolve`, one per row.
+
+        (bucket, tagged, clip_dir, frac_visible, *fracs)
+
+    The manifest rounds every fraction to 2 decimals, so 10^5 clips collapse to
+    a few thousand distinct keys and `resolve` runs once per key instead of once
+    per clip. Four reporting paths built this tuple by hand and each had to be
+    edited in step whenever a column joined the evidence — `frac_visible` is the
+    second time that happened, so the shape lives here now and `resolve_key`
+    below is the only place that knows which slot is which.
+
+    Columns absent from an older manifest fall back to the values that reproduce
+    the pre-column behaviour: tagged=1, clip_dir="", frac_visible=None (unknown).
+    """
+    n = len(df)
+    tagged = (df["tagged"].astype(int) if "tagged" in df.columns
+              else pd.Series(1, index=df.index))
+    clip_dir = df["clip_dir"] if "clip_dir" in df.columns else pd.Series("", index=df.index)
+    visible = ([parse_visible(v) for v in df["frac_visible"]]
+               if "frac_visible" in df.columns else [None] * n)
+    return list(zip(df["bucket"].astype(int), tagged, clip_dir, visible,
+                    *(df[c].astype(float) for c in spec.frac_columns())))
+
+
+def resolve_key(spec: DataSpec, key):
+    """`spec.resolve` applied to one `label_keys` tuple -> ClipLabel | None."""
+    return spec.resolve(int(key[0]),
+                        dict(zip(spec.activities, key[4:])),
+                        tagged=bool(key[1]),
+                        dir_activities=spec.activities_from_path(key[2]),
+                        frac_visible=key[3])
 
 
 def evidence_masses(df: pd.DataFrame, spec: DataSpec) -> pd.DataFrame:

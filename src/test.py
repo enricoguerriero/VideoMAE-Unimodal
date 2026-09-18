@@ -53,7 +53,8 @@ import pandas as pd
 
 from src.utils import (load_model, collate_fn, compute_metrics,
                        DEFAULT_MINORITY_CLASS, wandb_utils as wu)
-from src.data import VideoMAEDataset, DataSpec, spec_from_checkpoint
+from src.data import (VideoMAEDataset, DataSpec, spec_from_checkpoint,
+                      parse_visible)
 
 VIT_MODELS = ["VideoMAE", "VideoMAEGiant"]
 
@@ -96,7 +97,9 @@ def confident_subset(rows, spec: DataSpec):
         label = spec.resolve(int(row.bucket), fracs,
                              tagged=bool(int(getattr(row, "tagged", 1))),
                              dir_activities=spec.activities_from_path(
-                                 getattr(row, "clip_dir", "")))
+                                 getattr(row, "clip_dir", "")),
+                             frac_visible=parse_visible(
+                                 getattr(row, "frac_visible", None)))
         if label is None:
             continue
         idx.append(i)

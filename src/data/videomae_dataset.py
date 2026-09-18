@@ -34,7 +34,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from .spec import DataSpec
+from .spec import DataSpec, parse_visible
 
 logger = logging.getLogger(__name__)
 
@@ -69,15 +69,25 @@ class VideoMAEDataset(Dataset):
         raw = video_csv if isinstance(video_csv, pd.DataFrame) else pd.read_csv(video_csv)
         source = source or ("<dataframe>" if isinstance(video_csv, pd.DataFrame)
                             else video_csv)
-        self.data, self.labels, self.masks, self.n_dropped = self._resolve_rows(raw, spec)
+        (self.data, self.labels, self.masks,
+         self.n_dropped, self.n_gated) = self._resolve_rows(raw, spec)
         if len(self.data) == 0:
             raise ValueError(
                 f"{source}: no clips survived the data config ({spec.source}). "
                 f"Every one of its {len(raw)} rows was dropped — check `buckets` "
-                f"and `thresholds` in the data config.")
+                f"and `thresholds` in the data config."
+                + (f" The baby-visible gate alone removed {self.n_gated} of them; "
+                   f"with `unknown_visibility: drop` a site whose annotations lack "
+                   f"the visibility label loses everything."
+                   if self.n_gated else ""))
         if self.n_dropped:
             logger.info(f"{source}: {len(self.data)} clips kept, "
                         f"{self.n_dropped} dropped by {spec.source}")
+        if self.n_gated:
+            logger.info(f"{source}: of those, {self.n_gated} were removed by the "
+                        f"baby-visible gate (min_visible_fraction="
+                        f"{spec.min_visible_fraction}, unknown_visibility="
+                        f"{spec.unknown_visibility})")
 
         self.videos, self.indices = self._prepare_videos(
             self.data["video_path"].tolist(), self.num_frames
@@ -90,9 +100,10 @@ class VideoMAEDataset(Dataset):
     def _resolve_rows(raw: pd.DataFrame, spec: DataSpec):
         """Apply the DataSpec row by row.
 
-        Returns (kept_df, labels, masks, n_dropped) where `labels` is (N,) int64
-        in multiclass and (N, C) float32 in multilabel, and `masks` is (N, C)
-        float32 in multilabel / None in multiclass.
+        Returns (kept_df, labels, masks, n_dropped, n_gated) where `labels` is
+        (N,) int64 in multiclass and (N, C) float32 in multilabel, `masks` is
+        (N, C) float32 in multilabel / None in multiclass, and `n_gated` is the
+        subset of `n_dropped` removed by the baby-visible gate alone.
         """
         frac_cols = spec.frac_columns()
         has_evidence = "bucket" in raw.columns and all(c in raw.columns for c in frac_cols)
@@ -118,19 +129,36 @@ class VideoMAEDataset(Dataset):
                 raise ValueError(
                     f"legacy manifest has label values outside "
                     f"[0, {spec.num_classes}): e.g. {bad[:5].tolist()}")
-            return raw.reset_index(drop=True), labels, None, 0
+            return raw.reset_index(drop=True), labels, None, 0, 0
 
         # `tagged`/`clip_dir` are absent from manifests built before fraction tags
         # were handled per site; assume tagged (the old behaviour) when missing.
         has_tag_cols = "tagged" in raw.columns and "clip_dir" in raw.columns
+        has_vis = "frac_visible" in raw.columns
+        if spec.gates_visibility and not has_vis:
+            raise ValueError(
+                f"{spec.source} sets min_visible_fraction="
+                f"{spec.min_visible_fraction} but this manifest has no "
+                f"`frac_visible` column, so the gate would silently do nothing. "
+                f"Rebuild with `bash scripts/build_data.sh` (the column is filled "
+                f"by --annotations, which that script already passes).")
+
         keep_idx, targets, masks = [], [], []
+        n_gated = 0
         for i, row in enumerate(raw.itertuples(index=False)):
             fracs = {a: float(getattr(row, f"frac_{a}")) for a in spec.activities}
             tagged = bool(int(getattr(row, "tagged"))) if has_tag_cols else True
             dir_acts = (spec.activities_from_path(getattr(row, "clip_dir"))
                         if has_tag_cols else ())
+            visible = parse_visible(getattr(row, "frac_visible")) if has_vis else None
+            # Counted separately from every other drop reason: the gate is the
+            # one that removes clips the model would otherwise have been right
+            # about, so "how much did it cost" has to be readable on its own.
+            if not spec.keeps_visibility(visible):
+                n_gated += 1
+                continue
             label = spec.resolve(int(row.bucket), fracs, tagged=tagged,
-                                 dir_activities=dir_acts)
+                                 dir_activities=dir_acts, frac_visible=visible)
             if label is None:
                 continue
             keep_idx.append(i)
@@ -146,8 +174,8 @@ class VideoMAEDataset(Dataset):
             return (kept,
                     torch.tensor(targets, dtype=torch.float32),
                     torch.tensor(masks, dtype=torch.float32),
-                    n_dropped)
-        return kept, torch.tensor(targets, dtype=torch.long), None, n_dropped
+                    n_dropped, n_gated)
+        return kept, torch.tensor(targets, dtype=torch.long), None, n_dropped, n_gated
 
     # ------------------------------------------------------------------
     # Class statistics (loss weights + head bias init)

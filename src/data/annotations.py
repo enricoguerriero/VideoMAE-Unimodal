@@ -359,6 +359,25 @@ def intervals_by_category(rows, kind=None) -> dict:
     return out
 
 
+def visibility_intervals(rows) -> list:
+    """Merged `Newborn visible in video frame` intervals for one case.
+
+    The exact rows `intervals_by_category` throws away. data_process.py drops
+    them too (line 212), so they have never reached a label — but Ronald
+    Paleczny's Haydom pipeline uses them as a GATE: a clip is training data only
+    if it lies fully inside one of these spans, and everything else goes to
+    `clips_baby_not_visible_unlabeled.csv` and is never trained or tested on.
+    That is the single largest population difference between the two corpora,
+    and `frac_visible` in the manifest is how this repo can reproduce it.
+
+    Typo-tolerant via `is_visibility`, and merged the same way every other
+    category is, so a span annotated twice is not counted twice.
+    """
+    spans = [(start, end) for event, start, end, original in rows
+             if is_visibility(original) or is_visibility(event)]
+    return merge_intervals(spans)
+
+
 def window_from_stem(stem: str):
     """(start_ms, end_ms) from a clip filename stem, or None.
 
@@ -487,23 +506,72 @@ class FractionSource:
         self.categories = dict(categories)
         self.segment_ms = segment_ms
         self._cache = {}
+        self._vis_cache = {}
         self.misses = Counter()
+
+    def _load(self, case_id: str):
+        """Read one case's annotation file once, filling BOTH caches.
+
+        The activity intervals and the visibility spans come from the same
+        parse, so a case is never read twice just because a caller wants the
+        other quantity.
+        """
+        ivs, vis = None, None
+        f = self.index.lookup(case_id)
+        if f is None:
+            self.misses["ambiguous" if self.index.is_ambiguous(case_id)
+                        else "no_annotation_file"] += 1
+        else:
+            got, err = read_annotation(f)
+            if err:
+                self.misses["unreadable"] += 1
+            else:
+                ivs = intervals_by_category(got[0])
+                vis = visibility_intervals(got[0])
+        self._cache[case_id] = ivs
+        self._vis_cache[case_id] = vis
 
     def intervals(self, case_id: str):
         if case_id not in self._cache:
-            ivs = None
-            f = self.index.lookup(case_id)
-            if f is None:
-                self.misses["ambiguous" if self.index.is_ambiguous(case_id)
-                            else "no_annotation_file"] += 1
-            else:
-                got, err = read_annotation(f)
-                if err:
-                    self.misses["unreadable"] += 1
-                else:
-                    ivs = intervals_by_category(got[0])
-            self._cache[case_id] = ivs
+            self._load(case_id)
         return self._cache[case_id]
+
+    def visibility(self, case_id: str):
+        """Merged visibility spans, or None when the case is unreadable.
+
+        An empty LIST and None are different answers and must stay that way: []
+        means "this file was read and marks the newborn visible nowhere", None
+        means "no usable annotation file for this case". The first is a real
+        measurement, the second is ignorance.
+        """
+        if case_id not in self._vis_cache:
+            self._load(case_id)
+        return self._vis_cache[case_id]
+
+    def visible_fraction(self, case_id: str, stem: str):
+        """Share of one clip's 3 s window inside a baby-visible span, or None.
+
+        None means UNKNOWN — no annotation file, no time window in the
+        filename, or a file that annotates no visibility at all. It is never
+        0.0 for those, because "not marked visible anywhere" and "marked, and
+        this window is outside it" carry completely different weight: reading
+        the first as 0.0 would silently delete every clip of every case whose
+        annotator never used the label.
+        """
+        window = window_from_stem(stem)
+        if window is None:
+            return None
+        vis = self.visibility(case_id)
+        if not vis:            # None (unreadable) or [] (never annotated)
+            return None
+        start, end = window
+        # 4 decimals, NOT the 2 the activity fractions use. That rounding exists
+        # to match the precision of the `_suct0.25` tags already on disk, and no
+        # filename has ever carried a visibility tag, so there is no parity to
+        # keep here. At 2 decimals a window 99.6 % inside a visible span rounds
+        # to 1.00 and passes `min_visible_fraction: 1.0` — which is exactly the
+        # "fully inside" test the gate is supposed to be.
+        return round(overlap_ms(start, end, vis) / self.segment_ms, 4)
 
     def fractions(self, case_id: str, stem: str):
         """{activity: fraction} for one clip, or None when unrecoverable.

@@ -44,6 +44,7 @@ TASKS = (MULTICLASS, MULTILABEL)
 AMBIGUOUS_POLICIES = ("drop", "negative", "mask")
 OVERLAP_POLICIES = ("dominant", "drop")
 BUCKET_POLICIES = ("keep", "drop")
+UNKNOWN_VISIBILITY_POLICIES = ("keep", "drop")
 
 #: The nine buckets data_process.py writes as the trailing `_N` of every clip.
 BUCKET_NAMES = {
@@ -108,6 +109,8 @@ class DataSpec:
     buckets: dict[int, str]
     decision_thresholds: dict[str, float]
     annotation_events: dict[str, str] = field(default_factory=dict)
+    min_visible_fraction: float = 0.0
+    unknown_visibility: str = "keep"
     source: str | None = field(default=None, compare=False)
 
     # ------------------------------------------------------------------ load
@@ -136,11 +139,15 @@ class DataSpec:
         buckets = {int(k): str(v).strip().lower() for k, v in (raw.get("buckets") or {}).items()}
         dec = {str(k): float(v) for k, v in (raw.get("decision_thresholds") or {}).items()}
         events = {str(k): str(v) for k, v in (raw.get("annotation_events") or {}).items()}
+        min_vis = float(raw.get("min_visible_fraction", 0.0))
+        unk_vis = str(raw.get("unknown_visibility", "keep")).strip().lower()
 
         spec = cls(task=task, activities=activities, negative_class=negative_class,
                    tag_keys=tag_keys, thresholds=thresholds, weak_threshold=weak,
                    ambiguous=ambiguous, overlap_resolution=overlap, buckets=buckets,
-                   decision_thresholds=dec, annotation_events=events, source=source)
+                   decision_thresholds=dec, annotation_events=events,
+                   min_visible_fraction=min_vis, unknown_visibility=unk_vis,
+                   source=source)
         spec.validate()
         return spec
 
@@ -158,6 +165,8 @@ class DataSpec:
             "buckets": dict(self.buckets),
             "decision_thresholds": dict(self.decision_thresholds),
             "annotation_events": dict(self.annotation_events),
+            "min_visible_fraction": self.min_visible_fraction,
+            "unknown_visibility": self.unknown_visibility,
         }
 
     def validate(self) -> None:
@@ -207,6 +216,13 @@ class DataSpec:
         unknown = sorted(set(self.annotation_events) - set(self.activities))
         if unknown:
             raise ValueError(f"annotation_events names non-activities: {unknown}")
+        if not 0.0 <= self.min_visible_fraction <= 1.0:
+            raise ValueError(
+                f"min_visible_fraction must be in [0, 1], got {self.min_visible_fraction}")
+        if self.unknown_visibility not in UNKNOWN_VISIBILITY_POLICIES:
+            raise ValueError(
+                f"unknown_visibility must be one of {UNKNOWN_VISIBILITY_POLICIES}, "
+                f"got {self.unknown_visibility!r}")
 
     # ------------------------------------------------------------------ shape
     @property
@@ -257,6 +273,37 @@ class DataSpec:
     def frac_columns(self) -> list[str]:
         """Manifest column names holding the per-activity window fractions."""
         return [f"frac_{a}" for a in self.activities]
+
+    @property
+    def gates_visibility(self) -> bool:
+        """Is the baby-visible gate on at all?
+
+        `min_visible_fraction: 0.0` means off, and is the default — every
+        existing config and every checkpoint written before this key existed
+        therefore behaves exactly as it did.
+        """
+        return self.min_visible_fraction > 0.0
+
+    def keeps_visibility(self, frac_visible) -> bool:
+        """Does this clip survive the baby-visible gate?
+
+        `frac_visible` is the share of the clip's 3 s window that falls inside a
+        `Newborn visible in video frame` span, or None when it is UNKNOWN — the
+        case has no annotation file, its filename carries no time window, or its
+        annotator never used the visibility label at all.
+
+        Unknown is NOT zero, and the difference decides whole cases rather than
+        stray clips, so it gets its own policy (`unknown_visibility`) instead of
+        being folded into the threshold. `keep` (the default) gates only clips
+        that were actually measured; `drop` reproduces Ronald Paleczny's
+        pipeline, where a case with no visibility annotation yields no training
+        data at all because no window can be shown to lie inside a visible span.
+        """
+        if not self.gates_visibility:
+            return True
+        if frac_visible is None:
+            return self.unknown_visibility == "keep"
+        return float(frac_visible) >= self.min_visible_fraction - _FRAC_EPS
 
     def keeps_bucket(self, bucket: int) -> bool:
         return self.buckets.get(int(bucket), "drop") == "keep"
@@ -385,7 +432,7 @@ class DataSpec:
         return None
 
     def resolve(self, bucket: int, fracs: dict[str, float], tagged: bool = True,
-                dir_activities=()) -> ClipLabel | None:
+                dir_activities=(), frac_visible=None) -> ClipLabel | None:
         """(bucket, fractions) -> ClipLabel, or None if the clip is dropped.
 
         `tagged=False` means the clip's filename carries no fraction tags although
@@ -397,7 +444,15 @@ class DataSpec:
             effectively applied when the clips were cut and cannot be re-tuned.
           * `overlap_resolution: dominant` has nothing to rank by, so a multiclass
             clip with two positives is dropped rather than assigned arbitrarily.
+
+        `frac_visible` is the manifest's `frac_visible` column (None when the
+        column is absent or empty) and is consulted only when
+        `min_visible_fraction > 0`. The gate runs FIRST, because it is a
+        statement about whether the clip is admissible evidence at all — it does
+        not depend on, and must not be confused with, what the clip is labelled.
         """
+        if not self.keeps_visibility(frac_visible):
+            return None
         if not self.keeps_bucket(bucket):
             return None
 
@@ -487,6 +542,16 @@ class DataSpec:
             f"  buckets kept      : {kept}  (dropped: "
             f"{[b for b in sorted(BUCKET_NAMES) if b not in kept]})",
         ]
+        if self.gates_visibility:
+            lines.append(
+                f"  baby-visible gate : ON — keep a clip only if >= "
+                f"{self.min_visible_fraction:.2f} of its window is inside a "
+                f"`Newborn visible in video frame` span")
+            lines.append(
+                f"    unmeasured clips: {self.unknown_visibility}  (no annotation "
+                f"file, or no visibility label in it)")
+        else:
+            lines.append("  baby-visible gate : off (min_visible_fraction: 0.0)")
         if not self.is_multilabel:
             lines.append(f"  >=2 activities    : {self.overlap_resolution}")
         else:
@@ -495,6 +560,27 @@ class DataSpec:
                 f"p({a})>={self.decision_thresholds.get(a, 0.5):.2f}"
                 for a in self.activities))
         return "\n".join(lines)
+
+
+def parse_visible(value) -> float | None:
+    """A manifest's `frac_visible` cell -> float, or None for UNKNOWN.
+
+    The column holds an empty string wherever visibility could not be measured,
+    and pandas may hand that back as "", NaN or None depending on how the CSV
+    was read. All three mean the same thing and must never become 0.0 — under a
+    gate, 0.0 deletes the clip while None defers to `unknown_visibility`.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if out != out else out      # NaN
 
 
 def load_spec(path: str | Path | None = None) -> DataSpec:

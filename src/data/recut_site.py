@@ -254,14 +254,32 @@ def stage_case(entry, cleaned, stage_dir: Path, copy_videos: bool) -> None:
         os.symlink(os.path.realpath(entry["video"]), dst)
 
 
-def cut_case(case_id: str, stage_dir: str, out_dir: str, segment_size: int, shift: int):
+def parse_clip_size(text: str):
+    """"WxH" -> (W, H), for --clip-size."""
+    try:
+        w, h = (int(v) for v in str(text).lower().split("x", 1))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--clip-size must look like 256x192, got: {text!r}")
+    if w <= 0 or h <= 0:
+        raise argparse.ArgumentTypeError(f"--clip-size must be positive, got: {text!r}")
+    return (w, h)
+
+
+def cut_case(case_id: str, stage_dir: str, out_dir: str, segment_size: int, shift: int,
+             clip_size=None):
     """One case through the unchanged VideoDataProcessor. Top-level so it can be
-    handed to a ProcessPoolExecutor."""
+    handed to a ProcessPoolExecutor.
+
+    `clip_size=None` writes clips at the SOURCE resolution — see
+    data_process.save_clips for why that is now the default.
+    """
     from .data_process import VideoDataProcessor
     proc = VideoDataProcessor(
         video_file=f"{case_id}.mp4", annotation_file=f"{case_id}.txt",
         segment_size=segment_size, shift=shift, date_of_recording=case_id,
-        folder_name=out_dir, for_predict=False, base_dir=stage_dir)
+        folder_name=out_dir, for_predict=False, base_dir=stage_dir,
+        clip_size=clip_size)
     proc.run_video_only()
     return case_id
 
@@ -408,6 +426,14 @@ def main():
                    help="Only handle the first N paired cases (smoke test).")
     p.add_argument("--only", action="append", default=None, metavar="CASE_ID",
                    help="Only this case id. Repeatable.")
+    p.add_argument("--clip-size", type=parse_clip_size, default=None, metavar="WxH",
+                   help="Write clips at WxH instead of the source resolution "
+                        "(e.g. 256x192, the thesis' value). The default writes at "
+                        "the SOURCE resolution and leaves every resize to "
+                        "VideoMAEImageProcessor — the thesis' 256x192 was an aspect "
+                        "squash whose lost detail cannot be recovered downstream, "
+                        "and it costs the small-object classes (suction) most. Use "
+                        "this only to reproduce an existing tree.")
     p.add_argument("--skip-existing", action="store_true",
                    help="Skip cases that already have clips under --out, so an "
                         "interrupted run can be resumed.")
@@ -423,6 +449,9 @@ def main():
     print(f"  stage-dir   : {args.stage_dir}")
     print(f"  out         : {args.out}")
     print(f"  geometry    : {args.segment_size}s clip / {args.shift}s stride")
+    print(f"  resolution  : "
+          + (f"{args.clip_size[0]}x{args.clip_size[1]} (forced)" if args.clip_size
+             else "source (no resize — VideoMAEImageProcessor does the only one)"))
 
     index = AnnotationIndex.from_roots(args.annotations)
     if not len(index):
@@ -525,7 +554,8 @@ def main():
         from concurrent.futures import ProcessPoolExecutor, as_completed
         with ProcessPoolExecutor(max_workers=args.workers) as ex:
             futures = {ex.submit(cut_case, c, stage_s, out_s,
-                                 args.segment_size, args.shift): c for c in todo}
+                                 args.segment_size, args.shift,
+                                 args.clip_size): c for c in todo}
             for n, fut in enumerate(as_completed(futures), 1):
                 case_id = futures[fut]
                 try:
@@ -539,7 +569,8 @@ def main():
     else:
         for n, case_id in enumerate(todo, 1):
             try:
-                cut_case(case_id, stage_s, out_s, args.segment_size, args.shift)
+                cut_case(case_id, stage_s, out_s, args.segment_size, args.shift,
+                         args.clip_size)
                 ok += 1
                 status = "ok"
             except Exception as exc:                   # noqa: BLE001 — keep going

@@ -94,7 +94,7 @@ from pathlib import Path
 
 from .annotations import (FRAC_TOL, SEGMENT_MS, AnnotationIndex, FractionSource,
                           window_from_stem)
-from .spec import BUCKET_NAMES, DataSpec, TAG_BEARING_BUCKETS
+from .spec import BUCKET_NAMES, DataSpec, TAG_BEARING_BUCKETS, parse_visible
 
 #: The tags data_process.py actually wrote, and the category each one measured.
 #: Verification uses THIS, never the spec's activities: once suction is split by
@@ -164,6 +164,11 @@ def scan_root(site: str, root: Path, spec: DataSpec, frac_activities=None):
             "bucket": bucket,
             "clip_dir": rel_dir,
             "tagged": int(tagged),
+            # No clip filename has ever carried a visibility tag, so this is
+            # UNKNOWN until --annotations fills it. Empty string, never 0.00: a
+            # zero here would mean "measured, and the baby was not visible", and
+            # under a visibility gate that reading deletes the entire corpus.
+            "frac_visible": "",
         }
         for a in (frac_activities or spec.activities):
             row[f"frac_{a}"] = f"{fracs.get(a, 0.0):.2f}"
@@ -234,7 +239,9 @@ def backfill_fractions(rows, site, ann_roots, spec: DataSpec, verify_rows,
     """
     rep = {"site": site, "index": None, "checked": 0, "ok": 0, "mism": [],
            "verified": False, "filled": 0, "candidates": 0, "untagged": 0,
-           "unfilled": Counter(), "unfilled_cases": {}, "skipped": None}
+           "unfilled": Counter(), "unfilled_cases": {}, "skipped": None,
+           "vis_rows": 0, "vis_measured": 0, "vis_full": 0, "vis_partial": 0,
+           "vis_none": 0, "vis_cases_without": set(), "vis_cases": set()}
     index = AnnotationIndex.from_roots(ann_roots)
     rep["index"] = index
     if not len(index):
@@ -300,7 +307,42 @@ def backfill_fractions(rows, site, ann_roots, spec: DataSpec, verify_rows,
             r[f"frac_{a}"] = f"{got[a]:.2f}"
         r["tagged"] = 1
         rep["filled"] += 1
+
+    fill_visibility(rows, site, source, rep)
     return rep
+
+
+def fill_visibility(rows, site: str, source: FractionSource, rep: dict):
+    """Fill `frac_visible` for every clip of one site. Separate pass on purpose.
+
+    It runs over ALL rows, not just the tag-bearing buckets the fraction
+    backfill visits: the gate's whole point is to remove NEGATIVES that show no
+    baby, and those live in buckets 0/4/5, which the fraction loop skips unless
+    --rebackfill-all is set.
+
+    A clip whose visibility cannot be measured keeps the empty string it was
+    scanned with, so the manifest distinguishes three states — a number, or
+    "unknown" — and `unknown_visibility` in the data config decides what a gate
+    does with the third. Nothing here drops a row; this only records evidence.
+    """
+    for r in rows:
+        if r["site"] != site:
+            continue
+        rep["vis_rows"] += 1
+        case = r["case_id"]
+        rep["vis_cases"].add(case)
+        frac = source.visible_fraction(case, Path(r["video_path"]).stem)
+        if frac is None:
+            rep["vis_cases_without"].add(case)
+            continue
+        r["frac_visible"] = f"{frac:.4f}"
+        rep["vis_measured"] += 1
+        if frac >= 1.0 - FRAC_TOL:
+            rep["vis_full"] += 1
+        elif frac > 0.0:
+            rep["vis_partial"] += 1
+        else:
+            rep["vis_none"] += 1
 
 
 def report_backfill(reports, spec: DataSpec):
@@ -329,6 +371,9 @@ def report_backfill(reports, spec: DataSpec):
             print(f"    SKIPPED : {rep['skipped']}")
             print("              clips stay untagged and keep their bucket+directory "
                   "label")
+            print("              frac_visible is NOT filled either — it comes from the "
+                  "same\n              annotation files, so it carries the same vintage "
+                  "risk")
             continue
         print(f"    filled  : {rep['filled']:,} / {rep['candidates']:,} clip(s)"
               + ("" if rep["verified"] else "   [UNVERIFIED]"))
@@ -341,6 +386,7 @@ def report_backfill(reports, spec: DataSpec):
             print(f"              {n:,} clip(s) across {len(cases)} case(s) NOT "
                   f"recovered: {why}")
             print(f"              {cases[:6]}{' ...' if len(cases) > 6 else ''}")
+        report_visibility(rep)
     if any(r["filled"] for r in reports):
         print("\n  A backfilled clip is indistinguishable from one the processor tagged:"
               "\n  its fractions are the same function of the same annotations, rounded"
@@ -348,6 +394,41 @@ def report_backfill(reports, spec: DataSpec):
     else:
         print("\n  Nothing was backfilled — every clip keeps the label data_process.py"
               "\n  gave it, exactly as before this flag existed.")
+
+
+def report_visibility(rep):
+    """What a baby-visible gate would cost this site, before anyone turns it on.
+
+    Printed whether or not a gate is configured, because the decision to use one
+    is exactly this table: `min_visible_fraction: 1.0` keeps the `fully inside`
+    row and nothing else, and `unknown_visibility` decides the `unmeasured` row.
+    A site whose annotators rarely used the label will show a large `unmeasured`
+    count — that is the case where the gate costs episodes rather than clutter,
+    and it is not visible from the corpus any other way.
+    """
+    n = rep["vis_rows"]
+    if not n:
+        return
+    meas, full = rep["vis_measured"], rep["vis_full"]
+    unmeasured = n - meas
+    pct = lambda k: f"{100 * k / n:5.1f}%"
+    print(f"    visibility: {meas:,} / {n:,} clip(s) measured against "
+          f"`Newborn visible in video frame`")
+    print(f"              fully inside  {full:>9,}  {pct(full)}   <- kept by "
+          f"min_visible_fraction: 1.0")
+    print(f"              partly inside {rep['vis_partial']:>9,}  "
+          f"{pct(rep['vis_partial'])}")
+    print(f"              outside       {rep['vis_none']:>9,}  {pct(rep['vis_none'])}")
+    print(f"              unmeasured    {unmeasured:>9,}  {pct(unmeasured)}   <- "
+          f"unknown_visibility decides these")
+    without = rep["vis_cases_without"]
+    if without:
+        cases = sorted(without)
+        print(f"              {len(cases)} of {len(rep['vis_cases'])} case(s) have no "
+              f"usable visibility annotation at all;")
+        print(f"              with `unknown_visibility: drop` those cases contribute "
+              f"NOTHING:")
+        print(f"              {cases[:6]}{' ...' if len(cases) > 6 else ''}")
 
 
 def parse_root(spec_str: str):
@@ -419,7 +500,8 @@ def report(rows, per_site_buckets, spec: DataSpec):
     for r in rows:
         fracs = {a: float(r[f"frac_{a}"]) for a in spec.activities}
         label = spec.resolve(int(r["bucket"]), fracs, tagged=bool(int(r["tagged"])),
-                             dir_activities=spec.activities_from_path(r["clip_dir"]))
+                             dir_activities=spec.activities_from_path(r["clip_dir"]),
+                             frac_visible=parse_visible(r.get("frac_visible")))
         if label is None:
             dropped += 1
             per_site_dropped[r["site"]] += 1
@@ -553,7 +635,7 @@ def main():
             rebackfill_all=args.rebackfill_all, frac_activities=frac_activities))
 
     fieldnames = (["video_path", "case_id", "site", "bucket", "clip_dir", "tagged"]
-                  + [f"frac_{a}" for a in frac_activities])
+                  + [f"frac_{a}" for a in frac_activities] + ["frac_visible"])
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)

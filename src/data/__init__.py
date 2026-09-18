@@ -3,10 +3,11 @@
 # a machine without the ML stack installed. VideoMAEDataset is imported on first
 # access.
 
-from .spec import DataSpec, ClipLabel, load_spec, spec_from_checkpoint, BUCKET_NAMES
+from .spec import (DataSpec, ClipLabel, load_spec, spec_from_checkpoint,
+                   BUCKET_NAMES, parse_visible)
 
 __all__ = ["VideoMAEDataset", "DataSpec", "ClipLabel", "load_spec",
-           "spec_from_checkpoint", "BUCKET_NAMES"]
+           "spec_from_checkpoint", "BUCKET_NAMES", "parse_visible"]
 
 
 def __getattr__(name):

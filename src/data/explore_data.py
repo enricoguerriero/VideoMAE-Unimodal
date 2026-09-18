@@ -40,7 +40,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from .manifest import evidence_masses, explain_bad_manifest, read_manifest
+from .manifest import (evidence_masses, explain_bad_manifest, label_keys,
+                       read_manifest, resolve_key)
 from .spec import BUCKET_NAMES, TAG_BEARING_BUCKETS as TAG_BEARING, DataSpec
 
 # A class with fewer than this many clips in an eval split gives an F1 whose
@@ -64,13 +65,10 @@ def resolve_labels(df: pd.DataFrame, spec: DataSpec) -> pd.Series:
     2 decimals, so a corpus of 10^5 clips has only a few thousand distinct
     (bucket, fracs) keys and `spec.resolve` runs once per key.
     """
-    frac_cols = spec.frac_columns()
     memo: dict[tuple, str] = {}
 
     def name_for(key):
-        bucket, fracs = int(key[0]), dict(zip(spec.activities, key[3:]))
-        label = spec.resolve(bucket, fracs, tagged=bool(key[1]),
-                             dir_activities=spec.activities_from_path(key[2]))
+        label = resolve_key(spec, key)
         if label is None:
             return DROPPED
         if spec.is_multilabel:
@@ -85,11 +83,7 @@ def resolve_labels(df: pd.DataFrame, spec: DataSpec) -> pd.Series:
             return f"{name} (partial)" if masked else name
         return spec.class_names[label.class_index]
 
-    tagged_col = (df["tagged"].astype(int) if "tagged" in df.columns
-                  else pd.Series(1, index=df.index))
-    dir_col = df["clip_dir"] if "clip_dir" in df.columns else pd.Series("", index=df.index)
-    keys = list(zip(df["bucket"].astype(int), tagged_col, dir_col,
-                    *(df[c].astype(float) for c in frac_cols)))
+    keys = label_keys(df, spec)
     out = []
     for k in keys:
         if k not in memo:
@@ -207,18 +201,12 @@ def report_supervision(df: pd.DataFrame, spec: DataSpec, sites: list[str]) -> No
     """
     if not spec.is_multilabel:
         return
-    tagged_col = (df["tagged"].astype(int) if "tagged" in df.columns
-                  else pd.Series(1, index=df.index))
-    dir_col = df["clip_dir"] if "clip_dir" in df.columns else pd.Series("", index=df.index)
-    keys = list(zip(df["bucket"].astype(int), tagged_col, dir_col,
-                    *(df[c].astype(float) for c in spec.frac_columns())))
+    keys = label_keys(df, spec)
 
     memo, counts = {}, {s: {a: [0, 0, 0] for a in spec.activities} for s in sites}
     for key, site in zip(keys, df["site"]):
         if key not in memo:
-            fracs = dict(zip(spec.activities, key[3:]))
-            memo[key] = spec.resolve(int(key[0]), fracs, tagged=bool(key[1]),
-                                     dir_activities=spec.activities_from_path(key[2]))
+            memo[key] = resolve_key(spec, key)
         label = memo[key]
         if label is None:
             continue
