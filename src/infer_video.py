@@ -73,6 +73,8 @@ from src.data.ronald import (DEFAULT_RONALD_DIR,
                              DEFAULT_STRIP_PREFIX as RONALD_STRIP_PREFIX,
                              split_path as ronald_split_path)
 from src.data import DataSpec, parse_visible, spec_from_checkpoint
+from src.data.annotations import AnnotationIndex
+from src.data.sites import annotation_dirs
 from src.data.annotations import intervals_by_category, read_annotation
 
 # Distinct, colour-blind-friendly-ish palette. The negative/"no activity" state
@@ -973,14 +975,24 @@ MEDIA_LAYOUTS = [
 ]
 
 
-def resolve_media(anchor_clip: str, case_id: str):
+def resolve_media(anchor_clip: str, case_id: str, index=None):
     """Walk up from a clip to the full episode video + its annotation.
 
     Tries every known tree layout at every ancestor, so a checkpoint trained on
-    a foreign manifest resolves its episodes too. Returns (video, annotation),
-    either of which may be None.
+    a foreign manifest resolves its episodes too.
+
+    `index` is an AnnotationIndex used as a FALLBACK when no `<case_id>.txt`
+    sits beside the videos. That fallback is what makes Haydom work at all:
+    DRC keeps a per-case `Unprocessed_data/anot_files/` in the clip's own
+    ancestry, Haydom has none, and its annotations live in separate exports that
+    are not named after the case (see src/data/sites.py). Walking up therefore
+    finds every DRC annotation and no Haydom one — which looks exactly like
+    "Haydom has no ground truth" when it is only a layout difference.
+
+    Returns (video, annotation), either of which may be None.
     """
     p = Path(anchor_clip).expanduser().resolve()
+    video = annotation = None
     for anc in p.parents:
         for vids_rel, anots_rel in MEDIA_LAYOUTS:
             vids, anots = anc / vids_rel, anc / anots_rel
@@ -989,9 +1001,19 @@ def resolve_media(anchor_clip: str, case_id: str):
             for ext in VIDEO_EXTS:
                 cand = vids / f"{case_id}{ext}"
                 if cand.exists():
+                    video = cand
                     anot = anots / f"{case_id}.txt"
-                    return cand, (anot if anot.exists() else None)
-    return None, None
+                    annotation = anot if anot.exists() else None
+                    break
+            if video is not None:
+                break
+        if video is not None:
+            break
+    if annotation is None and index is not None:
+        # Key-based, not path-based: exact stem or any >= 5-digit run, the same
+        # rule build_manifest's backfill and recut_site.py already use here.
+        annotation = index.lookup(case_id)
+    return video, annotation
 
 
 def choose_case(cases, spec=None, default=None, pool=None):
@@ -1054,13 +1076,29 @@ def select_from_test_set(args, spec=None):
         raise FileNotFoundError(
             f"{test_csv} not found — run scripts/build_data.sh first, or pass --video.")
     ronald = getattr(args, "ronald", False)
+    # Annotation roots for the key-based fallback. Haydom's annotations are not
+    # reachable by walking up from a clip (src/data/sites.py), so without this
+    # every Haydom episode reports "no ground truth" and — with the default
+    # GT-only listing — vanishes from the menu entirely.
+    roots = ([Path(d).expanduser() for d in args.annotation_dir]
+             if getattr(args, "annotation_dir", None) else annotation_dirs())
+    index = AnnotationIndex.from_roots(roots) if roots else None
+    if index is not None and len(index):
+        logger.info(f"annotation lookup: {len(index)} case key(s) over "
+                    f"{len(index.dirs)} director{'y' if len(index.dirs) == 1 else 'ies'}")
+    elif not getattr(args, "no_gt", False):
+        logger.warning(
+            "no annotation directory found, so ground truth can only come from a "
+            "file sitting next to the videos. Haydom has none — pass "
+            "--annotation-dir DIR, or --all-cases to list episodes without GT.")
+
     all_cases = list_test_cases(
         test_csv, RONALD_STRIP_PREFIX if ronald else None, spec,
         default_site="Haydom" if ronald else None)
     if not all_cases:
         raise RuntimeError(f"No cases found in {test_csv}.")
     for c in all_cases:
-        c["video"], c["annotation"] = resolve_media(c["anchor"], c["case_id"])
+        c["video"], c["annotation"] = resolve_media(c["anchor"], c["case_id"], index)
 
     # Only OFFERABLE episodes are listed: one with no video cannot be run at
     # all, and one with no annotation gives an overlay with no reference line —
@@ -1075,10 +1113,21 @@ def select_from_test_set(args, spec=None):
         no_gt = sum(1 for c in hidden if c["video"] and not c["annotation"])
         logger.info(
             f"{len(cases)} of {len(all_cases)} episodes are listed; hiding "
-            + ", ".join(p for p in (f"{no_vid} with no video" if no_vid else "",
+            + ", ".join(t for t in (f"{no_vid} with no video" if no_vid else "",
                                     f"{no_gt} with no annotation" if no_gt else "")
-                        if p)
+                        if t)
             + ". Pass --all-cases to include them (or --case <id> for one).")
+        # Per site, because a filter that removes one hospital ENTIRELY is a
+        # path problem, not a data problem, and the count alone hides that.
+        sites = sorted({c.get("site") or "?" for c in all_cases})
+        if len(sites) > 1:
+            for site in sites:
+                tot = sum(1 for c in all_cases if (c.get("site") or "?") == site)
+                kept = sum(1 for c in cases if (c.get("site") or "?") == site)
+                note = ("   <- ALL HIDDEN: its annotations are probably not on a "
+                        "path this can reach; see src/data/sites.py"
+                        if kept == 0 and tot else "")
+                logger.info(f"    {site:<10} {kept:>4}/{tot:<4} listed{note}")
     if not cases:
         raise SystemExit(
             f"No episode in {test_csv} has both a video and an annotation on this "
@@ -1152,6 +1201,11 @@ def main():
                     help="Skip the menu and take the episode Enter would pick: a "
                          "RANDOM one whose ground truth contains every activity. "
                          "For nohup / batch runs.")
+    ap.add_argument("--annotation-dir", action="append", default=None, metavar="DIR",
+                    help="Directory of annotation files to resolve ground truth "
+                         "from, matched by case id. Repeatable. Defaults to the "
+                         "known per-site roots (src/data/sites.py) — needed for "
+                         "Haydom, whose annotations do not sit beside its clips.")
     ap.add_argument("--all-cases", action="store_true",
                     help="List every episode in the manifest, including those with "
                          "no annotation (no ground-truth overlay) or no resolvable "
