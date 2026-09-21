@@ -130,7 +130,8 @@ def entry_is_on(entry, track):
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
-def build_model(model_name, model_path, device, data_config=None):
+def build_model(model_name, model_path, device, data_config=None,
+                legacy_pooling="auto"):
     """Load a trained checkpoint exactly like src/test.py.
 
     The DataSpec is read back from the checkpoint, so head width and output
@@ -148,7 +149,15 @@ def build_model(model_name, model_path, device, data_config=None):
             logger.warning("checkpoint has no stored DataSpec — falling back to the "
                            "data config on disk; verify it matches this checkpoint.")
     logger.info(spec.describe())
-    model = load_model(model_name, spec=spec).to(device)
+    # Same policy as src/test.py: `auto` detects a pre-2026-08-31 checkpoint from
+    # the absence of `fc_norm` in its saved backbone and feeds its head the patch
+    # token it was actually fitted on. Without it such a model is fed a feature it
+    # has never seen and the predictions are quietly meaningless.
+    pooling_kwargs = {}
+    if model_name == "VideoMAE":
+        pooling_kwargs["pooling"] = {"auto": "auto", "on": "patch0_legacy",
+                                     "off": "mean"}[legacy_pooling]
+    model = load_model(model_name, spec=spec, **pooling_kwargs).to(device)
     model.load_classifier(saved, config)
     model.load_backbone(saved, config)
     if config.get("attention_pooling", False):
@@ -1091,6 +1100,12 @@ def main():
                          "no server/browser needed — just copy the file off the VM).")
     ap.add_argument("--serve", action="store_true", help="Serve the viewer over HTTP.")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--legacy-pooling", choices=["auto", "on", "off"], default="auto",
+                    help="Pooling for VideoMAE checkpoints trained before the "
+                         "2026-08-31 fix, whose head was fitted on "
+                         "last_hidden_state[:, 0] instead of the mean over all "
+                         "tokens. `auto` (default) detects them and does the right "
+                         "thing; you should not need to pass this.")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
@@ -1109,7 +1124,8 @@ def main():
     # sits through an interactive prompt.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
-    model, config, spec = build_model(args.model, args.model_path, device, args.data_config)
+    model, config, spec = build_model(args.model, args.model_path, device,
+                                      args.data_config, args.legacy_pooling)
 
     # Resolve the target video (+ optional annotation): explicit --video, or a
     # pick from the test set.
