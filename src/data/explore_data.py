@@ -30,11 +30,19 @@ answer once thresholds and bucket policy are fixed. The CASE-level geometry
 splitter balances on it.
 
 Pure pandas + PyYAML — no torch, no av. Runs anywhere the manifest does.
+
+    python -m src.data.explore_data --manifest data/clips_all.csv --splits-dir data
+    python -m src.data.explore_data ... --out results/data_report.txt
+
+The whole report is TEE'd to `--out` (or `<--out-dir>/report.txt`) while still
+scrolling past on the terminal, so it can be pasted into an issue or a thesis
+appendix without re-running anything or fighting a shell redirect.
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -576,6 +584,30 @@ def report_target(cases: pd.DataFrame, splits: dict[str, pd.DataFrame],
 
 
 # --------------------------------------------------------------------------
+class _Tee:
+    """Write to the terminal AND to a file at the same time.
+
+    A tee rather than a redirect, so the report still scrolls past live on a
+    long build instead of the run looking hung — and rather than capturing into
+    a buffer, so a crash halfway through still leaves the part that ran on disk.
+    """
+
+    def __init__(self, stream, handle):
+        self._stream, self._handle = stream, handle
+
+    def write(self, text):
+        self._stream.write(text)
+        self._handle.write(text)
+        return len(text)
+
+    def flush(self):
+        self._stream.flush()
+        self._handle.flush()
+
+    def isatty(self):
+        return self._stream.isatty()
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -591,45 +623,67 @@ def main():
                    help="Share of each site's clips you want held out (section 6)")
     p.add_argument("--top", type=int, default=20, help="Rows in the largest-cases table")
     p.add_argument("--out-dir", type=Path, default=None,
-                   help="Also write per_case.csv (the full case table) here")
+                   help="Write per_case.csv (the full case table) and report.txt here")
+    p.add_argument("--out", type=Path, default=None, metavar="PATH",
+                   help="Write the full printed report to this .txt as well as to "
+                        "the terminal. Defaults to <out-dir>/report.txt when "
+                        "--out-dir is given.")
     args = p.parse_args()
 
-    spec = DataSpec.load(args.data_config)
-    if not args.manifest.exists():
-        raise SystemExit(f"manifest not found: {args.manifest} — run build_manifest.py first")
+    # Resolve the report path before anything is printed, so the file holds the
+    # WHOLE report including the spec banner at the top.
+    report_path = args.out or (args.out_dir / "report.txt" if args.out_dir else None)
+    handle = None
+    if report_path is not None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = report_path.open("w", encoding="utf-8")
+        sys.stdout = _Tee(sys.stdout, handle)
 
-    df = read_manifest(args.manifest)
-    df["case_id"] = df["case_id"].astype(str)
-    missing = [c for c in ["video_path", "case_id", "site", "bucket"] + spec.frac_columns()
-               if c not in df.columns]
-    if missing:
-        raise SystemExit(explain_bad_manifest(args.manifest, df, missing))
-    df["label"] = resolve_labels(df, spec)
-    sites = sorted(df["site"].unique())
+    try:
+        spec = DataSpec.load(args.data_config)
+        if not args.manifest.exists():
+            raise SystemExit(f"manifest not found: {args.manifest} — run build_manifest.py first")
 
-    print(spec.describe())
-    report_corpus(df, spec, sites)
+        df = read_manifest(args.manifest)
+        df["case_id"] = df["case_id"].astype(str)
+        missing = [c for c in ["video_path", "case_id", "site", "bucket"] + spec.frac_columns()
+                   if c not in df.columns]
+        if missing:
+            raise SystemExit(explain_bad_manifest(args.manifest, df, missing))
+        df["label"] = resolve_labels(df, spec)
+        sites = sorted(df["site"].unique())
 
-    cases = case_table(df, spec)
-    report_cases(cases, spec, sites, args.top)
+        print(spec.describe())
+        report_corpus(df, spec, sites)
 
-    if args.splits is not None:
-        paths = list(args.splits)
-    elif args.splits_dir is not None:
-        paths = sorted(args.splits_dir.glob("train.csv")) + \
-                sorted(args.splits_dir.glob("validation.csv")) + \
-                sorted(args.splits_dir.glob("test*.csv"))
-    else:
-        paths = []
-    splits = load_splits(paths, spec)
-    report_splits(splits, df, spec, sites)
-    report_target(cases, splits, sites, args.target_test_ratio, spec)
+        cases = case_table(df, spec)
+        report_cases(cases, spec, sites, args.top)
 
-    if args.out_dir:
-        args.out_dir.mkdir(parents=True, exist_ok=True)
-        out = args.out_dir / "per_case.csv"
-        cases.to_csv(out, index=False)
-        print(f"\n[written] {out}  ({len(cases)} cases)")
+        if args.splits is not None:
+            paths = list(args.splits)
+        elif args.splits_dir is not None:
+            paths = sorted(args.splits_dir.glob("train.csv")) + \
+                    sorted(args.splits_dir.glob("validation.csv")) + \
+                    sorted(args.splits_dir.glob("test*.csv"))
+        else:
+            paths = []
+        splits = load_splits(paths, spec)
+        report_splits(splits, df, spec, sites)
+        report_target(cases, splits, sites, args.target_test_ratio, spec)
+
+        if args.out_dir:
+            args.out_dir.mkdir(parents=True, exist_ok=True)
+            out = args.out_dir / "per_case.csv"
+            cases.to_csv(out, index=False)
+            print(f"\n[written] {out}  ({len(cases)} cases)")
+    finally:
+        # Restore stdout and close even if the report raised partway: the
+        # half that ran is still worth having on disk, and leaving a _Tee
+        # installed would make the traceback print into the report too.
+        if handle is not None:
+            sys.stdout = sys.__stdout__
+            handle.close()
+            print(f"[written] {report_path}  (the full report, for copy/paste)")
 
 
 if __name__ == "__main__":

@@ -112,6 +112,8 @@ python -m src.data.split_cases \
     --seed 2025 \
     ${SPLIT_EXTRA[@]+"${SPLIT_EXTRA[@]}"}
 
+# --out-dir writes per_case.csv AND report.txt (the whole printed audit), so the
+# build leaves a pasteable record of what it produced.
 python -m src.data.explore_data \
     --manifest data/clips_all.csv \
     --splits-dir data \
