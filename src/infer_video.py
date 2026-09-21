@@ -68,6 +68,9 @@ import torch
 from torch.amp import autocast
 
 from src.utils import load_model
+from src.data.ronald import (DEFAULT_RONALD_DIR,
+                             DEFAULT_STRIP_PREFIX as RONALD_STRIP_PREFIX,
+                             split_path as ronald_split_path)
 from src.data import DataSpec, spec_from_checkpoint
 from src.data.annotations import intervals_by_category, read_annotation
 
@@ -347,8 +350,14 @@ def gt_per_second(intervals, duration_s, spec):
     """Reference labels per second, using the SAME rule as the training targets.
 
     For each second's 3 s window, measure each activity's share of the window and
-    threshold it with the data config's `thresholds` — the same numbers
-    build_manifest/DataSpec use on the pre-cut clips.
+    threshold it with `spec.gt_thresholds()` — normally the data config's own
+    `thresholds`, i.e. the same numbers build_manifest/DataSpec use on the
+    pre-cut clips.
+
+    A `label_source: columns` spec (a model trained on a FOREIGN manifest) has
+    no `thresholds`, because nothing in this repo decided its labels. Such a
+    config supplies `gt_thresholds` explicitly instead; if it does not, the
+    caller skips the overlay rather than inventing a cut.
 
     multilabel: every activity clearing its threshold is active (co-occurrence
                 shows up here too).
@@ -356,6 +365,13 @@ def gt_per_second(intervals, duration_s, spec):
                 negative class — i.e. the thesis' `for_predict` rule, with the
                 threshold read from config instead of hard-coded at 0.50.
     """
+    cuts = spec.gt_thresholds()
+    missing = [a for a in spec.activities if a not in cuts]
+    if missing:
+        raise ValueError(
+            f"{spec.source} gives no ground-truth cut for {missing}, so the "
+            f"overlay cannot be drawn. Add a `gt_thresholds` block naming every "
+            f"activity, or pass --no-gt.")
     out = []
     win_ms = WINDOW_S * 1000
     n_act = len(spec.activities)
@@ -363,8 +379,7 @@ def gt_per_second(intervals, duration_s, spec):
         s_ms = sec * 1000
         e_ms = s_ms + win_ms
         fracs = [_overlap_ms(s_ms, e_ms, intervals[i]) / win_ms for i in range(n_act)]
-        over = [i for i in range(n_act)
-                if fracs[i] >= spec.thresholds[spec.activities[i]]]
+        over = [i for i in range(n_act) if fracs[i] >= cuts[spec.activities[i]]]
         if spec.is_multilabel:
             out.append({"t": sec, "active": over,
                         "probs": [round(f, 4) for f in fracs]})
@@ -792,37 +807,78 @@ VIDEO_EXTS = [".mp4", ".MP4", ".avi", ".mkv", ".mov", ".MOV"]
 
 
 def recover_case_id(clip_path: str) -> str:
-    """Case id = clip filename stem before '_interval_' (matches build_manifest)."""
-    return Path(clip_path).stem.split("_interval_")[0]
+    """Clip path -> the id of the episode it was cut from.
+
+    Two conventions, because a checkpoint may have been trained on either tree:
+
+        ours    <case>_interval_<n>_start_<ms>_end_<ms>[_tags]_<bucket>.mp4
+        foreign <video_id>_Video_clip_<n>_<label>.mp4     (Ronald Paleczny's
+                write_csv.py; see src/data/ronald.py)
+
+    Splitting on the first separator that appears keeps both exact. Falling back
+    to the whole stem would silently make every clip its own "case", which turns
+    the pick-a-case menu into a list of thousands of one-clip entries rather than
+    an error anyone would notice.
+    """
+    stem = Path(clip_path).stem
+    for sep in ("_interval_", "_Video_clip_"):
+        if sep in stem:
+            return stem.split(sep)[0]
+    return stem
 
 
-def list_test_cases(test_csv: Path):
-    """Read the test manifest → ordered unique cases with clip counts + an anchor."""
+def list_test_cases(test_csv: Path, strip_prefix: str | None = None):
+    """Read the test manifest → ordered unique cases with clip counts + an anchor.
+
+    `strip_prefix` is removed from every clip path first. Ronald Paleczny's
+    manifests store absolute paths under the account that generated them
+    (`/home/u269483/spo/...`), and `resolve_media` finds the episode by walking
+    UP from a clip — so an unstripped path walks a tree that does not exist on
+    this machine and every case reports "video not found".
+    """
     cases = {}
     with open(test_csv, newline="") as f:
         for row in csv.DictReader(f):
             vp = row.get("video_path")
             if not vp:
                 continue
+            if strip_prefix and vp.startswith(strip_prefix):
+                vp = vp[len(strip_prefix):]
             cid = recover_case_id(vp)
             c = cases.setdefault(cid, {"case_id": cid, "n_clips": 0, "anchor": vp})
             c["n_clips"] += 1
     return sorted(cases.values(), key=lambda c: c["case_id"])
 
 
+#: (videos dir, annotations dir) pairs to look for, relative to an ancestor of
+#: the clip. Ours is the Unprocessed_data tree data_process.py cuts from;
+#: the second is Ronald Paleczny's, whose pipeline renames episodes into
+#: videos_corrected/ and writes millisecond annotations to annotations_corrected/
+#: (Master-project/src/data/data_preprocessing.py).
+MEDIA_LAYOUTS = [
+    (Path("Unprocessed_data") / "videos", Path("Unprocessed_data") / "anot_files"),
+    (Path("videos_corrected"), Path("annotations_corrected")),
+]
+
+
 def resolve_media(anchor_clip: str, case_id: str):
-    """Walk up the clip path for a sibling Unprocessed_data/{videos,anot_files}."""
+    """Walk up from a clip to the full episode video + its annotation.
+
+    Tries every known tree layout at every ancestor, so a checkpoint trained on
+    a foreign manifest resolves its episodes too. Returns (video, annotation),
+    either of which may be None.
+    """
     p = Path(anchor_clip).expanduser().resolve()
     for anc in p.parents:
-        base = anc / "Unprocessed_data"
-        vids, anots = base / "videos", base / "anot_files"
-        if not vids.is_dir():
-            continue
-        for ext in VIDEO_EXTS:
-            cand = vids / f"{case_id}{ext}"
-            if cand.exists():
-                anot = anots / f"{case_id}.txt"
-                return cand, (anot if anot.exists() else None)
+        for vids_rel, anots_rel in MEDIA_LAYOUTS:
+            vids, anots = anc / vids_rel, anc / anots_rel
+            if not vids.is_dir():
+                continue
+            for ext in VIDEO_EXTS:
+                cand = vids / f"{case_id}{ext}"
+                if cand.exists():
+                    anot = anots / f"{case_id}.txt"
+                    return cand, (anot if anot.exists() else None)
     return None, None
 
 
@@ -848,7 +904,8 @@ def select_from_test_set(args):
     if not test_csv.exists():
         raise FileNotFoundError(
             f"{test_csv} not found — run scripts/build_data.sh first, or pass --video.")
-    cases = list_test_cases(test_csv)
+    cases = list_test_cases(
+        test_csv, RONALD_STRIP_PREFIX if getattr(args, "ronald", False) else None)
     if not cases:
         raise RuntimeError(f"No cases found in {test_csv}.")
     for c in cases:
@@ -881,8 +938,17 @@ def main():
     ap.add_argument("--model_path", required=True, help="Trained checkpoint .pt")
     ap.add_argument("--video", default=None,
                     help="Full episode video. If omitted, pick a case from --test-csv.")
-    ap.add_argument("--test-csv", default="data/test.csv",
-                    help="Test manifest to pick a case from (default: data/test.csv).")
+    ap.add_argument("--test-csv", default=None,
+                    help="Test manifest to pick a case from (default: data/test.csv, "
+                         "or Ronald Paleczny's test.csv under --ronald).")
+    ap.add_argument("--ronald", action="store_true",
+                    help="Pick the episode from Ronald Paleczny's test manifest and "
+                         "resolve it in his tree (videos_corrected/ + "
+                         "annotations_corrected/). Use with a checkpoint trained by "
+                         "`train.sh --ronald`; the data config comes from the "
+                         "checkpoint either way.")
+    ap.add_argument("--ronald-dir", default=None, metavar="DIR",
+                    help=f"Where his manifests live (default {DEFAULT_RONALD_DIR}).")
     ap.add_argument("--case", default=None,
                     help="Case id to run non-interactively (skips the menu).")
     ap.add_argument("--annotation", default=None,
@@ -907,6 +973,12 @@ def main():
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(levelname)s: %(message)s")
+
+    if args.test_csv is None:
+        args.test_csv = (str(ronald_split_path("test", args.ronald_dir))
+                         if args.ronald else "data/test.csv")
+    if args.ronald:
+        logger.info(f"--ronald: picking an episode from {args.test_csv}")
 
     # Resolve the target video (+ optional annotation): explicit --video, or an
     # interactive pick from the test set.
@@ -941,7 +1013,14 @@ def main():
     gt_second = None
     if annotation:
         logger.info(f"Ground truth: {annotation}")
-        gt_second = gt_per_second(load_gt_intervals(annotation, spec), duration_s, spec)
+        # The inference is already done and is the point of the run, so a GT
+        # overlay that cannot be drawn degrades to "no overlay" with a reason,
+        # never to a crash that throws the predictions away.
+        try:
+            gt_second = gt_per_second(load_gt_intervals(annotation, spec),
+                                      duration_s, spec)
+        except ValueError as exc:
+            logger.warning(f"no ground-truth overlay: {exc}")
 
     # ---- make the video reachable by the browser ----
     local_video = out_dir / "video.mp4"

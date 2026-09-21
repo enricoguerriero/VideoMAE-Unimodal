@@ -22,6 +22,11 @@
 #
 # The full-episode video AND its annotation are auto-resolved from data/test.csv.
 # To run on an arbitrary video instead, call the module directly with --video.
+#
+# RONALD=1 picks the episode from Ronald Paleczny's test manifest and resolves it
+# in HIS tree (videos_corrected/ + annotations_corrected/) instead of ours. Use
+# it with a checkpoint trained by `train.sh --ronald`:
+#   RONALD=1 bash scripts/infer_video.sh VideoMAE checkpoints/<ckpt>.pt
 set -euo pipefail
 
 MODEL="${1:-VideoMAE}"
@@ -31,8 +36,15 @@ PORT="${4:-8000}"
 CASE="${5:-}"
 DATA_CONFIG="${6:-}"
 SERVE="${SERVE:-0}"
+RONALD="${RONALD:-0}"
 
-ARGS=(--model "${MODEL}" --model_path "${CKPT}" --test-csv data/test.csv)
+# No --test-csv here: src.infer_video picks the right default on its own
+# (data/test.csv, or his manifest under --ronald). Hardcoding it would override
+# that and send a Ronald-trained checkpoint looking for OUR episodes.
+ARGS=(--model "${MODEL}" --model_path "${CKPT}")
+if [[ "${RONALD}" == "1" ]]; then
+    ARGS+=(--ronald)
+fi
 if [[ -n "${CASE}" ]]; then
     ARGS+=(--case "${CASE}")
 fi

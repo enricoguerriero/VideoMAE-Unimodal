@@ -121,6 +121,7 @@ class DataSpec:
     buckets: dict[int, str]
     decision_thresholds: dict[str, float]
     annotation_events: dict[str, str] = field(default_factory=dict)
+    gt_thresholds_raw: dict[str, float] = field(default_factory=dict)
     label_source: str = "evidence"
     min_visible_fraction: float = 0.0
     unknown_visibility: str = "keep"
@@ -152,6 +153,7 @@ class DataSpec:
         buckets = {int(k): str(v).strip().lower() for k, v in (raw.get("buckets") or {}).items()}
         dec = {str(k): float(v) for k, v in (raw.get("decision_thresholds") or {}).items()}
         events = {str(k): str(v) for k, v in (raw.get("annotation_events") or {}).items()}
+        gt_thr = {str(k): float(v) for k, v in (raw.get("gt_thresholds") or {}).items()}
         label_source = str(raw.get("label_source", "evidence")).strip().lower()
         min_vis = float(raw.get("min_visible_fraction", 0.0))
         unk_vis = str(raw.get("unknown_visibility", "keep")).strip().lower()
@@ -160,7 +162,7 @@ class DataSpec:
                    tag_keys=tag_keys, thresholds=thresholds, weak_threshold=weak,
                    ambiguous=ambiguous, overlap_resolution=overlap, buckets=buckets,
                    decision_thresholds=dec, annotation_events=events,
-                   label_source=label_source,
+                   gt_thresholds_raw=gt_thr, label_source=label_source,
                    min_visible_fraction=min_vis, unknown_visibility=unk_vis,
                    source=source)
         spec.validate()
@@ -180,6 +182,7 @@ class DataSpec:
             "buckets": dict(self.buckets),
             "decision_thresholds": dict(self.decision_thresholds),
             "annotation_events": dict(self.annotation_events),
+            "gt_thresholds": dict(self.gt_thresholds_raw),
             "label_source": self.label_source,
             "min_visible_fraction": self.min_visible_fraction,
             "unknown_visibility": self.unknown_visibility,
@@ -246,6 +249,12 @@ class DataSpec:
         unknown = sorted(set(self.annotation_events) - set(self.activities))
         if unknown:
             raise ValueError(f"annotation_events names non-activities: {unknown}")
+        unknown_gt = sorted(set(self.gt_thresholds_raw) - set(self.activities))
+        if unknown_gt:
+            raise ValueError(f"gt_thresholds names non-activities: {unknown_gt}")
+        for a, t in self.gt_thresholds_raw.items():
+            if not 0.0 < t <= 1.0:
+                raise ValueError(f"gt_thresholds[{a}] must be in (0, 1], got {t}")
         if self.label_source not in LABEL_SOURCES:
             raise ValueError(
                 f"label_source must be one of {LABEL_SOURCES}, got {self.label_source!r}")
@@ -302,6 +311,27 @@ class DataSpec:
     @property
     def activation(self) -> str:
         return "sigmoid" if self.is_multilabel else "softmax"
+
+    def gt_thresholds(self) -> dict[str, float]:
+        """Window-coverage cuts for drawing a GROUND-TRUTH overlay from raw
+        annotations (src/infer_video.py). Empty when none can be determined.
+
+        This is NOT `thresholds`, even though it usually equals it. `thresholds`
+        decides what a training LABEL is, from our own manifests. This decides
+        how to redraw someone's annotation intervals as per-second reference
+        bars on a video — which still has to happen for a model whose labels
+        came from elsewhere and which therefore has no `thresholds` at all.
+
+        Falls back to `thresholds` so every existing config keeps its exact
+        current overlay behaviour and needs no new key. A `columns` spec must
+        set `gt_thresholds` explicitly (it has no `thresholds`), and returns {}
+        if it does not — the overlay is then skipped rather than guessed at,
+        because a wrong cut draws a confident GT bar that never happened.
+        """
+        if self.gt_thresholds_raw:
+            return {a: self.gt_thresholds_raw[a] for a in self.activities
+                    if a in self.gt_thresholds_raw}
+        return {a: self.thresholds[a] for a in self.activities if a in self.thresholds}
 
     def sigmoid_thresholds(self) -> list[float]:
         """Per-activity decision thresholds in logit order (multilabel)."""

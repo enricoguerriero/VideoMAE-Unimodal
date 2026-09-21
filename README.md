@@ -112,6 +112,8 @@ configs/data.yaml
       ├─ ambiguous ────────► drop the clip / call it negative / mask that activity
       ├─ label_source ─────► `evidence` (our manifests) | `columns` (a foreign
       │                       manifest's own binary label columns, verbatim)
+      ├─ gt_thresholds ────► coverage cut for infer_video's ground-truth overlay
+      │                       (defaults to `thresholds`; required in `columns`)
       ├─ buckets ──────────► which of the nine label buckets are eligible at all
       ├─ min_visible_fraction ► the baby-visible gate (0.0 = off)
       ├─ unknown_visibility ► what to do with clips whose visibility is unmeasured
@@ -542,6 +544,24 @@ he did not report) — and the loss. One caveat there: our default
 the raw `neg/pos`**. For his exact loss, train with a config that sets
 `class_weighting: inv_freq`. The run warns about this, and the preflight prints
 both alongside his documented values.
+
+**Episode inference works on his tree too:**
+
+```bash
+RONALD=1 bash scripts/infer_video.sh VideoMAE checkpoints/<ckpt>.pt
+```
+
+It picks an episode from his test manifest and resolves the full video plus its
+annotation from `videos_corrected/` + `annotations_corrected/`, alongside our
+own `Unprocessed_data/` layout. Three things had to follow: his clips are named
+`<video_id>_Video_clip_<n>_<label>.mp4` rather than `<case>_interval_...`; his
+manifests store paths under the generating account, so the prefix comes off
+before the episode is located; and the ground-truth overlay needs a coverage cut
+that a `columns` config does not have. That last one is `gt_thresholds` in
+`configs/data_ronald.yaml` — **his** 0.50/0.50/0.25, used for the overlay only,
+never for a label. Every other config falls back to its own `thresholds`, so
+their overlays are unchanged. If no cut can be determined the overlay is
+skipped with a reason rather than guessed at, and the predictions still land.
 
 **This is a diagnostic, not a destination.** His manifests point at his clip
 tree, so a checkpoint trained this way cannot be deployed on our data without a

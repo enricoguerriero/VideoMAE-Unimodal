@@ -78,7 +78,30 @@ decision_thresholds:
   stimulation: 0.5
   suction: 0.5
 
-# Unused here (no annotation overlays on his tree), kept so the file round-trips.
+# ---------------------------------------------------------------- GT overlay
+# For `src/infer_video.py` ONLY: the window-coverage cuts used to redraw raw
+# annotation intervals as per-second ground-truth bars on an episode video.
+#
+# This is NOT `thresholds`, which this config is forbidden to have. `thresholds`
+# decides what a training LABEL is, and nothing here can change his labels. But
+# an episode overlay is drawn from the ANNOTATION FILE, not from his manifest,
+# so it still needs a rule — and the right rule is the one his
+# clips_and_video_stats.py used, or the overlay would disagree with the very
+# labels the model was trained on:
+#
+#     ventilation 50%, stimulation 50%, suction 25%   (his defaults)
+#
+# Without this key the overlay is SKIPPED rather than guessed at: a wrong cut
+# draws a confident ground-truth bar for something that never happened, which is
+# worse than no bar at all.
+gt_thresholds:
+  ventilation: 0.50
+  stimulation: 0.50
+  suction: 0.25
+
+# Event names in the annotation files are the defaults ("Ventilation",
+# "Stimulation", "Suction"), which src/data/annotations.py already resolves from
+# his annotations_corrected/ exports. Kept so the file round-trips.
 annotation_events: {}
 
 # =============================================================================
