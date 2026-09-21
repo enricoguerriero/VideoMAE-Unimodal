@@ -34,6 +34,7 @@ from argparse import ArgumentParser
 import csv
 import logging
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -118,6 +119,94 @@ def confident_subset(rows, spec: DataSpec):
     return idx, torch.tensor(targets, dtype=torch.long), None
 
 
+def per_case_errors(rows, logits, labels, masks, spec):
+    """Per EPISODE: how many decisions the model got wrong, and where.
+
+    A "decision" is one clip in multiclass, one clip x activity in multilabel —
+    the same unit the metrics are computed over, so the counts here add up to
+    the confusion matrix rather than telling a second story.
+
+    Returns a list of dicts sorted worst-first by raw error count, each with
+    per-activity false positives and false negatives. FP and FN are kept apart
+    on purpose: an episode with 200 false positives on suction and one with 200
+    false negatives look identical under an error count and need completely
+    different explanations.
+    """
+    acts = list(spec.activities)
+    if spec.is_multilabel:
+        pred = (torch.sigmoid(logits) >= torch.tensor(spec.sigmoid_thresholds())).float()
+        sup = masks if masks is not None else torch.ones_like(pred)
+        wrong = ((pred != labels) & (sup > 0))
+        fp = ((pred == 1) & (labels == 0) & (sup > 0))
+        fn = ((pred == 0) & (labels == 1) & (sup > 0))
+    else:
+        # Project onto the activity axis so the report reads the same in both
+        # tasks: class 0 is "no activity", classes 1..N are the activities.
+        top = logits.argmax(dim=1)
+        pred = torch.zeros((len(top), len(acts)))
+        tgt = torch.zeros_like(pred)
+        for i, a in enumerate(acts):
+            pred[:, i] = (top == i + 1).float()
+            tgt[:, i] = (labels == i + 1).float()
+        labels, sup = tgt, torch.ones_like(pred)
+        wrong = (pred != labels)
+        fp = ((pred == 1) & (labels == 0))
+        fn = ((pred == 0) & (labels == 1))
+
+    case_ids = (rows["case_id"].astype(str).tolist() if "case_id" in rows.columns
+                else [DataSpec.case_id_from_stem(Path(p).stem) for p in rows["video_path"]])
+    sites = (rows["site"].astype(str).tolist() if "site" in rows.columns
+             else [""] * len(case_ids))
+
+    agg = {}
+    for i, cid in enumerate(case_ids):
+        c = agg.setdefault(cid, {"case_id": cid, "site": sites[i], "clips": 0,
+                                 "decisions": 0, "errors": 0,
+                                 "fp": dict.fromkeys(acts, 0),
+                                 "fn": dict.fromkeys(acts, 0),
+                                 "pos": dict.fromkeys(acts, 0)})
+        c["clips"] += 1
+        c["decisions"] += int(sup[i].sum().item())
+        c["errors"] += int(wrong[i].sum().item())
+        for j, a in enumerate(acts):
+            c["fp"][a] += int(fp[i, j].item())
+            c["fn"][a] += int(fn[i, j].item())
+            c["pos"][a] += int(labels[i, j].item())
+    for c in agg.values():
+        c["rate"] = c["errors"] / max(c["decisions"], 1)
+    return sorted(agg.values(), key=lambda c: -c["errors"])
+
+
+def rank_worst(cases, by, spec):
+    """Re-sort `per_case_errors` output by the requested criterion.
+
+    `errors` is the default because it finds where the bulk of the damage is.
+    `rate` finds the episodes the model handles worst, which are often short and
+    contribute little overall — useful, but a different question. An ACTIVITY
+    name ranks by that activity's errors alone, which is the one to use when a
+    single class is the problem (suction, here).
+    """
+    if by == "rate":
+        return sorted(cases, key=lambda c: (-c["rate"], -c["errors"]))
+    if by in spec.activities:
+        return sorted(cases, key=lambda c: -(c["fp"][by] + c["fn"][by]))
+    return sorted(cases, key=lambda c: -c["errors"])
+
+
+def report_worst(cases, spec, name, by, top, logger):
+    """Print the worst episodes, with FP/FN split per activity."""
+    acts = list(spec.activities)
+    head = "".join(f"{a[:7]+' FP/FN':>16}" for a in acts)
+    logger.info(f"\n[{name}] WORST EPISODES by {by}")
+    logger.info(f"  {'case':<14}{'site':<8}{'clips':>7}{'errors':>8}{'rate':>7}{head}")
+    for c in cases[:top]:
+        cells = "".join(f"{c['fp'][a]:>8,}/{c['fn'][a]:<7,}" for a in acts)
+        logger.info(f"  {c['case_id']:<14}{c['site']:<8}{c['clips']:>7,}"
+                    f"{c['errors']:>8,}{100*c['rate']:>6.1f}%{cells}")
+    logger.info("  FP = predicted the activity where the ground truth says no; "
+                "FN = missed it.")
+
+
 def resolve_test_sets(cli, config) -> list[tuple[str, str]]:
     """[(name, csv_path)] from --test_data, else the checkpoint config, else the
     per-site defaults.
@@ -200,6 +289,19 @@ def main():
                              "as not performed instead of being masked out, and no clip "
                              "is dropped for ambiguity. Reports this alongside the "
                              "confident-subset numbers so the two are comparable.")
+    parser.add_argument("--render-worst", type=int, default=0, metavar="N",
+                        help="After scoring, render a full-episode inference video "
+                             "for the N episodes the model got most wrong, via "
+                             "src.infer_video. 0 (default) renders nothing; the "
+                             "per-episode error table is printed either way.")
+    parser.add_argument("--worst-by", default="errors", metavar="CRITERION",
+                        help="How to rank episodes: `errors` (total wrong decisions, "
+                             "the default), `rate` (errors per decision — finds the "
+                             "episodes handled worst, often short ones), or an "
+                             "ACTIVITY name to rank by that class alone (e.g. "
+                             "`suction`).")
+    parser.add_argument("--worst-dir", default="results/worst_episodes", metavar="DIR",
+                        help="Where the rendered episodes are written.")
     parser.add_argument("--ronald", action="store_true",
                         help="Score on Ronald Paleczny's test manifest. Implied "
                              "for a checkpoint trained with --ronald (the path is "
@@ -282,6 +384,12 @@ def main():
     model = load_model(args.model, spec=spec, **pooling_kwargs)
     model = model.to(device)
 
+    if args.worst_by not in ("errors", "rate") and args.worst_by not in spec.activities:
+        raise SystemExit(
+            f"--worst-by {args.worst_by!r} is not `errors`, `rate`, or one of this "
+            f"checkpoint's activities {list(spec.activities)}.")
+    args._ckpt_ronald = bool(config.get("ronald"))
+
     ronald = args.ronald or bool(config.get("ronald"))
     if args.ronald and not args.test_data:
         config = {**config, "test_data":
@@ -322,9 +430,9 @@ def main():
     base = os.path.splitext(os.path.basename(args.model_path))[0]
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    all_metrics, all_files = {}, []
+    all_metrics, all_files, all_worst = {}, [], {}
     for name, test_csv in test_sets:
-        metrics, files = run_test_set(name, test_csv, model=model, spec=spec, args=args,
+        metrics, files, worst = run_test_set(name, test_csv, model=model, spec=spec, args=args,
                                       config=config, device=device, amp_dtype=amp_dtype,
                                       minority_class=minority_class, base=base, ts=ts,
                                       logger=logger, sites=sites, ronald=ronald)
@@ -332,6 +440,7 @@ def main():
             continue
         all_metrics[name] = metrics
         all_files += files
+        all_worst[name] = worst
 
     if not all_metrics:
         raise SystemExit(
@@ -358,6 +467,63 @@ def main():
     )
     wu.finish()
 
+    # LAST, after every metric is printed, logged and stored: rendering is slow
+    # and optional, and nothing above it should be waiting on a video encoder.
+    if args.render_worst:
+        render_worst_episodes(all_worst, args, spec, logger)
+
+
+def render_worst_episodes(worst_by_set, args, spec, logger):
+    """Render a full-episode video for the worst episodes, via src.infer_video.
+
+    Run as a SUBPROCESS rather than by importing infer_video's pipeline. The
+    request is "the same video infer_video produces", and shelling out to it is
+    the only way to guarantee that stays true as either side changes — there is
+    no second copy of the window/overlay/render logic to drift. The cost is
+    reloading the backbone per episode (tens of seconds), which is small next to
+    decoding a 20-minute recording.
+
+    A failure to render one episode is reported and skipped, never fatal: the
+    metrics are the point of the run and they are already computed by here.
+    """
+    import subprocess
+    out_root = Path(args.worst_dir)
+    rendered, failed = [], []
+    for set_name, cases in worst_by_set.items():
+        for c in cases[:args.render_worst]:
+            out_dir = out_root / f"{set_name}_{c['case_id']}"
+            cmd = [sys.executable, "-m", "src.infer_video",
+                   "--model", args.model, "--model_path", args.model_path,
+                   "--case", c["case_id"], "--out-dir", str(out_dir),
+                   "--render-video", "--all-cases"]
+            if args.ronald or bool(getattr(args, "_ckpt_ronald", False)):
+                cmd += ["--ronald"]
+            if args.data_config:
+                cmd += ["--data-config", args.data_config]
+            if args.legacy_pooling != "auto":
+                cmd += ["--legacy-pooling", args.legacy_pooling]
+            logger.info(f"[worst] rendering {set_name}/{c['case_id']} "
+                        f"({c['errors']:,} errors over {c['clips']:,} clips) -> {out_dir}")
+            try:
+                subprocess.run(cmd, check=True)
+                rendered.append(out_dir / "annotated.mp4")
+            except subprocess.CalledProcessError as exc:
+                failed.append((set_name, c["case_id"], exc.returncode))
+                logger.warning(f"[worst] {c['case_id']} did not render "
+                               f"(exit {exc.returncode}) — skipped. Its raw video or "
+                               f"annotation may not resolve on this machine; "
+                               f"`python scripts/check_episode_media.py` says which.")
+    if rendered:
+        logger.info(f"\n[worst] {len(rendered)} episode(s) rendered under {out_root}:")
+        for f in rendered:
+            logger.info(f"    {f}")
+        logger.info("  Copy them off the VM and play in VLC — the prediction track "
+                    "sits above the ground-truth track, so a systematic error reads "
+                    "as one band being consistently wider or shifted.")
+    if failed:
+        logger.warning(f"[worst] {len(failed)} episode(s) failed to render: "
+                       f"{[f'{a}/{b}' for a, b, _ in failed]}")
+
 
 def run_test_set(name, test_csv, *, model, spec, args, config, device, amp_dtype,
                  minority_class, base, ts, logger, sites=None, ronald=False):
@@ -366,7 +532,7 @@ def run_test_set(name, test_csv, *, model, spec, args, config, device, amp_dtype
     if not os.path.exists(test_csv):
         logger.warning(f"[{name}] {test_csv} not found — skipped. Run "
                        f"scripts/build_data.sh to regenerate the splits.")
-        return None, []
+        return None, [], []
 
     logger.info(f"\n{'=' * 70}\n[{name}] {test_csv}\n{'=' * 70}")
     if ronald:
@@ -379,7 +545,7 @@ def run_test_set(name, test_csv, *, model, spec, args, config, device, amp_dtype
         rows = pd.read_csv(test_csv)
     rows = filter_rows_to_sites(rows, sites, name, logger)
     if rows is None:
-        return None, []
+        return None, [], []
     if args.thesis_only:
         if THESIS_COLUMN not in rows.columns:
             logger.warning(f"[{name}] no `{THESIS_COLUMN}` column in {test_csv} — it "
@@ -390,7 +556,7 @@ def run_test_set(name, test_csv, *, model, spec, args, config, device, amp_dtype
                         f"{rows['case_id'].nunique()} frozen cases")
             if rows.empty:
                 logger.warning(f"[{name}] no thesis cases in this set — skipped.")
-                return None, []
+                return None, [], []
 
     # With --full-coverage the DATASET is built from the permissive spec, so no
     # clip is dropped for ambiguity; the strict spec is then re-applied to the
@@ -434,6 +600,13 @@ def run_test_set(name, test_csv, *, model, spec, args, config, device, amp_dtype
     metrics = compute_metrics(logits_t, labels_t, spec, masks=masks_t,
                               minority_class=minority_class)
 
+    # Per-episode errors: printed on every run, because "which recordings is
+    # this failing on" is a different and often more actionable question than
+    # the aggregate, and it costs nothing once the logits exist.
+    worst = rank_worst(
+        per_case_errors(test_dataset.data, logits_t, labels_t, masks_t, spec),
+        args.worst_by, spec)
+
     sub_metrics, sub_idx = None, None
     if args.full_coverage and spec.ambiguous != "negative":
         sub_idx, sub_labels, sub_masks_t = confident_subset(test_dataset.data, spec)
@@ -457,6 +630,9 @@ def run_test_set(name, test_csv, *, model, spec, args, config, device, amp_dtype
                     f"(excluded {metrics.get('proj/excluded', 0)} ambiguous clips)")
         logger.info(f"[{name}] co-occurrence: {metrics['true/multi_active']} clips truly "
                     f"have >=2 activities, {metrics['pred/multi_active']} were predicted so")
+
+    report_worst(worst, spec, name, args.worst_by,
+                 max(args.render_worst, 10), logger)
 
     if sub_metrics is not None:
         # Under `ambiguous: mask` a clip is DROPPED only when every activity is
@@ -554,7 +730,7 @@ def run_test_set(name, test_csv, *, model, spec, args, config, device, amp_dtype
              classes=np.array(spec.class_names),
              task=np.array(spec.task))
     logger.info(f"[{name}] scores -> {scores_path}")
-    return metrics, [csv_path, scores_path]
+    return metrics, [csv_path, scores_path], worst
 
 
 def report_per_class(name, metrics, sub_metrics, spec, logger):

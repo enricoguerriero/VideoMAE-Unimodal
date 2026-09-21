@@ -832,11 +832,9 @@ def recover_case_id(clip_path: str) -> str:
     the pick-a-case menu into a list of thousands of one-clip entries rather than
     an error anyone would notice.
     """
-    stem = Path(clip_path).stem
-    for sep in ("_interval_", "_Video_clip_"):
-        if sep in stem:
-            return stem.split(sep)[0]
-    return stem
+    # One implementation, in DataSpec, so build_manifest / test.py / this all
+    # split a stem the same way.
+    return DataSpec.case_id_from_stem(Path(clip_path).stem)
 
 
 def row_positives(row, spec):

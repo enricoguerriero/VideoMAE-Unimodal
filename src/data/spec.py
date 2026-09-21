@@ -475,10 +475,24 @@ class DataSpec:
             object.__setattr__(self, "_tag_re_cache", cached)
         return cached
 
+    #: Clip-stem separators that follow the case id, most specific first.
+    #:   ours    <case>_interval_<n>_start_<ms>_end_<ms>[_tags]_<bucket>
+    #:   foreign <video_id>_Video_clip_<n>_<label>   (Ronald Paleczny's
+    #:           write_csv.py; see src/data/ronald.py)
+    CASE_ID_SEPARATORS = ("_interval_", "_Video_clip_")
+
     @staticmethod
     def case_id_from_stem(stem: str) -> str:
-        """Case id = everything before '_interval_'."""
-        return stem.split("_interval_")[0]
+        """Clip filename stem -> the id of the episode it was cut from.
+
+        Falling back to the whole stem when no separator matches is deliberate
+        and safe: a manifest of one-clip "cases" is obvious in any per-case
+        report, whereas guessing a prefix would silently merge episodes.
+        """
+        for sep in DataSpec.CASE_ID_SEPARATORS:
+            if sep in stem:
+                return stem.split(sep)[0]
+        return stem
 
     # ------------------------------------------------------------------ stage 2
     def _activity_state(self, activity: str, frac: float) -> str:

@@ -779,6 +779,50 @@ happening" where the annotation declines to say. The run prints how many are
 still excluded that way. To include them too, copy the data config with
 `buckets: {5: keep}` and pass it as `DATA_CONFIG`.
 
+#### Which episodes is it failing on: `--render-worst`
+
+Aggregate metrics say how much is wrong, never *where*. Every test run now also
+prints a per-episode error table — same decision unit as the metrics, so the
+counts reconcile with the confusion matrix — with false positives and false
+negatives kept apart per activity:
+
+```
+[haydom] WORST EPISODES by suction
+  case          site      clips  errors   rate   ventila FP/FN   stimula FP/FN   suction FP/FN
+  40402325      Haydom      656     189   9.6%      31/4            12/9           118/15
+  ...
+  FP = predicted the activity where the ground truth says no; FN = missed it.
+```
+
+That split is the point: 200 false positives and 200 false negatives score the
+same under an error count and need opposite explanations.
+
+`--render-worst N` then renders a full-episode video for the N worst, so you can
+watch the failure instead of inferring it:
+
+```bash
+bash scripts/test.sh VideoMAE <ckpt>.pt 0 "" --render-worst 3
+bash scripts/test.sh VideoMAE <ckpt>.pt 0 "" --render-worst 3 --worst-by suction
+```
+
+| `--worst-by` | picks |
+|---|---|
+| `errors` (default) | where the bulk of the damage is — biased to long episodes |
+| `rate` | errors per decision: the episodes handled worst, often short and low-impact |
+| an activity name | that class alone — the one to use when suction is the problem |
+
+Videos land in `--worst-dir` (default `results/worst_episodes/<set>_<case>/`).
+Rendering runs `src.infer_video` as a subprocess rather than re-implementing its
+pipeline, so what you get is exactly what `infer_video` produces and cannot
+drift from it; the cost is reloading the backbone per episode, which is small
+next to decoding a full recording. It runs **last**, after every metric is
+printed, logged and stored — and an episode that fails to render is reported and
+skipped, never fatal.
+
+Note the rendered video is a fresh 1 s-stride pass over the whole episode, not a
+replay of the scored clips, so it shows the continuous timeline including the
+stretches the clip manifest dropped.
+
 #### Multilabel: tune the decision thresholds, do not leave them at 0.5
 
 Training uses `pos_weight` (`class_weighting: sqrt_inv_freq`), which inflates the
