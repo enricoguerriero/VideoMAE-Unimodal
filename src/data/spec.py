@@ -373,6 +373,9 @@ class DataSpec:
     def parse_stem(self, stem: str) -> tuple[int | None, dict[str, float], bool]:
         """Filename stem -> (bucket, {activity: fraction}, tagged).
 
+        Evidence mode only — a `columns` spec has no `tag_keys` to match with,
+        and a foreign manifest's filenames follow its own convention, not ours.
+
         Clip stems look like
             {case}_interval_{n}_start_{ms}_end_{ms}[_stim0.67][_vent0.55]_{bucket}
 
@@ -382,6 +385,11 @@ class DataSpec:
         other clip `tagged` is True and the (possibly all-zero) fractions are
         real. Returns (None, {}, False) when the stem breaks the convention.
         """
+        if self.labels_from_columns:
+            raise RuntimeError(
+                f"{self.source} sets `label_source: columns`: its manifest's "
+                f"filenames are a foreign convention with no bucket suffix or "
+                f"fraction tags, so they cannot be parsed for labels.")
         try:
             bucket = int(stem.rsplit("_", 1)[1])
         except (ValueError, IndexError):
@@ -509,6 +517,15 @@ class DataSpec:
         statement about whether the clip is admissible evidence at all — it does
         not depend on, and must not be confused with, what the clip is labelled.
         """
+        if self.labels_from_columns:
+            # Nothing here can run without thresholds and buckets, and a
+            # `columns` spec has neither. Reaching this means a caller still
+            # assumes the evidence schema; say so rather than dying on a
+            # KeyError three frames down.
+            raise RuntimeError(
+                f"{self.source} sets `label_source: columns`, so labels come from "
+                f"the manifest's own columns and resolve() has nothing to resolve. "
+                f"This caller still expects `bucket`/`frac_*`.")
         if not self.keeps_visibility(frac_visible):
             return None
         if not self.keeps_bucket(bucket):
@@ -586,30 +603,45 @@ class DataSpec:
 
     # ------------------------------------------------------------------ report
     def describe(self) -> str:
-        kept = self.kept_buckets()
         lines = [
             f"DataSpec ({self.source or 'inline'})",
             f"  task              : {self.task}  ({self.activation} head, "
             f"{'masked BCE' if self.is_multilabel else 'weighted CE'})",
             f"  outputs           : {self.num_classes} — {', '.join(self.class_names)}",
-            "  LABEL cut (frac of the 3 s window that must be the activity)",
-            "    positive if     : " + ", ".join(
-                f"{a}>={self.thresholds[a]:.2f}" for a in self.activities),
-            f"    negative if     : frac <= {self.weak_threshold:.2f}",
-            f"  ambiguous band    : {self.ambiguous}",
-            f"  buckets kept      : {kept}  (dropped: "
-            f"{[b for b in sorted(BUCKET_NAMES) if b not in kept]})",
         ]
-        if self.gates_visibility:
-            lines.append(
-                f"  baby-visible gate : ON — keep a clip only if >= "
-                f"{self.min_visible_fraction:.2f} of its window is inside a "
-                f"`Newborn visible in video frame` span")
-            lines.append(
-                f"    unmeasured clips: {self.unknown_visibility}  (no annotation "
-                f"file, or no visibility label in it)")
+        # In `columns` mode there is no label cut to describe: the manifest
+        # states the answer, and this spec carries no thresholds, no buckets and
+        # no gate to print (validate() rejects them). Printing the evidence-mode
+        # block here would be describing machinery that is not running.
+        if self.labels_from_columns:
+            lines.append("  LABELS            : read verbatim from the manifest's "
+                         "own columns")
+            lines.append("                      " + ", ".join(self.activities))
+            lines.append("    not re-derived  : no bucket, no threshold, no "
+                         "ambiguous band, no")
+            lines.append("                      visibility gate — and no clip is "
+                         "dropped")
         else:
-            lines.append("  baby-visible gate : off (min_visible_fraction: 0.0)")
+            kept = self.kept_buckets()
+            lines += [
+                "  LABEL cut (frac of the 3 s window that must be the activity)",
+                "    positive if     : " + ", ".join(
+                    f"{a}>={self.thresholds[a]:.2f}" for a in self.activities),
+                f"    negative if     : frac <= {self.weak_threshold:.2f}",
+                f"  ambiguous band    : {self.ambiguous}",
+                f"  buckets kept      : {kept}  (dropped: "
+                f"{[b for b in sorted(BUCKET_NAMES) if b not in kept]})",
+            ]
+            if self.gates_visibility:
+                lines.append(
+                    f"  baby-visible gate : ON — keep a clip only if >= "
+                    f"{self.min_visible_fraction:.2f} of its window is inside a "
+                    f"`Newborn visible in video frame` span")
+                lines.append(
+                    f"    unmeasured clips: {self.unknown_visibility}  (no annotation "
+                    f"file, or no visibility label in it)")
+            else:
+                lines.append("  baby-visible gate : off (min_visible_fraction: 0.0)")
         if not self.is_multilabel:
             lines.append(f"  >=2 activities    : {self.overlap_resolution}")
         else:
