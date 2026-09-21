@@ -622,13 +622,24 @@ def main():
     p.add_argument("--target-test-ratio", type=float, default=0.20,
                    help="Share of each site's clips you want held out (section 6)")
     p.add_argument("--top", type=int, default=20, help="Rows in the largest-cases table")
-    p.add_argument("--out-dir", type=Path, default=None,
-                   help="Write per_case.csv (the full case table) and report.txt here")
+    p.add_argument("--out-dir", type=Path, default=None, metavar="DIR",
+                   help="DIRECTORY to write per_case.csv (the full case table) and "
+                        "report.txt into. For just the report as one file, use --out.")
     p.add_argument("--out", type=Path, default=None, metavar="PATH",
                    help="Write the full printed report to this .txt as well as to "
                         "the terminal. Defaults to <out-dir>/report.txt when "
                         "--out-dir is given.")
     args = p.parse_args()
+
+    # `--out-dir DIR` vs `--out FILE.txt` is an easy slip, and getting it wrong
+    # used to silently create a DIRECTORY named `report.txt`. A path that names a
+    # text file is unambiguous about what was meant, so honour it and say so
+    # rather than making the mistake on the user's behalf.
+    if args.out_dir is not None and args.out_dir.suffix.lower() in (".txt", ".log", ".md"):
+        print(f"[note] --out-dir {args.out_dir} names a file, not a directory — "
+              f"writing the report there. Use --out for a file, --out-dir for a "
+              f"directory (which also gets per_case.csv).")
+        args.out, args.out_dir = args.out or args.out_dir, None
 
     # Resolve the report path before anything is printed, so the file holds the
     # WHOLE report including the spec banner at the top.
