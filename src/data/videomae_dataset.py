@@ -105,6 +105,9 @@ class VideoMAEDataset(Dataset):
         (N, C) float32 in multilabel / None in multiclass, and `n_gated` is the
         subset of `n_dropped` removed by the baby-visible gate alone.
         """
+        if spec.labels_from_columns:
+            return VideoMAEDataset._resolve_label_columns(raw, spec)
+
         frac_cols = spec.frac_columns()
         has_evidence = "bucket" in raw.columns and all(c in raw.columns for c in frac_cols)
 
@@ -176,6 +179,52 @@ class VideoMAEDataset(Dataset):
                     torch.tensor(masks, dtype=torch.float32),
                     n_dropped, n_gated)
         return kept, torch.tensor(targets, dtype=torch.long), None, n_dropped, n_gated
+
+    @staticmethod
+    def _resolve_label_columns(raw: pd.DataFrame, spec: DataSpec):
+        """`label_source: columns` — the manifest's activity columns ARE the targets.
+
+        For a FOREIGN manifest: one binary column per activity, already decided
+        by whatever pipeline produced it. Nothing is thresholded, nothing is
+        bucketed, nothing is gated, and NO ROW IS EVER DROPPED — a foreign
+        pipeline's split is its own, and silently shrinking it would destroy the
+        one thing this mode exists to provide, which is an exact like-for-like
+        comparison on someone else's data.
+
+        Columns are matched BY NAME, so `spec.activities` fixes the logit order
+        independently of the CSV's column order. Reading them positionally would
+        silently transpose two activities whenever the orders disagree — and they
+        do disagree here: this repo's configs list stimulation first, Ronald
+        Paleczny's manifests put ventilation first.
+
+        Every mask is 1.0: a foreign manifest states a label for every activity
+        on every clip and has no notion of "unknown".
+        """
+        missing = [a for a in spec.activities if a not in raw.columns]
+        if missing:
+            raise ValueError(
+                f"{spec.source} sets label_source: columns, so every activity needs "
+                f"its own binary column in the manifest — missing {missing}. "
+                f"Columns present: {sorted(raw.columns)}")
+        if "video_path" not in raw.columns:
+            raise ValueError("a label_source: columns manifest needs a `video_path` column")
+
+        values = raw[list(spec.activities)]
+        num = values.apply(pd.to_numeric, errors="coerce")
+        if num.isna().any().any():
+            bad = {a: raw.loc[num[a].isna(), a].unique()[:3].tolist()
+                   for a in spec.activities if num[a].isna().any()}
+            raise ValueError(f"non-numeric label values in {spec.source}'s manifest: {bad}")
+        if not num.isin([0, 1]).all().all():
+            offenders = {a: sorted(set(num[a].unique()) - {0, 1})[:5]
+                         for a in spec.activities if not num[a].isin([0, 1]).all()}
+            raise ValueError(
+                f"label columns must be binary 0/1, got {offenders}. This mode takes "
+                f"the manifest's labels verbatim; it cannot threshold them.")
+
+        targets = torch.tensor(num.values, dtype=torch.float32)
+        masks = torch.ones_like(targets)
+        return raw.reset_index(drop=True), targets, masks, 0, 0
 
     # ------------------------------------------------------------------
     # Class statistics (loss weights + head bias init)

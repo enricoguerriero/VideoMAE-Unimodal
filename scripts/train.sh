@@ -8,6 +8,7 @@
 #   bash scripts/train.sh VideoMAE 0,1                               # both GPUs (DataParallel)
 #   bash scripts/train.sh VideoMAE 0 configs/data.yaml               # 4-class, thesis-comparable
 #   bash scripts/train.sh VideoMAE 0 configs/data.yaml --sites Haydom  # one hospital only
+#   bash scripts/train.sh VideoMAE 0 --ronald                        # on Ronald's data
 #
 # DATA_CONFIG decides the task, the thresholds and the bucket keep/drop list, and
 # with it the head width, the output activation and the loss. Omit it to use
@@ -23,6 +24,14 @@
 #   --config PATH               training config YAML (default configs/config.yaml)
 #   --sites Haydom              train + validate on one hospital only (repeatable,
 #                               case-insensitive; test sets are already per-site)
+#   --ronald                    train on Ronald Paleczny's manifests instead of
+#                               ours — his clips, his labels, his splits, through
+#                               our model. A DIAGNOSTIC: if our model reaches his
+#                               numbers on his data, the gap was DATA; if it does
+#                               not, the gap is MODEL/TRAINING and the pipeline
+#                               was never the problem. Forces
+#                               configs/data_ronald.yaml; the checkpoint records
+#                               his test set, so `test.sh <ckpt>` follows.
 #   --attention_pooling         learned pooling instead of the pretrained fc_norm
 #   --only_train                skip validation entirely
 #

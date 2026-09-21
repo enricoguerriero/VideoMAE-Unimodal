@@ -3,11 +3,18 @@
 #
 # Usage: bash scripts/test.sh [MODEL] <CKPT> [GPU] [DATA_CONFIG] [EXTRA...]
 #
-# With no EXTRA args it evaluates every test set listed under `test_data:` in the
+# With no EXTRA args it evaluates the test sets listed under `test_data:` in the
 # checkpoint's config — data/test_haydom.csv and data/test_drc.csv — writing one
 # results_*.csv / scores_*.npz per site and printing a side-by-side comparison.
 # A gap between the two IS the cross-site generalisation result; do not average
 # it away.
+#
+# ONE EXCEPTION, and it is the one you want after `train.sh --sites Haydom`: a
+# checkpoint that records which hospitals it was TRAINED on is scored on those
+# only. Scoring a Haydom-only model on DRC by default answers a question nobody
+# asked and buries the number that matters in a two-row table. Pass
+# `--sites all` to score everything anyway — that IS the cross-site experiment,
+# and it is worth running on purpose.
 #
 # The task (multiclass/multilabel, class names, decision thresholds) is read back
 # from the checkpoint, so nothing extra is needed for a multilabel model. Pass
@@ -15,6 +22,12 @@
 # checkpoint at different `decision_thresholds` (use "" to skip the argument).
 #
 # Useful EXTRA args:
+#   --ronald                      score on Ronald Paleczny's test manifest
+#                                 (implied by a checkpoint trained with --ronald)
+#   --sites Haydom                score one hospital only (default: whichever
+#                                 the checkpoint was trained on)
+#   --sites all                   score every test set, including hospitals this
+#                                 model never saw — the generalisation number
 #   --thesis-only                 score only the thesis' frozen cases (the
 #                                 like-for-like multimodal comparison)
 #   --test_data data/test.csv     one pooled score over both sites instead

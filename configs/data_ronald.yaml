@@ -1,0 +1,100 @@
+# =============================================================================
+# data_ronald.yaml — Ronald Paleczny's labels, taken verbatim.
+# =============================================================================
+# Paired with `--ronald` on scripts/train.sh. It exists to answer ONE question:
+#
+#   Is our gap DATA or MODEL?
+#
+# Our pipeline and his differ in several places at once — the baby-visible gate,
+# clip resolution, stride, pool downsampling, the split — and every fix lands on
+# top of the others, so a run that is still worse does not say which difference
+# is responsible. This config removes the data from the comparison entirely:
+# HIS clips, HIS labels, HIS splits, through OUR model, training loop and
+# metrics.
+#
+#   our model on his data  ~=  his Table 3.5   -> the gap was DATA
+#   our model on his data  <<  his Table 3.5   -> the gap is MODEL/TRAINING,
+#                                                 and the pipeline was never it
+#
+# It is a DIAGNOSTIC. His manifests point at his clip tree, so a model trained
+# this way cannot be deployed on our data without a retrain.
+#
+#   bash scripts/train.sh VideoMAE 0 --ronald
+#   bash scripts/test.sh  VideoMAE checkpoints/<ckpt>.pt --ronald
+#
+# TARGET — his thesis Table 3.5, test set (7,938 clips), thresholds 0.5/0.5/0.5:
+#
+#   | class       | precision | recall |   F1  |
+#   |-------------|-----------|--------|-------|
+#   | ventilation |   0.975   | 0.989  | 0.982 |
+#   | stimulation |   0.829   | 0.786  | 0.807 |
+#   | suction     |   0.831   | 0.762  | 0.795 |
+#   | MACRO       |   0.878   | 0.846  | 0.861 |
+# =============================================================================
+
+task: multilabel
+
+# ---------------------------------------------------------------- label source
+# >>> THE KEY THAT MAKES THIS CONFIG DIFFERENT FROM EVERY OTHER ONE <<<
+#
+# `columns` means: the manifest already holds one binary column per activity and
+# those ARE the targets. No bucket, no threshold, no ambiguous band, no
+# visibility gate — his `clips_and_video_stats.py` already made every one of
+# those decisions, at his values, and this reads the result.
+#
+# It is also why this file has no `thresholds`, `tag_keys`, `buckets`,
+# `weak_threshold`, `ambiguous` or `min_visible_fraction`: DataSpec REJECTS them
+# here rather than letting them sit in the file looking as though they apply.
+# Re-thresholding someone else's resolved labels is not possible, and a config
+# that implies otherwise is how two pipelines end up compared on data that is no
+# longer either one's.
+label_source: columns
+
+# ---------------------------------------------------------------- classes
+# HIS order: ventilation, stimulation, suction. This fixes the logit order and
+# every metric key, so the per-class table prints in the same order as his
+# Table 3.5 and the two can be read side by side without re-sorting.
+#
+# The columns are matched BY NAME, not by position, so this order is a
+# presentation choice and not a correctness risk — our other configs put
+# stimulation first and would load his manifests just as correctly.
+activities: [ventilation, stimulation, suction]
+
+# Never a trained output in multilabel — the all-zero vector is "no activity".
+# Used only to label the projected single-label confusion matrix.
+negative_class: non_target
+
+# ---------------------------------------------------------------- inference
+# 0.5 for all three: his test.py's default (Ronald_code/src/metrics.py
+# DEFAULT_THRESHOLDS), which is what his published test numbers used.
+#
+# Note the discrepancy he documents and deliberately preserved: his TRAIN/VAL
+# metrics used [0.5, 0.5, 0.25] while his TEST metrics used [0.5, 0.5, 0.5].
+# Table 3.5 is a test table, so 0.5/0.5/0.5 is the one that makes this
+# comparison like-for-like. Do not tune these before reading the target table —
+# a tuned threshold compared against his untuned one is not a comparison.
+decision_thresholds:
+  ventilation: 0.5
+  stimulation: 0.5
+  suction: 0.5
+
+# Unused here (no annotation overlays on his tree), kept so the file round-trips.
+annotation_events: {}
+
+# =============================================================================
+# What is still OURS in this run, and why the comparison is still fair
+# =============================================================================
+# Everything except the data:
+#
+#   * the backbone and its pooling (our fc_norm + mean-pooling path),
+#   * the head, dropout, optimiser, LR schedule, AMP, epochs — configs/config.yaml,
+#   * the loss. NOTE: our default `class_weighting: sqrt_inv_freq` gives
+#     pos_weight = sqrt(neg/pos); HIS was the raw neg/pos. To match him exactly,
+#     run with a training config that sets `class_weighting: inv_freq`, which
+#     reproduces his [1.0719, 9.9393, 39.0729].
+#   * the metrics, including average precision, which he did not report.
+#
+# The loader prints his documented pos_weight and prior bias for the loaded
+# train.csv before training starts. If those do not match, the manifests are not
+# the thesis splits and Table 3.5 is the wrong target — see src/data/ronald.py.
+# =============================================================================

@@ -34,6 +34,7 @@ import csv
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -53,6 +54,8 @@ from src.utils import (load_model, collate_fn, compute_metrics, build_criterion,
                        DEFAULT_MINORITY_CLASS, wandb_utils as wu)
 from src.data import VideoMAEDataset, DataSpec
 from src.data.manifest import read_manifest
+from src.data.ronald import (DEFAULT_RONALD_DIR, DEFAULT_STRIP_PREFIX, load_split,
+                             split_path, verify_split_stats)
 
 VIT_MODELS = ["VideoMAE", "VideoMAEGiant"]
 
@@ -107,6 +110,60 @@ def save_metrics_to_csv(csv_path, metrics, val_loss, epoch, split, batch=None):
         writer.writeheader()
         writer.writerows(old_rows)
         writer.writerow(row)
+
+
+RONALD_DATA_CONFIG = "configs/data_ronald.yaml"
+
+
+def apply_ronald_config(args, config, logger) -> dict:
+    """Point the run at Ronald Paleczny's data. Returns the config keys to set.
+
+    `--ronald` has to override three things at once — the data config, the three
+    split paths, and anything that assumes our manifest schema — and every one
+    of them is a silent failure if missed: a mismatched data config crashes on a
+    missing `bucket` column, a missed split path trains on OUR clips while the
+    log says his.
+
+    So the incompatible flags are ERRORS here, not warnings. `--sites` is the
+    clearest case: his manifests have no `site` column and are Haydom-only, so
+    the flag cannot filter anything, and a run that accepted it would look like
+    it had been restricted when it had not.
+    """
+    if args.sites:
+        raise SystemExit(
+            "--ronald and --sites are incompatible: his manifests are Haydom-only "
+            "and carry no `site` column, so --sites could not filter them. Drop "
+            "--sites.")
+    if args.data_config and Path(args.data_config).name != Path(RONALD_DATA_CONFIG).name:
+        raise SystemExit(
+            f"--ronald needs {RONALD_DATA_CONFIG} (it sets `label_source: columns`, "
+            f"which is what reads his manifests' label columns verbatim), but "
+            f"--data-config {args.data_config} was given. Drop --data-config, or "
+            f"pass {RONALD_DATA_CONFIG} explicitly.")
+
+    out = {"data_config": RONALD_DATA_CONFIG, "sites": None, "ronald": True,
+           "ronald_dir": args.ronald_dir or DEFAULT_RONALD_DIR}
+    for split, key in (("train", "train_data"), ("validation", "validation_data")):
+        out[key] = str(split_path(split, args.ronald_dir))
+    # test.py reads `test_data` back out of the checkpoint, so recording it here
+    # is what makes `test.sh <ckpt>` score his test set without being told again.
+    out["test_data"] = {"ronald_test": str(split_path("test", args.ronald_dir))}
+
+    logger.warning(
+        "--ronald: training on Ronald Paleczny's manifests, NOT ours.\n"
+        f"    train      : {out['train_data']}\n"
+        f"    validation : {out['validation_data']}\n"
+        f"    test       : {out['test_data']['ronald_test']}\n"
+        f"    labels     : taken verbatim from his ventilation/stimulation/suction "
+        f"columns\n"
+        "    This is a diagnostic. The checkpoint points at HIS clip tree and "
+        "cannot be\n    deployed on ours without a retrain.")
+    if config.get("class_weighting", "sqrt_inv_freq") != "inv_freq":
+        logger.warning(
+            "    NOTE: his pos_weight was the raw neg/pos; ours defaults to "
+            "sqrt(neg/pos).\n    For his exact loss, use a training config with "
+            "`class_weighting: inv_freq`.")
+    return out
 
 
 def select_sites(csv_path, sites, split_name, logger):
@@ -270,6 +327,21 @@ def main():
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--only_train", action="store_true", default=False)
     parser.add_argument("--attention_pooling", action="store_true", default=False)
+    parser.add_argument("--ronald", action="store_true",
+                        help="Train on Ronald Paleczny's manifests instead of ours: "
+                             "his clips, his labels, his splits, through our model "
+                             "and training loop. Forces configs/data_ronald.yaml and "
+                             "overrides train/validation/test_data. A DIAGNOSTIC for "
+                             "'is our gap data or model?' — the resulting checkpoint "
+                             "points at his clip tree and is not deployable on ours.")
+    parser.add_argument("--ronald-dir", default=None, metavar="DIR",
+                        help=f"Where his three manifests live "
+                             f"(default {DEFAULT_RONALD_DIR}).")
+    parser.add_argument("--ronald-strip-prefix", default=DEFAULT_STRIP_PREFIX,
+                        metavar="PREFIX",
+                        help="Leading path prefix stripped from every clip path in "
+                             "his manifests; they store absolute paths under the "
+                             "account that generated them. Pass '' to disable.")
     parser.add_argument("--sites", nargs="+", default=None, metavar="SITE",
                         help="Train and validate on these hospitals only, e.g. "
                              "`--sites Haydom`. Case-insensitive; repeatable "
@@ -323,11 +395,15 @@ def main():
                         format="%(levelname)s: %(message)s")
     logger = logging.getLogger(__name__)
 
+    if args.ronald:
+        config.update(apply_ronald_config(args, config, logger))
     spec = DataSpec.load(args.data_config or config.get("data_config"))
     logger.info(f"Training {args.model}\n{spec.describe()}")
 
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     site_tag = "_" + "-".join(sorted(s.lower() for s in args.sites)) if args.sites else ""
+    if args.ronald:
+        site_tag = "_ronald"
     regime = "full" if config.get("train_backbone", True) else "head"
     # Defaults to the model name, so naming is unchanged unless --run-name is given.
     run_label = args.run_name or args.model
@@ -338,9 +414,15 @@ def main():
     # Resolve (and validate) the split sources BEFORE the backbone is built: a
     # mistyped --sites should fail in a second, not after a 1B-parameter download.
     sites_note = f" [sites={'+'.join(sorted(args.sites))}]" if args.sites else ""
-    train_source = select_sites(config["train_data"], args.sites, "train", logger)
-    val_source = (None if args.only_train else
-                  select_sites(config["validation_data"], args.sites, "validation", logger))
+    if args.ronald:
+        train_source = load_split("train", args.ronald_dir, args.ronald_strip_prefix)
+        verify_split_stats(train_source, logger)
+        val_source = (None if args.only_train else
+                      load_split("validation", args.ronald_dir, args.ronald_strip_prefix))
+    else:
+        train_source = select_sites(config["train_data"], args.sites, "train", logger)
+        val_source = (None if args.only_train else
+                      select_sites(config["validation_data"], args.sites, "validation", logger))
 
     device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     # Needed before the model is wrapped, because _AutocastForward takes it.

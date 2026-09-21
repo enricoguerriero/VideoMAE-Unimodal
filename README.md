@@ -110,6 +110,8 @@ configs/data.yaml
       ├─ thresholds ───────► which activities count as present in a clip
       ├─ weak_threshold ───► which count as absent  (the band between is ambiguous)
       ├─ ambiguous ────────► drop the clip / call it negative / mask that activity
+      ├─ label_source ─────► `evidence` (our manifests) | `columns` (a foreign
+      │                       manifest's own binary label columns, verbatim)
       ├─ buckets ──────────► which of the nine label buckets are eligible at all
       ├─ min_visible_fraction ► the baby-visible gate (0.0 = off)
       ├─ unknown_visibility ► what to do with clips whose visibility is unmeasured
@@ -458,9 +460,119 @@ derived from the split you train on, so a single-site run gets that site's prior
 — which is the point, and is why the site list is stored in the checkpoint under
 `config["sites"]` and appears in the W&B run name.
 
-Test sets need no such flag: they are already one file per hospital, and
-`scripts/test.sh` scores each separately (`--test_data haydom=data/test_haydom.csv`
-to score just one).
+**Testing follows the checkpoint automatically.** `config["sites"]` is read back
+by `src/test.py`, so a model trained with `--sites Haydom` is scored on Haydom
+only — no flag needed:
+
+```bash
+bash scripts/train.sh VideoMAE 0 configs/data_multilabel_thesis.yaml --sites Haydom
+bash scripts/test.sh  VideoMAE checkpoints/<ckpt>.pt        # haydom only
+bash scripts/test.sh  VideoMAE checkpoints/<ckpt>.pt --sites all   # + DRC: the
+                                                                   # generalisation number
+```
+
+`--sites` on `test.py` overrides that in both directions and filters on the
+`site` **column**, so it works on a pooled CSV (`data/test.csv`,
+`data/validation.csv`) as well as on the per-site files. A test set left empty by
+the filter is skipped with a log line, never a crash. The sites actually scored
+are recorded in W&B as `eval_sites`, separately from the `sites` the model was
+trained on — those differ exactly when `--sites all` asks the cross-site question.
+
+#### Settling "data or model?": `--ronald`
+
+Every fix so far lands on top of the others, so a run that is still short of his
+numbers does not say *which* difference is responsible. `--ronald` removes the
+data from the comparison entirely — **his clips, his labels, his splits, through
+our model, training loop and metrics**:
+
+```bash
+python scripts/check_ronald_data.py                  # seconds, run this first
+bash scripts/train.sh VideoMAE 0 --ronald
+bash scripts/test.sh  VideoMAE checkpoints/<ckpt>.pt  # his test set, automatically
+```
+
+The result is interpretable in one step:
+
+| outcome | reading |
+|---|---|
+| our model ≈ his Table 3.5 | the gap was **data**. Keep working on the pipeline — the gate, the resolution, the split. |
+| our model ≪ his Table 3.5 | the gap is **model or training**. The pipeline was never the problem. |
+
+**Target — his thesis Table 3.5**, test set (7,938 clips), thresholds 0.5/0.5/0.5:
+
+| class | precision | recall | F1 |
+|---|---|---|---|
+| ventilation | 0.975 | 0.989 | 0.982 |
+| stimulation | 0.829 | 0.786 | 0.807 |
+| suction | 0.831 | 0.762 | 0.795 |
+| **macro** | **0.878** | **0.846** | **0.861** |
+
+**Run the preflight.** `scripts/check_ronald_data.py` is read-only and takes
+seconds, and it checks the things that would otherwise waste the whole run: that
+the manifests parse, that the clip paths resolve once the account prefix is
+stripped, and — the important one — that `train.csv` **is** the thesis split.
+His README documents the statistics it must produce:
+
+```
+pos_weight per label: [1.0719, 9.9393, 39.0729]
+prior bias per label: [-0.0694, -2.2965, -3.6654]
+```
+
+Training re-checks this and warns on a mismatch. A manifest that misses these is
+not the one Table 3.5 was measured on, so the comparison would be against the
+wrong baseline — and the numbers are sharp enough to catch a difference of a few
+dozen clips.
+
+**How his labels get in.** His manifests are `video_path,ventilation,
+stimulation,suction` — three *final* binary columns, decided by his
+`clips_and_video_stats.py` at his thresholds under his visible gate.
+`configs/data_ronald.yaml` sets a new DataSpec key, `label_source: columns`,
+which takes those columns verbatim: no bucket, no threshold, no ambiguous band,
+no visibility gate, and **no row is ever dropped**. The config carries none of
+those keys either — DataSpec *rejects* them in this mode rather than letting
+them sit in the file looking as though they apply.
+
+Columns are matched **by name**, so his `[ventilation, stimulation, suction]`
+order cannot be silently transposed onto our usual stimulation-first order.
+
+**What is still ours**, and why the comparison is still fair: the backbone and
+pooling, the head, the optimiser and schedule, the metrics (including AP, which
+he did not report) — and the loss. One caveat there: our default
+`class_weighting: sqrt_inv_freq` gives `pos_weight = sqrt(neg/pos)`; **his was
+the raw `neg/pos`**. For his exact loss, train with a config that sets
+`class_weighting: inv_freq`. The run warns about this, and the preflight prints
+both alongside his documented values.
+
+**This is a diagnostic, not a destination.** His manifests point at his clip
+tree, so a checkpoint trained this way cannot be deployed on our data without a
+retrain. `--ronald` and `--sites` are mutually exclusive (his data is
+Haydom-only and has no `site` column), and `--full-coverage` is rejected because
+there is no ambiguous band to widen.
+
+#### Is cross-site training actually hurting you?
+
+Worth knowing before you attribute a weak number to it: **the three activities
+are not equally affected, and `suction` is a special case.**
+
+Haydom's suction is *penguin device only* (108 cases; 0 bulb, 0 tube). DRC's is
+bulb and tube. Under the 3-activity configs those are one `suction` label, so a
+pooled run asks one logit to fire on three visually distinct devices, two of
+which never occur at Haydom — and `scripts/suction_devices.py` measured the
+consequence: a DRC-trained model scores **AP 0.013 on Haydom suction**, i.e.
+chance.
+
+So for suction there are two different fixes and they are not interchangeable:
+
+| | what it does |
+|---|---|
+| `--sites Haydom` | removes the conflicting DRC devices by removing DRC |
+| `configs/data_suction3.yaml` | keeps DRC but splits `suction` into `suction_penguin` / `suction_bulb` / `suction_tube`, so the shared class (penguin, 119 cases across both sites) is learned and scored on its own |
+
+Run `--sites Haydom` first — it is one flag and it isolates the question. If
+Haydom-only fixes suction, the pooled label was the problem and `data_suction3`
+is how you get DRC's data back without reintroducing it. If Haydom-only changes
+little, the ceiling is not cross-site conflict and the remaining suspects are the
+two in *The baby-visible gate* and *Clip resolution* above.
 
 The third argument (or `--data-config`) picks the label regime; nothing in
 `configs/config.yaml` has to change. The run logs the resolved spec, the class

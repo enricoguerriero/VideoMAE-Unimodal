@@ -55,6 +55,8 @@ from src.utils import (load_model, collate_fn, compute_metrics,
                        DEFAULT_MINORITY_CLASS, wandb_utils as wu)
 from src.data import (VideoMAEDataset, DataSpec, spec_from_checkpoint,
                       parse_visible)
+from src.data.ronald import (DEFAULT_RONALD_DIR, DEFAULT_STRIP_PREFIX, load_split,
+                             split_path)
 
 VIT_MODELS = ["VideoMAE", "VideoMAEGiant"]
 
@@ -136,6 +138,56 @@ def resolve_test_sets(cli, config) -> list[tuple[str, str]]:
     return list(DEFAULT_TEST_SETS.items())
 
 
+def resolve_sites(cli_sites, config, logger):
+    """Which hospitals to score, as a lowercase set — or None for "all of them".
+
+    A model trained with `--sites Haydom` has never seen DRC, so scoring it there
+    by default answers a question nobody asked and buries the number that matters
+    in a two-row comparison table. training.py records the flag in the
+    checkpoint's config, so the default here is simply "the sites this model was
+    trained on".
+
+    That default is a convenience, never a restriction: `--sites all` scores
+    every test set regardless, which IS the cross-site generalisation experiment
+    and is worth running deliberately. An explicit `--sites` wins over both.
+    """
+    if cli_sites:
+        if len(cli_sites) == 1 and cli_sites[0].lower() == "all":
+            logger.info("--sites all: scoring every test set, including hospitals "
+                        "this model was not trained on")
+            return None
+        return {s.lower() for s in cli_sites}
+    trained = config.get("sites")
+    if trained:
+        logger.info(f"checkpoint was trained with --sites {sorted(trained)}, so only "
+                    f"those are scored. Pass `--sites all` for the cross-site number.")
+        return {str(s).lower() for s in trained}
+    return None
+
+
+def filter_rows_to_sites(rows, sites, name, logger):
+    """Restrict one test CSV's rows to `sites`. Returns None if nothing is left.
+
+    Filtering on the `site` COLUMN rather than on the test set's NAME, so this is
+    correct for a pooled file (`data/test.csv`, `data/validation.csv`) as well as
+    for the per-site ones — and a per-site file filtered to its own site is a
+    no-op rather than a special case.
+    """
+    if not sites:
+        return rows
+    if "site" not in rows.columns:
+        logger.warning(f"[{name}] --sites given but this CSV has no `site` column — "
+                       f"it predates the per-site manifest; scoring every row.")
+        return rows
+    out = rows[rows["site"].str.lower().isin(sites)]
+    if out.empty:
+        logger.info(f"[{name}] no clips from {sorted(sites)} — skipped.")
+        return None
+    if len(out) < len(rows):
+        logger.info(f"[{name}] --sites {sorted(sites)} keeps {len(out):,}/{len(rows):,} clips")
+    return out.reset_index(drop=True)
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument("--model", type=str, required=True, choices=VIT_MODELS)
@@ -148,6 +200,25 @@ def main():
                              "as not performed instead of being masked out, and no clip "
                              "is dropped for ambiguity. Reports this alongside the "
                              "confident-subset numbers so the two are comparable.")
+    parser.add_argument("--ronald", action="store_true",
+                        help="Score on Ronald Paleczny's test manifest. Implied "
+                             "for a checkpoint trained with --ronald (the path is "
+                             "recorded in it), so you rarely need this; pass it to "
+                             "score OUR model on HIS test set deliberately.")
+    parser.add_argument("--ronald-dir", default=None, metavar="DIR",
+                        help=f"Where his manifests live (default {DEFAULT_RONALD_DIR}).")
+    parser.add_argument("--ronald-strip-prefix", default=DEFAULT_STRIP_PREFIX,
+                        metavar="PREFIX",
+                        help="Leading path prefix stripped from his clip paths.")
+    parser.add_argument("--sites", nargs="+", default=None, metavar="SITE",
+                        help="Score only these hospitals, e.g. `--sites Haydom`. "
+                             "Case-insensitive, repeatable, and applied to the "
+                             "`site` column so it works on pooled CSVs too. "
+                             "DEFAULT: the sites the checkpoint was TRAINED on "
+                             "(training.py records --sites), so a Haydom-only "
+                             "model is scored on Haydom only. Pass `--sites all` "
+                             "to score every test set, which is the cross-site "
+                             "generalisation experiment.")
     parser.add_argument("--thesis-only", action="store_true",
                         help=f"Score only the thesis' frozen cases (rows with "
                              f"{THESIS_COLUMN} == 1), for a like-for-like comparison "
@@ -190,6 +261,18 @@ def main():
                            "it matches how the checkpoint was trained.")
     logger.info(spec.describe())
 
+    # --full-coverage widens the AMBIGUOUS band to "not performed". A
+    # label_source: columns manifest has no ambiguous band — its labels are
+    # already final — so the flag has nothing to widen, and full_coverage_spec()
+    # would be rejected by DataSpec.validate for setting an inert key. Say that
+    # here rather than surfacing it as a validation error three frames down.
+    if args.full_coverage and spec.labels_from_columns:
+        raise SystemExit(
+            f"--full-coverage does not apply to {spec.source}: it sets "
+            f"`label_source: columns`, so every clip already carries a final "
+            f"0/1 for every activity and nothing is masked or dropped for "
+            f"ambiguity. The score you would get is the one you already get.")
+
     # Only VideoMAE has the two pooling paths; the giant pools inside its own
     # trunk, so passing the kwarg to it would be a TypeError.
     pooling_kwargs = {}
@@ -199,7 +282,20 @@ def main():
     model = load_model(args.model, spec=spec, **pooling_kwargs)
     model = model.to(device)
 
+    ronald = args.ronald or bool(config.get("ronald"))
+    if args.ronald and not args.test_data:
+        config = {**config, "test_data":
+                  {"ronald_test": str(split_path("test", args.ronald_dir))}}
     test_sets = resolve_test_sets(args.test_data, config)
+    sites = None if ronald else resolve_sites(args.sites, config, logger)
+    if ronald:
+        logger.warning(
+            "--ronald: scoring on Ronald Paleczny's test manifest. Compare against "
+            "his thesis Table 3.5 (macro P/R/F1 0.878/0.846/0.861 at thresholds "
+            "0.5/0.5/0.5) — and note AP is ours, he did not report it.")
+        if args.sites:
+            raise SystemExit("--ronald and --sites are incompatible: his manifests "
+                             "are Haydom-only and have no `site` column.")
     logger.info("Test sets: " + ", ".join(f"{n} -> {c}" for n, c in test_sets))
 
     model.load_classifier(saved, config)
@@ -212,6 +308,11 @@ def main():
         wandb.init(project=config.get("wandb_project", "videomae-unimodal"),
                    name=f"test_{model.model_name}_{spec.task}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
                    config={**config, "test_data": dict(test_sets),
+                           # `sites` in the checkpoint config is what the model was
+                           # TRAINED on; this is what it is being SCORED on. They
+                           # differ exactly when --sites all asks the cross-site
+                           # question, which is the run you most need to tell apart.
+                           "eval_sites": sorted(sites) if sites else "all",
                            "thesis_only": args.thesis_only,
                            "pooling": getattr(model, "pooling", "n/a"),
                            "data_spec": spec.to_dict()},
@@ -226,14 +327,18 @@ def main():
         metrics, files = run_test_set(name, test_csv, model=model, spec=spec, args=args,
                                       config=config, device=device, amp_dtype=amp_dtype,
                                       minority_class=minority_class, base=base, ts=ts,
-                                      logger=logger)
+                                      logger=logger, sites=sites, ronald=ronald)
         if metrics is None:
             continue
         all_metrics[name] = metrics
         all_files += files
 
     if not all_metrics:
-        raise SystemExit("no test set produced any metrics — check the paths above.")
+        raise SystemExit(
+            "no test set produced any metrics — check the paths above."
+            + (f" Every set was empty after --sites {sorted(sites)}; pass "
+               f"`--sites all` to score the hospitals this model was not trained on."
+               if sites else ""))
 
     report_comparison(all_metrics, spec, minority_class, logger)
     # The same numbers as one sortable grid instead of ~40 scalar panels. This is
@@ -255,7 +360,7 @@ def main():
 
 
 def run_test_set(name, test_csv, *, model, spec, args, config, device, amp_dtype,
-                 minority_class, base, ts, logger):
+                 minority_class, base, ts, logger, sites=None, ronald=False):
     """Evaluate one test CSV. Returns (metrics, written files), or (None, []) if
     the CSV is missing — a missing site should not abort the other site's score."""
     if not os.path.exists(test_csv):
@@ -264,7 +369,17 @@ def run_test_set(name, test_csv, *, model, spec, args, config, device, amp_dtype
         return None, []
 
     logger.info(f"\n{'=' * 70}\n[{name}] {test_csv}\n{'=' * 70}")
-    rows = pd.read_csv(test_csv)
+    if ronald:
+        # NOT pd.read_csv: his manifests store clip paths under the account that
+        # generated them, and the prefix has to come off or every decode is a
+        # PermissionError.
+        rows = load_split("test", os.path.dirname(test_csv) or None,
+                          args.ronald_strip_prefix)
+    else:
+        rows = pd.read_csv(test_csv)
+    rows = filter_rows_to_sites(rows, sites, name, logger)
+    if rows is None:
+        return None, []
     if args.thesis_only:
         if THESIS_COLUMN not in rows.columns:
             logger.warning(f"[{name}] no `{THESIS_COLUMN}` column in {test_csv} — it "

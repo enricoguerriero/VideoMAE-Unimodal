@@ -46,6 +46,18 @@ OVERLAP_POLICIES = ("dominant", "drop")
 BUCKET_POLICIES = ("keep", "drop")
 UNKNOWN_VISIBILITY_POLICIES = ("keep", "drop")
 
+#: Where a clip's target comes from.
+#:   evidence — the repo's own manifests: `bucket` + `frac_*`, resolved HERE by
+#:              `DataSpec.resolve`, so thresholds and buckets are live.
+#:   columns  — the manifest already holds one binary column per activity, and
+#:              those ARE the targets. Used for a FOREIGN manifest whose labels
+#:              were decided by another pipeline (see configs/data_ronald.yaml).
+#:              Every label-shaping key below is inert in this mode, by design:
+#:              re-thresholding someone else's resolved labels is not possible,
+#:              and pretending otherwise is how two pipelines get compared on
+#:              data that is no longer either one's.
+LABEL_SOURCES = ("evidence", "columns")
+
 #: The nine buckets data_process.py writes as the trailing `_N` of every clip.
 BUCKET_NAMES = {
     0: "non_target",
@@ -109,6 +121,7 @@ class DataSpec:
     buckets: dict[int, str]
     decision_thresholds: dict[str, float]
     annotation_events: dict[str, str] = field(default_factory=dict)
+    label_source: str = "evidence"
     min_visible_fraction: float = 0.0
     unknown_visibility: str = "keep"
     source: str | None = field(default=None, compare=False)
@@ -139,6 +152,7 @@ class DataSpec:
         buckets = {int(k): str(v).strip().lower() for k, v in (raw.get("buckets") or {}).items()}
         dec = {str(k): float(v) for k, v in (raw.get("decision_thresholds") or {}).items()}
         events = {str(k): str(v) for k, v in (raw.get("annotation_events") or {}).items()}
+        label_source = str(raw.get("label_source", "evidence")).strip().lower()
         min_vis = float(raw.get("min_visible_fraction", 0.0))
         unk_vis = str(raw.get("unknown_visibility", "keep")).strip().lower()
 
@@ -146,6 +160,7 @@ class DataSpec:
                    tag_keys=tag_keys, thresholds=thresholds, weak_threshold=weak,
                    ambiguous=ambiguous, overlap_resolution=overlap, buckets=buckets,
                    decision_thresholds=dec, annotation_events=events,
+                   label_source=label_source,
                    min_visible_fraction=min_vis, unknown_visibility=unk_vis,
                    source=source)
         spec.validate()
@@ -165,6 +180,7 @@ class DataSpec:
             "buckets": dict(self.buckets),
             "decision_thresholds": dict(self.decision_thresholds),
             "annotation_events": dict(self.annotation_events),
+            "label_source": self.label_source,
             "min_visible_fraction": self.min_visible_fraction,
             "unknown_visibility": self.unknown_visibility,
         }
@@ -183,32 +199,46 @@ class DataSpec:
             raise ValueError(f"ambiguous must be one of {AMBIGUOUS_POLICIES}")
         if self.overlap_resolution not in OVERLAP_POLICIES:
             raise ValueError(f"overlap_resolution must be one of {OVERLAP_POLICIES}")
-        for a in self.activities:
-            if a not in self.tag_keys:
-                raise ValueError(f"tag_keys is missing activity {a!r}")
-            if a not in self.thresholds:
-                raise ValueError(f"thresholds is missing activity {a!r}")
-            if not 0.0 < self.thresholds[a] <= 1.0:
-                raise ValueError(f"thresholds[{a}] must be in (0, 1], got {self.thresholds[a]}")
-            if self.thresholds[a] <= self.weak_threshold:
-                raise ValueError(
-                    f"thresholds[{a}]={self.thresholds[a]} must exceed "
-                    f"weak_threshold={self.weak_threshold}; otherwise the "
-                    f"positive and negative bands overlap")
-        if len(set(self.tag_keys[a] for a in self.activities)) != len(self.activities):
-            raise ValueError(f"tag_keys must be unique per activity: {self.tag_keys}")
-        if not 0.0 <= self.weak_threshold < 1.0:
-            raise ValueError(f"weak_threshold must be in [0, 1), got {self.weak_threshold}")
+        # `tag_keys` name a filename tag and `thresholds` cut a window fraction.
+        # A `columns` manifest has neither — its labels are already decided — so
+        # requiring them there would mean writing dummy values into the config
+        # and inviting someone to tune them.
+        if self.label_source != "columns":
+            for a in self.activities:
+                if a not in self.tag_keys:
+                    raise ValueError(f"tag_keys is missing activity {a!r}")
+                if a not in self.thresholds:
+                    raise ValueError(f"thresholds is missing activity {a!r}")
+                if not 0.0 < self.thresholds[a] <= 1.0:
+                    raise ValueError(f"thresholds[{a}] must be in (0, 1], got {self.thresholds[a]}")
+                if self.thresholds[a] <= self.weak_threshold:
+                    raise ValueError(
+                        f"thresholds[{a}]={self.thresholds[a]} must exceed "
+                        f"weak_threshold={self.weak_threshold}; otherwise the "
+                        f"positive and negative bands overlap")
+            if len(set(self.tag_keys[a] for a in self.activities)) != len(self.activities):
+                raise ValueError(f"tag_keys must be unique per activity: {self.tag_keys}")
+            if not 0.0 <= self.weak_threshold < 1.0:
+                raise ValueError(f"weak_threshold must be in [0, 1), got {self.weak_threshold}")
+        elif self.thresholds or self.tag_keys:
+            raise ValueError(
+                "label_source: columns takes no `thresholds` or `tag_keys` — the "
+                "manifest's labels are already resolved and nothing here can "
+                "re-cut them. Remove both keys.")
         for b, policy in self.buckets.items():
             if policy not in BUCKET_POLICIES:
                 raise ValueError(f"buckets[{b}] must be one of {BUCKET_POLICIES}, got {policy!r}")
             if b not in BUCKET_NAMES:
                 raise ValueError(f"unknown bucket {b}; valid buckets are {sorted(BUCKET_NAMES)}")
-        missing = sorted(set(BUCKET_NAMES) - set(self.buckets))
-        if missing:
-            raise ValueError(
-                f"buckets must cover every bucket 0-8; missing {missing}. "
-                f"Be explicit — a silently dropped bucket is a silently smaller dataset.")
+        # In `columns` mode there are no buckets to cover: the foreign manifest
+        # carries resolved labels and never had this repo's nine-bucket taxonomy.
+        # The `label_source` check below insists the key be absent entirely.
+        if self.label_source != "columns":
+            missing = sorted(set(BUCKET_NAMES) - set(self.buckets))
+            if missing:
+                raise ValueError(
+                    f"buckets must cover every bucket 0-8; missing {missing}. "
+                    f"Be explicit — a silently dropped bucket is a silently smaller dataset.")
         for a in self.activities:
             t = self.decision_thresholds.get(a, 0.5)
             if not 0.0 < t < 1.0:
@@ -216,6 +246,29 @@ class DataSpec:
         unknown = sorted(set(self.annotation_events) - set(self.activities))
         if unknown:
             raise ValueError(f"annotation_events names non-activities: {unknown}")
+        if self.label_source not in LABEL_SOURCES:
+            raise ValueError(
+                f"label_source must be one of {LABEL_SOURCES}, got {self.label_source!r}")
+        if self.label_source == "columns":
+            # These keys all shape a label out of EVIDENCE. There is no evidence
+            # here — the manifest states the answer. Leaving them set would read
+            # like they apply, and the whole point of this mode is that the
+            # foreign pipeline's labels arrive untouched.
+            inert = [k for k, v in (("buckets", bool(self.buckets)),
+                                    ("ambiguous", self.ambiguous != "drop"),
+                                    ("min_visible_fraction", self.gates_visibility),
+                                    ("overlap_resolution", self.overlap_resolution != "drop"))
+                     if v]
+            if inert:
+                raise ValueError(
+                    f"label_source: columns means the manifest's own per-activity "
+                    f"columns ARE the targets, so {inert} cannot do anything — but "
+                    f"they are set, which reads as though they will. Remove them, "
+                    f"or use label_source: evidence.")
+            if not self.is_multilabel:
+                raise ValueError(
+                    "label_source: columns needs task: multilabel — one binary "
+                    "column per activity is a multilabel target by construction.")
         if not 0.0 <= self.min_visible_fraction <= 1.0:
             raise ValueError(
                 f"min_visible_fraction must be in [0, 1], got {self.min_visible_fraction}")
@@ -273,6 +326,11 @@ class DataSpec:
     def frac_columns(self) -> list[str]:
         """Manifest column names holding the per-activity window fractions."""
         return [f"frac_{a}" for a in self.activities]
+
+    @property
+    def labels_from_columns(self) -> bool:
+        """Are the targets read verbatim from the manifest's activity columns?"""
+        return self.label_source == "columns"
 
     @property
     def gates_visibility(self) -> bool:
