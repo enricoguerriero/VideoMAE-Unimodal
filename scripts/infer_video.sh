@@ -10,10 +10,12 @@
 #   bash scripts/infer_video.sh <MODEL> <CKPT> [GPU] [PORT] [CASE]
 #
 # The menu lists each episode's ground-truth clip count PER ACTIVITY. Press
-# Enter to take the default: the episode whose ground truth contains EVERY
-# activity, with the most clips of the rarest one — the episode actually worth
-# looking at, since an overlay with two flat tracks says nothing about them.
-# AUTO=1 skips the prompt and takes that same episode (for nohup / batch runs).
+# Enter to take the suggestion: a RANDOM episode whose ground truth contains
+# EVERY activity — worth looking at, because an overlay with two flat tracks
+# says nothing about those two. Re-running suggests a different one, so you are
+# not always judging the model on the same baby, camera and operator.
+#   AUTO=1   skip the prompt and take that random pick (nohup / batch runs)
+#   SEED=42  make the pick reproducible, for regenerating a specific figure
 #
 # By default it writes a STANDALONE annotated.mp4 (offline-friendly: no server or
 # browser — just copy the file off the VM and play it in VLC). This is the right
@@ -44,6 +46,7 @@ DATA_CONFIG="${6:-}"
 SERVE="${SERVE:-0}"
 RONALD="${RONALD:-0}"
 AUTO="${AUTO:-0}"
+SEED="${SEED:-}"
 
 # No --test-csv here: src.infer_video picks the right default on its own
 # (data/test.csv, or his manifest under --ronald). Hardcoding it would override
@@ -54,6 +57,9 @@ if [[ "${RONALD}" == "1" ]]; then
 fi
 if [[ "${AUTO}" == "1" ]]; then
     ARGS+=(--auto-case)
+fi
+if [[ -n "${SEED}" ]]; then
+    ARGS+=(--seed "${SEED}")
 fi
 if [[ -n "${CASE}" ]]; then
     ARGS+=(--case "${CASE}")

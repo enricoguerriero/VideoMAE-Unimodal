@@ -59,6 +59,7 @@ import json
 import logging
 import math
 import os
+import random
 import shutil
 from pathlib import Path
 
@@ -911,33 +912,39 @@ def list_test_cases(test_csv: Path, strip_prefix: str | None = None, spec=None):
     return sorted(cases.values(), key=lambda c: c["case_id"])
 
 
-def default_case(cases, spec):
-    """The episode to use when the user just presses Enter.
+def qualifying_cases(cases, spec):
+    """Episodes worth suggesting, best coverage tier first. May be empty.
 
-    Prefers one that contains EVERY activity, because that is the episode worth
-    looking at: an overlay showing all three tracks lit at different times says
-    far more about a model than one where two tracks are flat all the way
-    through and nothing can be judged about them.
-
-    Among the qualifying episodes it maximises the RAREST activity's clip count
-    first (suction, usually), then the others — a case with 40 suction clips
-    shows the behaviour that a case with 2 cannot. Falls back to the episode
-    covering the most distinct activities, then the largest, so there is always
-    a default even on a manifest where no single episode has everything.
+    An overlay is only informative where the ground truth actually exercises the
+    model: an episode with two flat tracks says nothing about those two
+    activities. So the pool is the episodes covering the MOST distinct
+    activities — all of them where any episode has all of them, and the widest
+    available otherwise, so there is always something to offer.
     """
     usable = [c for c in cases if c.get("video") and c.get("n_clips")]
-    if not usable:
-        return None
-    if not spec or not any(c.get("pos") for c in usable):
-        return max(usable, key=lambda c: c["n_clips"])
-    n_act = len(spec.activities)
+    if not usable or not spec or not any(c.get("pos") for c in usable):
+        return usable
+    covered = {id(c): sum(1 for v in (c.get("pos") or []) if v > 0) for c in usable}
+    best = max(covered.values())
+    return [c for c in usable if covered[id(c)] == best]
 
-    def key(c):
-        pos = c.get("pos") or [0] * n_act
-        return (sum(1 for v in pos if v > 0),   # how many activities are present
-                sorted(pos),                     # then: lift the rarest one first
-                c["n_clips"])
-    return max(usable, key=key)
+
+def default_case(cases, spec, rng=None):
+    """The episode to use when the user just presses Enter.
+
+    A RANDOM pick among `qualifying_cases`, not the best one: always landing on
+    the same episode means every look at the model is a look at the same baby,
+    the same camera angle and the same operator, and a model can be flattered or
+    libelled by one recording. Re-running offers a different episode, which is
+    how you notice that.
+
+    `rng` makes it reproducible — `--seed` — for when a specific figure has to be
+    regenerated. Unseeded is the default, because the point is variety.
+    """
+    pool = qualifying_cases(cases, spec)
+    if not pool:
+        return None
+    return (rng or random).choice(pool)
 
 
 #: (videos dir, annotations dir) pairs to look for, relative to an ancestor of
@@ -972,7 +979,7 @@ def resolve_media(anchor_clip: str, case_id: str):
     return None, None
 
 
-def choose_case(cases, spec=None, default=None):
+def choose_case(cases, spec=None, default=None, pool=None):
     """Print a numbered menu and return the selected case dict (interactive).
 
     Each row shows the episode's ground-truth clip count PER ACTIVITY, so the
@@ -988,8 +995,13 @@ def choose_case(cases, spec=None, default=None):
         cells = "".join(f"{n:>10,}" if n else f"{'·':>10}" for n in pos)
         v = "✓" if c["video"] else "✗"
         g = "✓" if c["annotation"] else "✗"
-        mark = " <- default" if default is not None and c is default else ""
+        in_pool = bool(pool) and any(c is q for q in pool)
+        mark = (" * <- suggested" if default is not None and c is default
+                else (" *" if in_pool else ""))
         print(f"  [{i:2d}] {c['case_id']:<14}{c['n_clips']:>7,}{cells}     {v}   {g}{mark}")
+    if pool and len(pool) > 1:
+        print(f"       * = one of the {len(pool)} episodes with the widest activity "
+              f"coverage; Enter picks among them at random")
     if any(c.get("unreadable") for c in cases):
         n = sum(c["unreadable"] for c in cases)
         print(f"  ({n:,} clip row(s) could not be resolved to labels and are not "
@@ -998,10 +1010,13 @@ def choose_case(cases, spec=None, default=None):
     if default is not None:
         pos = default.get("pos") or []
         covered = [a for a, n in zip(acts, pos) if n]
-        why = (f"has all {len(acts)} activities" if len(covered) == len(acts) and acts
-               else f"has {', '.join(covered) or 'no labelled activity'}")
+        why = (f"all {len(acts)} activities" if len(covered) == len(acts) and acts
+               else f"{', '.join(covered) or 'no labelled activity'}")
+        n_pool = len(pool) if pool is not None else 0
+        among = (f", 1 of {n_pool} such episodes — re-run for another"
+                 if n_pool > 1 else "")
         prompt = (f"\nSelect a case [1-{len(cases)}], or Enter for "
-                  f"{default['case_id']} ({why}) (q to quit): ")
+                  f"{default['case_id']} ({why}{among}) (q to quit): ")
     else:
         prompt = f"\nSelect a case [1-{len(cases)}] (q to quit): "
 
@@ -1030,7 +1045,8 @@ def select_from_test_set(args, spec=None):
     for c in cases:
         c["video"], c["annotation"] = resolve_media(c["anchor"], c["case_id"])
 
-    default = default_case(cases, spec)
+    rng = random.Random(args.seed) if getattr(args, "seed", None) is not None else None
+    default = default_case(cases, spec, rng)
     if args.case:
         chosen = next((c for c in cases if c["case_id"] == args.case), None)
         if chosen is None:
@@ -1042,10 +1058,14 @@ def select_from_test_set(args, spec=None):
                              f"(none has a resolvable video).")
         chosen = default
         pos = dict(zip(spec.activities, chosen.get("pos", []))) if spec else {}
+        n_pool = len(qualifying_cases(cases, spec))
         logger.info(f"--auto-case: {chosen['case_id']} ({chosen['n_clips']:,} clips, "
-                    f"ground truth {pos})")
+                    f"ground truth {pos}) — randomly chosen from {n_pool} episode(s) "
+                    f"with the widest activity coverage"
+                    + ("" if getattr(args, 'seed', None) is None
+                       else f", seed={args.seed}"))
     else:
-        chosen = choose_case(cases, spec, default)
+        chosen = choose_case(cases, spec, default, qualifying_cases(cases, spec))
 
     if not chosen["video"]:
         raise SystemExit(
@@ -1080,9 +1100,13 @@ def main():
     ap.add_argument("--case", default=None,
                     help="Case id to run non-interactively (skips the menu).")
     ap.add_argument("--auto-case", action="store_true",
-                    help="Skip the menu and take the episode Enter would pick: the "
-                         "one whose ground truth contains every activity, with the "
-                         "most clips of the rarest. For nohup / batch runs.")
+                    help="Skip the menu and take the episode Enter would pick: a "
+                         "RANDOM one whose ground truth contains every activity. "
+                         "For nohup / batch runs.")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Make that random pick reproducible, for regenerating a "
+                         "specific figure. Unseeded by default — the point of the "
+                         "randomness is that re-running shows a different episode.")
     ap.add_argument("--annotation", default=None,
                     help="5-col TSV to overlay ground truth (auto-resolved for test cases).")
     ap.add_argument("--no-gt", action="store_true",
