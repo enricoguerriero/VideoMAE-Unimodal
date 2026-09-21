@@ -545,6 +545,30 @@ the raw `neg/pos`**. For his exact loss, train with a config that sets
 `class_weighting: inv_freq`. The run warns about this, and the preflight prints
 both alongside his documented values.
 
+**Which episodes can inference actually run on?**
+
+```bash
+python scripts/check_episode_media.py                 # ours, both sites
+python scripts/check_episode_media.py --ronald        # his
+```
+
+Read-only, and it calls the same `resolve_media` inference calls, so it cannot
+drift from what inference will do. It prints per site how many episodes resolve
+a video and an annotation, and — the part that matters — **which directory each
+annotation came from**, so the vintage is visible rather than assumed. A site
+that resolves nothing is an exit-1 failure with the unresolved cases named.
+
+The two sites resolve differently and that asymmetry is the whole reason this
+check exists: DRC keeps `Unprocessed_data/anot_files/<case>.txt` inside the
+clip's own ancestry, while Haydom has no such directory and its exports are not
+named after the case, so its lookup goes through `AnnotationIndex` against the
+roots in `src/data/sites.py`, matched by case key (exact stem, or any run of
+>= 5 digits). Those roots are ordered, and `prefer_order=True` keeps that order
+— the staged re-cut annotations win because they are the exact vintage the
+clips were cut from. Without it `from_roots` sorts by directory size and a
+larger export of a different vintage would supply the overlay, putting it
+quietly out of step with the labels the model trained on.
+
 **Episode inference works on his tree too:**
 
 ```bash

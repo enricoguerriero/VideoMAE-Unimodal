@@ -448,10 +448,19 @@ class AnnotationIndex:
         return True
 
     @classmethod
-    def from_roots(cls, roots):
+    def from_roots(cls, roots, prefer_order=False):
         """Index every directory under `roots` that holds .txt files, largest
         first — argument order is not a quality ranking, and the first directory
-        an rglob surfaces can easily be a two-file scratch folder."""
+        an rglob surfaces can easily be a two-file scratch folder.
+
+        `prefer_order=True` keeps the CALLER's order instead, for the case where
+        argument order IS a quality ranking: an inference overlay must prefer the
+        annotations its clips were actually cut from, even when a larger export
+        of a different vintage also covers the case. Drawing ground truth from a
+        vintage the labels did not come from puts the overlay and the model's
+        own targets quietly out of step. Callers that just want coverage (the
+        fraction backfill) should leave it False.
+        """
         self = cls()
         seen = set()
         for root in roots:
@@ -466,7 +475,8 @@ class AnnotationIndex:
                 if d not in seen:
                     seen.add(d)
                     self.add_dir(d)
-        self.entries.sort(key=lambda e: -len(e["index"]))
+        if not prefer_order:
+            self.entries.sort(key=lambda e: -len(e["index"]))
         return self
 
     def lookup(self, case_id: str):

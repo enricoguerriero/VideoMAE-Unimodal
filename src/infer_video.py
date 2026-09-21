@@ -1082,7 +1082,11 @@ def select_from_test_set(args, spec=None):
     # GT-only listing — vanishes from the menu entirely.
     roots = ([Path(d).expanduser() for d in args.annotation_dir]
              if getattr(args, "annotation_dir", None) else annotation_dirs())
-    index = AnnotationIndex.from_roots(roots) if roots else None
+    # prefer_order=True: sites.py lists the STAGED re-cut annotations first
+    # because they are the exact vintage the clips were cut from. Without it the
+    # index sorts by directory size and a larger export of a different vintage
+    # wins, so the overlay would disagree with the labels the model trained on.
+    index = AnnotationIndex.from_roots(roots, prefer_order=True) if roots else None
     if index is not None and len(index):
         logger.info(f"annotation lookup: {len(index)} case key(s) over "
                     f"{len(index.dirs)} director{'y' if len(index.dirs) == 1 else 'ies'}")
