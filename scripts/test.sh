@@ -26,8 +26,10 @@
 #                                 for the 3 episodes with the most errors (via
 #                                 src.infer_video). The per-episode error table
 #                                 prints on every run regardless.
-#   --worst-by suction            rank those episodes by one class instead of by
-#                                 total errors (`rate` ranks by errors/decision)
+#   --worst-by suction            rank those episodes by one class's error COUNT
+#   --worst-by suction:rate       ...by that class's error RATE instead, so a long
+#                                 recording cannot crowd out a short one that gets
+#                                 the class badly wrong (`rate` alone = all classes)
 #   --ronald                      score on Ronald Paleczny's test manifest
 #                                 (implied by a checkpoint trained with --ronald)
 #   --sites Haydom                score one hospital only (default: whichever

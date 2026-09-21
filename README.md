@@ -805,11 +805,22 @@ bash scripts/test.sh VideoMAE <ckpt>.pt 0 "" --render-worst 3
 bash scripts/test.sh VideoMAE <ckpt>.pt 0 "" --render-worst 3 --worst-by suction
 ```
 
-| `--worst-by` | picks |
-|---|---|
-| `errors` (default) | where the bulk of the damage is — biased to long episodes |
-| `rate` | errors per decision: the episodes handled worst, often short and low-impact |
-| an activity name | that class alone — the one to use when suction is the problem |
+| `--worst-by` | picks | count or rate |
+|---|---|---|
+| `errors` (default) | where the bulk of the damage is — biased to long episodes | count |
+| `rate` | errors per decision: the episodes handled worst, often short | rate |
+| `suction` | that class alone, still biased to long episodes | count |
+| `suction:rate` | that class **normalised by its own supervised decisions** | rate |
+
+`<activity>:rate` is the one for "which episode gets suction most wrong", and it
+routinely reverses the `<activity>` order — a 1,000-clip recording with 30
+suction errors (3.0 %) outranks a 60-clip one with 12 (20.0 %) by count, and
+loses to it by rate. Ranking by it adds a `suction err%` column so the number
+being sorted on is visible. Ties fall back to the raw count.
+
+The denominator is that activity's **supervised decisions**, not its positives:
+an episode containing no suction at all would divide by zero, and those are
+exactly the episodes a false-positive problem lives in.
 
 Videos land in `--worst-dir` (default `results/worst_episodes/<set>_<case>/`).
 Rendering runs `src.infer_video` as a subprocess rather than re-implementing its

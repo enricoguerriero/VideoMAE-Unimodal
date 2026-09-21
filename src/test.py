@@ -164,7 +164,8 @@ def per_case_errors(rows, logits, labels, masks, spec):
                                  "decisions": 0, "errors": 0,
                                  "fp": dict.fromkeys(acts, 0),
                                  "fn": dict.fromkeys(acts, 0),
-                                 "pos": dict.fromkeys(acts, 0)})
+                                 "pos": dict.fromkeys(acts, 0),
+                                 "sup": dict.fromkeys(acts, 0)})
         c["clips"] += 1
         c["decisions"] += int(sup[i].sum().item())
         c["errors"] += int(wrong[i].sum().item())
@@ -172,8 +173,16 @@ def per_case_errors(rows, logits, labels, masks, spec):
             c["fp"][a] += int(fp[i, j].item())
             c["fn"][a] += int(fn[i, j].item())
             c["pos"][a] += int(labels[i, j].item())
+            c["sup"][a] += int(sup[i, j].item())
     for c in agg.values():
         c["rate"] = c["errors"] / max(c["decisions"], 1)
+        # Per activity: errors on it over the decisions actually SUPERVISED for
+        # it. Not over its positives — an episode with no suction at all would
+        # divide by zero, and those are exactly the episodes a false-positive
+        # problem shows up in, so that denominator is undefined where it matters
+        # most.
+        c["act_rate"] = {a: (c["fp"][a] + c["fn"][a]) / max(c["sup"][a], 1)
+                         for a in acts}
     return sorted(agg.values(), key=lambda c: -c["errors"])
 
 
@@ -184,27 +193,45 @@ def rank_worst(cases, by, spec):
     `rate` finds the episodes the model handles worst, which are often short and
     contribute little overall — useful, but a different question. An ACTIVITY
     name ranks by that activity's errors alone, which is the one to use when a
-    single class is the problem (suction, here).
+    single class is the problem (suction, here), and `<activity>:rate` does the
+    same normalised by that activity's supervised decisions — so a long
+    ventilation-heavy recording stops crowding out a short one that gets suction
+    badly wrong.
     """
     if by == "rate":
         return sorted(cases, key=lambda c: (-c["rate"], -c["errors"]))
-    if by in spec.activities:
-        return sorted(cases, key=lambda c: -(c["fp"][by] + c["fn"][by]))
+    act, _, mode = by.partition(":")
+    if act in spec.activities:
+        if mode == "rate":
+            # Tie-break on the raw count so two episodes at the same rate are
+            # ordered by how much they actually contribute.
+            return sorted(cases, key=lambda c: (-c["act_rate"][act],
+                                                -(c["fp"][act] + c["fn"][act])))
+        return sorted(cases, key=lambda c: -(c["fp"][act] + c["fn"][act]))
     return sorted(cases, key=lambda c: -c["errors"])
 
 
 def report_worst(cases, spec, name, by, top, logger):
     """Print the worst episodes, with FP/FN split per activity."""
     acts = list(spec.activities)
+    ranked_act, _, mode = by.partition(":")
+    show_act = ranked_act if (ranked_act in acts and mode == "rate") else None
+
     head = "".join(f"{a[:7]+' FP/FN':>16}" for a in acts)
+    extra = f"{ranked_act[:9]+' err%':>15}" if show_act else ""
     logger.info(f"\n[{name}] WORST EPISODES by {by}")
-    logger.info(f"  {'case':<14}{'site':<8}{'clips':>7}{'errors':>8}{'rate':>7}{head}")
+    logger.info(f"  {'case':<14}{'site':<8}{'clips':>7}{'errors':>8}{'rate':>7}"
+                f"{head}{extra}")
     for c in cases[:top]:
         cells = "".join(f"{c['fp'][a]:>8,}/{c['fn'][a]:<7,}" for a in acts)
+        tail = (f"{100*c['act_rate'][show_act]:>14.1f}%" if show_act else "")
         logger.info(f"  {c['case_id']:<14}{c['site']:<8}{c['clips']:>7,}"
-                    f"{c['errors']:>8,}{100*c['rate']:>6.1f}%{cells}")
+                    f"{c['errors']:>8,}{100*c['rate']:>6.1f}%{cells}{tail}")
     logger.info("  FP = predicted the activity where the ground truth says no; "
                 "FN = missed it.")
+    if show_act:
+        logger.info(f"  {ranked_act} err% = ({ranked_act} FP + FN) / decisions "
+                    f"supervised for {ranked_act} in that episode.")
 
 
 def resolve_test_sets(cli, config) -> list[tuple[str, str]]:
@@ -297,9 +324,11 @@ def main():
     parser.add_argument("--worst-by", default="errors", metavar="CRITERION",
                         help="How to rank episodes: `errors` (total wrong decisions, "
                              "the default), `rate` (errors per decision — finds the "
-                             "episodes handled worst, often short ones), or an "
-                             "ACTIVITY name to rank by that class alone (e.g. "
-                             "`suction`).")
+                             "episodes handled worst, often short ones), an ACTIVITY "
+                             "name for that class's error COUNT (e.g. `suction`), or "
+                             "`<activity>:rate` for that class's error RATE (e.g. "
+                             "`suction:rate`), which stops long recordings crowding "
+                             "out short ones that get the class badly wrong.")
     parser.add_argument("--worst-dir", default="results/worst_episodes", metavar="DIR",
                         help="Where the rendered episodes are written.")
     parser.add_argument("--ronald", action="store_true",
@@ -384,10 +413,13 @@ def main():
     model = load_model(args.model, spec=spec, **pooling_kwargs)
     model = model.to(device)
 
-    if args.worst_by not in ("errors", "rate") and args.worst_by not in spec.activities:
+    _act, _, _mode = args.worst_by.partition(":")
+    if not (args.worst_by in ("errors", "rate")
+            or (_act in spec.activities and _mode in ("", "rate"))):
         raise SystemExit(
-            f"--worst-by {args.worst_by!r} is not `errors`, `rate`, or one of this "
-            f"checkpoint's activities {list(spec.activities)}.")
+            f"--worst-by {args.worst_by!r} is not `errors`, `rate`, one of this "
+            f"checkpoint's activities {list(spec.activities)}, or "
+            f"`<activity>:rate`.")
     args._ckpt_ronald = bool(config.get("ronald"))
 
     ronald = args.ronald or bool(config.get("ronald"))
