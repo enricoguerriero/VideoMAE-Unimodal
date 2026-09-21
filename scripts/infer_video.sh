@@ -9,6 +9,12 @@
 # Pick a case interactively from the test set (no paths to type):
 #   bash scripts/infer_video.sh <MODEL> <CKPT> [GPU] [PORT] [CASE]
 #
+# The menu lists each episode's ground-truth clip count PER ACTIVITY. Press
+# Enter to take the default: the episode whose ground truth contains EVERY
+# activity, with the most clips of the rarest one — the episode actually worth
+# looking at, since an overlay with two flat tracks says nothing about them.
+# AUTO=1 skips the prompt and takes that same episode (for nohup / batch runs).
+#
 # By default it writes a STANDALONE annotated.mp4 (offline-friendly: no server or
 # browser — just copy the file off the VM and play it in VLC). This is the right
 # mode for a headless / offline VM.
@@ -37,6 +43,7 @@ CASE="${5:-}"
 DATA_CONFIG="${6:-}"
 SERVE="${SERVE:-0}"
 RONALD="${RONALD:-0}"
+AUTO="${AUTO:-0}"
 
 # No --test-csv here: src.infer_video picks the right default on its own
 # (data/test.csv, or his manifest under --ronald). Hardcoding it would override
@@ -44,6 +51,9 @@ RONALD="${RONALD:-0}"
 ARGS=(--model "${MODEL}" --model_path "${CKPT}")
 if [[ "${RONALD}" == "1" ]]; then
     ARGS+=(--ronald)
+fi
+if [[ "${AUTO}" == "1" ]]; then
+    ARGS+=(--auto-case)
 fi
 if [[ -n "${CASE}" ]]; then
     ARGS+=(--case "${CASE}")

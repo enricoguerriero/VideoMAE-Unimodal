@@ -71,7 +71,7 @@ from src.utils import load_model
 from src.data.ronald import (DEFAULT_RONALD_DIR,
                              DEFAULT_STRIP_PREFIX as RONALD_STRIP_PREFIX,
                              split_path as ronald_split_path)
-from src.data import DataSpec, spec_from_checkpoint
+from src.data import DataSpec, parse_visible, spec_from_checkpoint
 from src.data.annotations import intervals_by_category, read_annotation
 
 # Distinct, colour-blind-friendly-ish palette. The negative/"no activity" state
@@ -827,7 +827,50 @@ def recover_case_id(clip_path: str) -> str:
     return stem
 
 
-def list_test_cases(test_csv: Path, strip_prefix: str | None = None):
+def row_positives(row, spec):
+    """Per-activity 0/1 for one manifest row, or None if it cannot be read.
+
+    Two manifest shapes, matching DataSpec's two label sources:
+
+      columns  — one binary column per activity (a foreign manifest). Read
+                 straight off, by NAME.
+      evidence — `bucket` + `frac_*`, resolved through the DataSpec exactly as
+                 the Dataset would, so the menu reports the labels this model
+                 was actually trained against rather than a second opinion.
+    """
+    if spec.labels_from_columns:
+        out = []
+        for a in spec.activities:
+            v = row.get(a)
+            if v is None or str(v).strip() == "":
+                return None
+            try:
+                out.append(1 if int(float(v)) else 0)
+            except ValueError:
+                return None
+        return out
+    if "bucket" not in row:
+        return None
+    try:
+        fracs = {a: float(row.get(f"frac_{a}") or 0.0) for a in spec.activities}
+        label = spec.resolve(
+            int(row["bucket"]), fracs,
+            tagged=bool(int(row.get("tagged", 1) or 1)),
+            dir_activities=spec.activities_from_path(row.get("clip_dir", "")),
+            frac_visible=parse_visible(row.get("frac_visible")))
+    except (ValueError, TypeError, RuntimeError):
+        return None
+    if label is None:
+        return [0] * len(spec.activities)
+    if label.targets is not None:
+        return [1 if t == 1.0 and m == 1.0 else 0
+                for t, m in zip(label.targets, label.mask)]
+    # multiclass: index 0 is the negative class, activities start at 1
+    return [1 if label.class_index == i + 1 else 0
+            for i in range(len(spec.activities))]
+
+
+def list_test_cases(test_csv: Path, strip_prefix: str | None = None, spec=None):
     """Read the test manifest → ordered unique cases with clip counts + an anchor.
 
     `strip_prefix` is removed from every clip path first. Ronald Paleczny's
@@ -845,9 +888,47 @@ def list_test_cases(test_csv: Path, strip_prefix: str | None = None):
             if strip_prefix and vp.startswith(strip_prefix):
                 vp = vp[len(strip_prefix):]
             cid = recover_case_id(vp)
-            c = cases.setdefault(cid, {"case_id": cid, "n_clips": 0, "anchor": vp})
+            c = cases.setdefault(cid, {"case_id": cid, "n_clips": 0, "anchor": vp,
+                                       "pos": [0] * len(spec.activities) if spec else [],
+                                       "unreadable": 0})
             c["n_clips"] += 1
+            if spec is None:
+                continue
+            got = row_positives(row, spec)
+            if got is None:
+                c["unreadable"] += 1
+            else:
+                c["pos"] = [n + g for n, g in zip(c["pos"], got)]
     return sorted(cases.values(), key=lambda c: c["case_id"])
+
+
+def default_case(cases, spec):
+    """The episode to use when the user just presses Enter.
+
+    Prefers one that contains EVERY activity, because that is the episode worth
+    looking at: an overlay showing all three tracks lit at different times says
+    far more about a model than one where two tracks are flat all the way
+    through and nothing can be judged about them.
+
+    Among the qualifying episodes it maximises the RAREST activity's clip count
+    first (suction, usually), then the others — a case with 40 suction clips
+    shows the behaviour that a case with 2 cannot. Falls back to the episode
+    covering the most distinct activities, then the largest, so there is always
+    a default even on a manifest where no single episode has everything.
+    """
+    usable = [c for c in cases if c.get("video") and c.get("n_clips")]
+    if not usable:
+        return None
+    if not spec or not any(c.get("pos") for c in usable):
+        return max(usable, key=lambda c: c["n_clips"])
+    n_act = len(spec.activities)
+
+    def key(c):
+        pos = c.get("pos") or [0] * n_act
+        return (sum(1 for v in pos if v > 0),   # how many activities are present
+                sorted(pos),                     # then: lift the rarest one first
+                c["n_clips"])
+    return max(usable, key=key)
 
 
 #: (videos dir, annotations dir) pairs to look for, relative to an ancestor of
@@ -882,42 +963,80 @@ def resolve_media(anchor_clip: str, case_id: str):
     return None, None
 
 
-def choose_case(cases):
-    """Print a numbered menu and return the selected case dict (interactive)."""
-    print("\nTest-set cases:")
+def choose_case(cases, spec=None, default=None):
+    """Print a numbered menu and return the selected case dict (interactive).
+
+    Each row shows the episode's ground-truth clip count PER ACTIVITY, so the
+    choice can be made on what is actually in the episode rather than on a case
+    id. Pressing Enter takes `default` — see `default_case`.
+    """
+    acts = list(spec.activities) if spec else []
+    head = "".join(f"{a[:9]:>10}" for a in acts)
+    print("\nTest-set cases  (ground-truth positive clips per activity):")
+    print(f"       {'case':<14}{'clips':>7}{head}   video  GT")
     for i, c in enumerate(cases, 1):
-        v = "video ✓" if c["video"] else "video ✗ (raw not found)"
-        g = "GT ✓" if c["annotation"] else "GT ✗"
-        print(f"  [{i:2d}] {c['case_id']:14s} {c['n_clips']:5d} clips   {v:26s} {g}")
+        pos = c.get("pos") or []
+        cells = "".join(f"{n:>10,}" if n else f"{'·':>10}" for n in pos)
+        v = "✓" if c["video"] else "✗"
+        g = "✓" if c["annotation"] else "✗"
+        mark = " <- default" if default is not None and c is default else ""
+        print(f"  [{i:2d}] {c['case_id']:<14}{c['n_clips']:>7,}{cells}     {v}   {g}{mark}")
+    if any(c.get("unreadable") for c in cases):
+        n = sum(c["unreadable"] for c in cases)
+        print(f"  ({n:,} clip row(s) could not be resolved to labels and are not "
+              f"counted above)")
+
+    if default is not None:
+        pos = default.get("pos") or []
+        covered = [a for a, n in zip(acts, pos) if n]
+        why = (f"has all {len(acts)} activities" if len(covered) == len(acts) and acts
+               else f"has {', '.join(covered) or 'no labelled activity'}")
+        prompt = (f"\nSelect a case [1-{len(cases)}], or Enter for "
+                  f"{default['case_id']} ({why}) (q to quit): ")
+    else:
+        prompt = f"\nSelect a case [1-{len(cases)}] (q to quit): "
+
     while True:
-        sel = input(f"\nSelect a case [1-{len(cases)}] (q to quit): ").strip()
+        sel = input(prompt).strip()
         if sel.lower() in ("q", "quit", "exit"):
             raise SystemExit(0)
+        if sel == "" and default is not None:
+            return default
         if sel.isdigit() and 1 <= int(sel) <= len(cases):
             return cases[int(sel) - 1]
         print("  invalid selection")
 
 
-def select_from_test_set(args):
+def select_from_test_set(args, spec=None):
     """Resolve (video_path, annotation) via the test manifest + user selection."""
     test_csv = Path(args.test_csv).expanduser()
     if not test_csv.exists():
         raise FileNotFoundError(
             f"{test_csv} not found — run scripts/build_data.sh first, or pass --video.")
     cases = list_test_cases(
-        test_csv, RONALD_STRIP_PREFIX if getattr(args, "ronald", False) else None)
+        test_csv, RONALD_STRIP_PREFIX if getattr(args, "ronald", False) else None,
+        spec)
     if not cases:
         raise RuntimeError(f"No cases found in {test_csv}.")
     for c in cases:
         c["video"], c["annotation"] = resolve_media(c["anchor"], c["case_id"])
 
+    default = default_case(cases, spec)
     if args.case:
         chosen = next((c for c in cases if c["case_id"] == args.case), None)
         if chosen is None:
             raise SystemExit(f"case '{args.case}' not in {test_csv}. "
                              f"Available: {[c['case_id'] for c in cases]}")
+    elif getattr(args, "auto_case", False):
+        if default is None:
+            raise SystemExit(f"--auto-case: no usable episode in {test_csv} "
+                             f"(none has a resolvable video).")
+        chosen = default
+        pos = dict(zip(spec.activities, chosen.get("pos", []))) if spec else {}
+        logger.info(f"--auto-case: {chosen['case_id']} ({chosen['n_clips']:,} clips, "
+                    f"ground truth {pos})")
     else:
-        chosen = choose_case(cases)
+        chosen = choose_case(cases, spec, default)
 
     if not chosen["video"]:
         raise SystemExit(
@@ -951,6 +1070,10 @@ def main():
                     help=f"Where his manifests live (default {DEFAULT_RONALD_DIR}).")
     ap.add_argument("--case", default=None,
                     help="Case id to run non-interactively (skips the menu).")
+    ap.add_argument("--auto-case", action="store_true",
+                    help="Skip the menu and take the episode Enter would pick: the "
+                         "one whose ground truth contains every activity, with the "
+                         "most clips of the rarest. For nohup / batch runs.")
     ap.add_argument("--annotation", default=None,
                     help="5-col TSV to overlay ground truth (auto-resolved for test cases).")
     ap.add_argument("--no-gt", action="store_true",
@@ -980,14 +1103,22 @@ def main():
     if args.ronald:
         logger.info(f"--ronald: picking an episode from {args.test_csv}")
 
-    # Resolve the target video (+ optional annotation): explicit --video, or an
-    # interactive pick from the test set.
+    # The MODEL loads first, before any episode is chosen. Two reasons: the
+    # case menu reports each episode's ground-truth activities and needs the
+    # spec to read them, and a head/spec mismatch should abort before the user
+    # sits through an interactive prompt.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Device: {device}")
+    model, config, spec = build_model(args.model, args.model_path, device, args.data_config)
+
+    # Resolve the target video (+ optional annotation): explicit --video, or a
+    # pick from the test set.
     stem = None
     if args.video:
         video_path = Path(args.video).expanduser().resolve()
         annotation = args.annotation
     else:
-        stem, video_path, auto_annotation = select_from_test_set(args)
+        stem, video_path, auto_annotation = select_from_test_set(args, spec)
         annotation = args.annotation or auto_annotation
 
     if args.no_gt:
@@ -998,9 +1129,6 @@ def main():
     out_dir = Path(args.out_dir).expanduser() if args.out_dir else Path("viewer_out") / stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Device: {device}")
-    model, config, spec = build_model(args.model, args.model_path, device, args.data_config)
     colors = class_colors(spec)
     tracks = track_specs(spec)
 

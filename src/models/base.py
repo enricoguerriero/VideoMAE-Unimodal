@@ -188,11 +188,35 @@ class VideoModel(nn.Module):
         last = max(idxs, default=None)
         out_w = saved.get(f"seq.{last}.weight") if last is not None else None
         if out_w is not None and out_w.shape[0] != self.num_classes:
+            # Say WHICH spec the checkpoint carries, not just that the widths
+            # disagree. Every checkpoint stores the DataSpec it trained with, so
+            # this mismatch has exactly two causes and the stored spec tells them
+            # apart: either a --data-config override is being forced onto a
+            # checkpoint trained for something else, or the checkpoint predates
+            # `data_spec` and the fallback config on disk is the wrong one.
+            stored = (checkpoint or {}).get("data_spec") or {}
+            if stored:
+                acts = stored.get("activities", [])
+                n = len(acts) + (0 if stored.get("task") == "multilabel" else 1)
+                detail = (f"\n  the checkpoint was trained as: task="
+                          f"{stored.get('task')}, {n} logits, "
+                          f"classes={acts}, label_source="
+                          f"{stored.get('label_source', 'evidence')}"
+                          f"\n  this run is using            : task={self.task}, "
+                          f"{self.num_classes} logits"
+                          f"\n  Drop --data-config (and the 6th positional of "
+                          f"scripts/infer_video.sh) so the checkpoint's own spec "
+                          f"is used.")
+            else:
+                detail = ("\n  the checkpoint stores NO `data_spec` (trained before "
+                          "that was recorded), so the spec came from a config on "
+                          "disk and is a guess. Pass --data-config pointing at the "
+                          "one it was actually trained with.")
             raise ValueError(
                 f"checkpoint head emits {out_w.shape[0]} logits but this run's "
-                f"data config asks for {self.num_classes} ({self.task}). The "
-                f"checkpoint was trained for a different task — load the matching "
-                f"data config (checkpoints store theirs under 'data_spec').")
+                f"data config asks for {self.num_classes} ({self.task})." + detail
+                + "\n  `python scripts/inspect_checkpoint.py <ckpt>.pt` prints what "
+                  "a checkpoint holds.")
 
         # Mirror the saved head's shape: a placeholder bias vector is enough,
         # since load_state_dict overwrites it with the trained values.
