@@ -880,8 +880,13 @@ def row_positives(row, spec):
             for i in range(len(spec.activities))]
 
 
-def list_test_cases(test_csv: Path, strip_prefix: str | None = None, spec=None):
+def list_test_cases(test_csv: Path, strip_prefix: str | None = None, spec=None,
+                    default_site: str | None = None):
     """Read the test manifest → ordered unique cases with clip counts + an anchor.
+
+    `default_site` names the hospital for a manifest with no `site` column —
+    his are Haydom-only and carry none. Our own manifests have the column, so
+    the value is read per row and never guessed.
 
     `strip_prefix` is removed from every clip path first. Ronald Paleczny's
     manifests store absolute paths under the account that generated them
@@ -900,8 +905,18 @@ def list_test_cases(test_csv: Path, strip_prefix: str | None = None, spec=None):
             cid = recover_case_id(vp)
             c = cases.setdefault(cid, {"case_id": cid, "n_clips": 0, "anchor": vp,
                                        "pos": [0] * len(spec.activities) if spec else [],
-                                       "unreadable": 0})
+                                       "unreadable": 0, "site": default_site or ""})
             c["n_clips"] += 1
+            site = (row.get("site") or "").strip()
+            if site:
+                # A case belongs to one hospital; the split is per case, so two
+                # sites under one case id means the manifest is wrong, not that
+                # the episode spans hospitals. Say so rather than pick one.
+                if c["site"] and c["site"] != site:
+                    logger.warning(f"case {cid} is labelled both {c['site']!r} and "
+                                   f"{site!r} in {test_csv} — using the first")
+                else:
+                    c["site"] = site
             if spec is None:
                 continue
             got = row_positives(row, spec)
@@ -988,17 +1003,18 @@ def choose_case(cases, spec=None, default=None, pool=None):
     """
     acts = list(spec.activities) if spec else []
     head = "".join(f"{a[:9]:>10}" for a in acts)
+    sites = any(c.get("site") for c in cases)
+    site_head = f"{'site':<8}" if sites else ""
     print("\nTest-set cases  (ground-truth positive clips per activity):")
-    print(f"       {'case':<14}{'clips':>7}{head}   video  GT")
+    print(f"       {'case':<14}{site_head}{'clips':>7}{head}")
     for i, c in enumerate(cases, 1):
         pos = c.get("pos") or []
         cells = "".join(f"{n:>10,}" if n else f"{'·':>10}" for n in pos)
-        v = "✓" if c["video"] else "✗"
-        g = "✓" if c["annotation"] else "✗"
+        site_cell = f"{(c.get('site') or '?'):<8}" if sites else ""
         in_pool = bool(pool) and any(c is q for q in pool)
-        mark = (" * <- suggested" if default is not None and c is default
-                else (" *" if in_pool else ""))
-        print(f"  [{i:2d}] {c['case_id']:<14}{c['n_clips']:>7,}{cells}     {v}   {g}{mark}")
+        mark = ("  * <- suggested" if default is not None and c is default
+                else ("  *" if in_pool else ""))
+        print(f"  [{i:2d}] {c['case_id']:<14}{site_cell}{c['n_clips']:>7,}{cells}{mark}")
     if pool and len(pool) > 1:
         print(f"       * = one of the {len(pool)} episodes with the widest activity "
               f"coverage; Enter picks among them at random")
@@ -1037,31 +1053,58 @@ def select_from_test_set(args, spec=None):
     if not test_csv.exists():
         raise FileNotFoundError(
             f"{test_csv} not found — run scripts/build_data.sh first, or pass --video.")
-    cases = list_test_cases(
-        test_csv, RONALD_STRIP_PREFIX if getattr(args, "ronald", False) else None,
-        spec)
-    if not cases:
+    ronald = getattr(args, "ronald", False)
+    all_cases = list_test_cases(
+        test_csv, RONALD_STRIP_PREFIX if ronald else None, spec,
+        default_site="Haydom" if ronald else None)
+    if not all_cases:
         raise RuntimeError(f"No cases found in {test_csv}.")
-    for c in cases:
+    for c in all_cases:
         c["video"], c["annotation"] = resolve_media(c["anchor"], c["case_id"])
+
+    # Only OFFERABLE episodes are listed: one with no video cannot be run at
+    # all, and one with no annotation gives an overlay with no reference line —
+    # a prediction track floating against nothing, which is the least useful
+    # thing this tool produces. --all-cases puts them back.
+    cases = [c for c in all_cases if c["video"] and c["annotation"]]
+    hidden = [c for c in all_cases if c not in cases]
+    if getattr(args, "all_cases", False):
+        cases = all_cases
+    elif hidden:
+        no_vid = sum(1 for c in hidden if not c["video"])
+        no_gt = sum(1 for c in hidden if c["video"] and not c["annotation"])
+        logger.info(
+            f"{len(cases)} of {len(all_cases)} episodes are listed; hiding "
+            + ", ".join(p for p in (f"{no_vid} with no video" if no_vid else "",
+                                    f"{no_gt} with no annotation" if no_gt else "")
+                        if p)
+            + ". Pass --all-cases to include them (or --case <id> for one).")
+    if not cases:
+        raise SystemExit(
+            f"No episode in {test_csv} has both a video and an annotation on this "
+            f"machine. Pass --all-cases to list them anyway, --case <id> to force "
+            f"one, or --video/--annotation to point at files directly.")
 
     rng = random.Random(args.seed) if getattr(args, "seed", None) is not None else None
     default = default_case(cases, spec, rng)
     if args.case:
-        chosen = next((c for c in cases if c["case_id"] == args.case), None)
+        # An explicit id overrides the filter: asking for a specific episode is
+        # not the same as browsing, and "I know it has no GT" is a valid state.
+        chosen = next((c for c in all_cases if c["case_id"] == args.case), None)
         if chosen is None:
             raise SystemExit(f"case '{args.case}' not in {test_csv}. "
-                             f"Available: {[c['case_id'] for c in cases]}")
+                             f"Available: {[c['case_id'] for c in all_cases]}")
     elif getattr(args, "auto_case", False):
         if default is None:
-            raise SystemExit(f"--auto-case: no usable episode in {test_csv} "
-                             f"(none has a resolvable video).")
+            raise SystemExit(f"--auto-case: no usable episode in {test_csv}.")
         chosen = default
         pos = dict(zip(spec.activities, chosen.get("pos", []))) if spec else {}
         n_pool = len(qualifying_cases(cases, spec))
-        logger.info(f"--auto-case: {chosen['case_id']} ({chosen['n_clips']:,} clips, "
-                    f"ground truth {pos}) — randomly chosen from {n_pool} episode(s) "
-                    f"with the widest activity coverage"
+        logger.info(f"--auto-case: {chosen['case_id']} "
+                    f"[{chosen.get('site') or 'site unknown'}] "
+                    f"({chosen['n_clips']:,} clips, ground truth {pos}) — randomly "
+                    f"chosen from {n_pool} episode(s) with the widest activity "
+                    f"coverage"
                     + ("" if getattr(args, 'seed', None) is None
                        else f", seed={args.seed}"))
     else:
@@ -1073,7 +1116,13 @@ def select_from_test_set(args, spec=None):
             f"  {chosen['anchor']}\n"
             f"but no sibling Unprocessed_data/videos/{chosen['case_id']}.* exists. "
             f"Pass the full video explicitly with --video (and --annotation).")
-    logger.info(f"Selected case {chosen['case_id']}: {chosen['video']}")
+    logger.info(f"Selected case {chosen['case_id']}"
+                + (f" [{chosen['site']}]" if chosen.get("site") else "")
+                + f": {chosen['video']}")
+    if not chosen["annotation"]:
+        logger.warning("this episode has no annotation file — the overlay will show "
+                       "predictions with no ground-truth reference to read them "
+                       "against.")
     return chosen["case_id"], chosen["video"], chosen["annotation"]
 
 
@@ -1103,6 +1152,10 @@ def main():
                     help="Skip the menu and take the episode Enter would pick: a "
                          "RANDOM one whose ground truth contains every activity. "
                          "For nohup / batch runs.")
+    ap.add_argument("--all-cases", action="store_true",
+                    help="List every episode in the manifest, including those with "
+                         "no annotation (no ground-truth overlay) or no resolvable "
+                         "video. The default lists only runnable, GT-bearing ones.")
     ap.add_argument("--seed", type=int, default=None,
                     help="Make that random pick reproducible, for regenerating a "
                          "specific figure. Unseeded by default — the point of the "

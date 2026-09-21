@@ -14,8 +14,12 @@
 # EVERY activity — worth looking at, because an overlay with two flat tracks
 # says nothing about those two. Re-running suggests a different one, so you are
 # not always judging the model on the same baby, camera and operator.
+# Only episodes that are actually runnable are listed: they need both a video
+# and an annotation, since an overlay with no ground-truth reference is the
+# least useful thing this produces. Each row shows its hospital.
 #   AUTO=1   skip the prompt and take that random pick (nohup / batch runs)
 #   SEED=42  make the pick reproducible, for regenerating a specific figure
+#   ALL=1    list every episode, including those with no GT / no video
 #
 # By default it writes a STANDALONE annotated.mp4 (offline-friendly: no server or
 # browser — just copy the file off the VM and play it in VLC). This is the right
@@ -47,6 +51,7 @@ SERVE="${SERVE:-0}"
 RONALD="${RONALD:-0}"
 AUTO="${AUTO:-0}"
 SEED="${SEED:-}"
+ALL="${ALL:-0}"
 
 # No --test-csv here: src.infer_video picks the right default on its own
 # (data/test.csv, or his manifest under --ronald). Hardcoding it would override
@@ -60,6 +65,9 @@ if [[ "${AUTO}" == "1" ]]; then
 fi
 if [[ -n "${SEED}" ]]; then
     ARGS+=(--seed "${SEED}")
+fi
+if [[ "${ALL}" == "1" ]]; then
+    ARGS+=(--all-cases)
 fi
 if [[ -n "${CASE}" ]]; then
     ARGS+=(--case "${CASE}")
